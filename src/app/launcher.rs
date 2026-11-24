@@ -451,6 +451,7 @@ impl App {
                 tab,
                 x: qx as f32,
                 y: qy as f32,
+                modifiers: keyboard_types::Modifiers::empty(),
             });
         }
     }
@@ -1190,6 +1191,7 @@ impl App {
                     tab: self.browser_tab(),
                     x: qx as f32,
                     y: qy as f32,
+                    modifiers: keyboard_types::Modifiers::empty(),
                 });
             }
         }
@@ -2154,6 +2156,9 @@ impl App {
             EngineEvent::HistoryJumpFailed { tab, index, reason } => {
                 self.on_history_jump_failed(tab, index, reason);
             }
+            EngineEvent::CursorChanged { cursor, .. } => {
+                self.browser.panel.page_cursor = cursor;
+            }
             EngineEvent::FocusChanged { tab: _, id } => {
                 // Magnet off means never dock — drop any parked target too.
                 if !self.browser.panel.cursor.magnet {
@@ -2288,7 +2293,8 @@ impl App {
                 | EngineEvent::FrameSlot { .. }
                 | EngineEvent::TabOpened { .. }
                 | EngineEvent::TabClosed { .. }
-                | EngineEvent::HistoryJumpFailed { .. } => {}
+                | EngineEvent::HistoryJumpFailed { .. }
+                | EngineEvent::CursorChanged { .. } => {}
             }
         }
         if strip_changed && self.browser.tabs_restored {

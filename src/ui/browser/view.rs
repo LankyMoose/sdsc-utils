@@ -4,6 +4,7 @@
 //! `ui::browser::state`; this module owns the chrome/page/cursor composition
 //! and the browser-facing message vocabulary.
 
+use crate::browser::engine::BrowserCursor;
 use crate::ui::browser::state::{
     BrowserPanel, CHROME_BOOKMARK_H, CHROME_BOOKMARKS_Y, CHROME_HEADER_H, CHROME_ROW_GAP,
     CHROME_ROW_H, CHROME_STRIP_Y, CHROME_TOOLBAR_Y, ChromeTarget, cursor_targets,
@@ -48,8 +49,12 @@ pub enum BrowserMessage {
         x: f32,
         y: f32,
     },
-    /// Hardware left click on the live page; uses `BrowserPanel::page_mouse`.
-    PageClick,
+    /// Physical left button pressed on the live page.
+    PagePress,
+    /// Physical left button released on the live page.
+    PageRelease,
+    /// Pointer left the live page.
+    PagePointerLeft,
     /// Hardware wheel over the live page; uses `BrowserPanel::page_mouse`.
     PageWheel {
         dx: i32,
@@ -85,7 +90,11 @@ impl BrowserMessage {
             Self::BookmarkStar => Some("browser.bookmark.star"),
             Self::BookmarkSave => Some("browser.bookmark.save"),
             Self::BookmarkRemove => Some("browser.bookmark.remove"),
-            Self::PagePointerMoved { .. } | Self::PageClick | Self::PageWheel { .. } => None,
+            Self::PagePointerMoved { .. }
+            | Self::PagePress
+            | Self::PageRelease
+            | Self::PagePointerLeft
+            | Self::PageWheel { .. } => None,
             Self::Scrolled(_) => None,
             #[cfg(debug_assertions)]
             Self::Shot(_) => None,
@@ -138,7 +147,7 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 /// keyboard, and a chrome dock is carried by the control chip; free roam
 /// and flights draw everywhere on the surface, header included.
 fn cursor_draws(panel: &BrowserPanel) -> bool {
-    !panel.url_editing && panel.chrome_attached().is_none()
+    !panel.url_editing && !panel.page_mouse_active && panel.chrome_attached().is_none()
 }
 
 /// Map a unified cursor point (page px; header negative) to card pixels.
@@ -156,6 +165,36 @@ pub(crate) fn scroll_delta_units(delta: iced::mouse::ScrollDelta) -> (i32, i32) 
             ((x * 120.0).round() as i32, (y * 120.0).round() as i32)
         }
         iced::mouse::ScrollDelta::Pixels { x, y } => (x.round() as i32, y.round() as i32),
+    }
+}
+
+/// Map the page cursor reported by CEF onto iced's OS cursor vocabulary.
+pub(crate) fn cursor_interaction(cursor: BrowserCursor) -> iced::mouse::Interaction {
+    use iced::mouse::Interaction;
+    match cursor {
+        BrowserCursor::Default => Interaction::None,
+        BrowserCursor::Pointer => Interaction::Pointer,
+        BrowserCursor::Text => Interaction::Text,
+        BrowserCursor::Crosshair => Interaction::Crosshair,
+        BrowserCursor::Move => Interaction::Move,
+        BrowserCursor::Wait => Interaction::Wait,
+        BrowserCursor::Progress => Interaction::Progress,
+        BrowserCursor::Help => Interaction::Help,
+        BrowserCursor::NotAllowed => Interaction::NotAllowed,
+        BrowserCursor::ContextMenu => Interaction::ContextMenu,
+        BrowserCursor::Copy => Interaction::Copy,
+        BrowserCursor::Cell => Interaction::Cell,
+        BrowserCursor::NoDrop => Interaction::NoDrop,
+        BrowserCursor::Grab => Interaction::Grab,
+        BrowserCursor::Grabbing => Interaction::Grabbing,
+        BrowserCursor::ZoomIn => Interaction::ZoomIn,
+        BrowserCursor::ZoomOut => Interaction::ZoomOut,
+        BrowserCursor::ResizeHorizontal => Interaction::ResizingHorizontally,
+        BrowserCursor::ResizeVertical => Interaction::ResizingVertically,
+        BrowserCursor::ResizeNwSe => Interaction::ResizingDiagonallyDown,
+        BrowserCursor::ResizeNeSw => Interaction::ResizingDiagonallyUp,
+        BrowserCursor::ResizeColumn => Interaction::ResizingColumn,
+        BrowserCursor::ResizeRow => Interaction::ResizingRow,
     }
 }
 
@@ -270,11 +309,14 @@ pub fn browser_page_view(
                 x: point.x,
                 y: point.y,
             })
-            .on_press(BrowserMessage::PageClick)
+            .on_press(BrowserMessage::PagePress)
+            .on_release(BrowserMessage::PageRelease)
+            .on_exit(BrowserMessage::PagePointerLeft)
             .on_scroll(|delta| {
                 let (dx, dy) = scroll_delta_units(delta);
                 BrowserMessage::PageWheel { dx, dy }
             })
+            .interaction(cursor_interaction(panel.page_cursor))
             .into();
     }
     let body_text = match session.error() {
@@ -807,7 +849,7 @@ pub fn root_view(
         .width(Length::Fixed(layout.card_w))
         .height(Length::Fixed(layout.card_h));
     let transparent = crate::ui::chrome::transparent_windows();
-    container(card)
+    let root: Element<'_, BrowserMessage> = container(card)
         .width(Fill)
         .height(Fill)
         .center_x(Fill)
@@ -823,7 +865,15 @@ pub fn root_view(
             text_color: Some(theme::INK),
             ..container::Style::default()
         })
-        .into()
+        .into();
+    // Controller mode owns the sole pointer (pad ring); a real mouse shows the
+    // OS cursor with CEF's hover shape instead. Automated sessions never hide
+    // the host cursor.
+    crate::ui::launcher::cursor_hide::force_cursor(
+        root,
+        !panel.page_mouse_active && !crate::platform::debug_quiet::input_dropped(),
+    )
+    .into()
 }
 
 #[cfg(test)]
@@ -1529,6 +1579,28 @@ mod tests {
         assert_eq!(
             scroll_delta_units(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -12.4 }),
             (0, -12)
+        );
+    }
+
+    #[test]
+    fn page_cursor_shapes_map_to_os_interactions() {
+        use iced::mouse::Interaction;
+        assert_eq!(
+            cursor_interaction(BrowserCursor::Default),
+            Interaction::None
+        );
+        assert_eq!(
+            cursor_interaction(BrowserCursor::Pointer),
+            Interaction::Pointer
+        );
+        assert_eq!(cursor_interaction(BrowserCursor::Text), Interaction::Text);
+        assert_eq!(
+            cursor_interaction(BrowserCursor::ResizeNwSe),
+            Interaction::ResizingDiagonallyDown
+        );
+        assert_eq!(
+            cursor_interaction(BrowserCursor::ResizeNeSw),
+            Interaction::ResizingDiagonallyUp
         );
     }
 }

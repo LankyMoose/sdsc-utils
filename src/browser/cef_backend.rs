@@ -18,7 +18,8 @@
 use crate::browser::cursor::{FocusKind, Focusable};
 use crate::browser::dom;
 use crate::browser::engine::{
-    EngineActivity, EngineCommand, EngineEvent, EngineHandle, TabId, TabKey,
+    BrowserCursor, BrowserMouseButton, EngineActivity, EngineCommand, EngineEvent, EngineHandle,
+    TabId, TabKey,
 };
 use crate::browser::frame_slot::FrameSlot;
 use cef::*;
@@ -379,6 +380,8 @@ struct TabContext {
     last_history_hash: Arc<Mutex<u64>>,
     /// Exact history traversal through the DevTools protocol.
     devtools: Arc<DevToolsState>,
+    /// Last page cursor shape, so repeated CEF notifications are deduped.
+    last_cursor: Arc<Mutex<crate::browser::engine::BrowserCursor>>,
     /// Causal flow of the last traced navigation/history command. CEF
     /// callbacks join engine log lines to the UI action that caused them.
     trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
@@ -1148,6 +1151,35 @@ cef::wrap_display_handler! {
             let request_id = self.ctx.favicon_request.fetch_add(1, Ordering::AcqRel) + 1;
             start_favicon_download(&self.ctx, Some(request_id), page_url, urls);
         }
+
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: cef::sys::HCURSOR,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> std::os::raw::c_int {
+            let cursor = cursor_from_cef(type_);
+            {
+                let mut last = self
+                    .ctx
+                    .last_cursor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *last == cursor {
+                    return 1;
+                }
+                *last = cursor;
+            }
+            trace_engine(&self.ctx, "cursor")
+                .field("cursor", format!("{cursor:?}"))
+                .emit();
+            self.ctx.handle.emit(EngineEvent::CursorChanged {
+                tab: self.ctx.tab,
+                cursor,
+            });
+            1
+        }
     }
 }
 
@@ -1583,6 +1615,8 @@ struct TabEntry {
     url: String,
     last_dom: Instant,
     dom_epoch: u64,
+    /// Left mouse button held over the page (drag selection modifier).
+    mouse_left_down: bool,
     /// Keeps the DevTools message observer registered for this browser.
     /// Lives outside `TabContext` because the registration handle is not
     /// `Send`; `TabContext` crosses into the favicon worker.
@@ -1671,6 +1705,7 @@ impl Worker {
             pending_click: Arc::new(Mutex::new(None)),
             last_history_hash: Arc::new(Mutex::new(0)),
             devtools: Arc::new(DevToolsState::default()),
+            last_cursor: Arc::new(Mutex::new(crate::browser::engine::BrowserCursor::Default)),
             trace_flow: Arc::new(Mutex::new(None)),
         };
         let mut client = SdscClient::new(
@@ -1706,6 +1741,7 @@ impl Worker {
                 url: url.to_string(),
                 last_dom: Instant::now(),
                 dom_epoch: 0,
+                mouse_left_down: false,
                 devtools_registration: None,
             },
         );
@@ -1839,13 +1875,87 @@ impl Worker {
                 }
             }
             EngineCommand::SetDarkMode { .. } => {}
-            EngineCommand::MouseMove { tab, x, y } => {
+            EngineCommand::MouseMove {
+                tab,
+                x,
+                y,
+                modifiers: keys,
+            } => {
                 if let Some(entry) = self.tab(tab) {
                     *entry
                         .ctx
                         .last_mouse
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = (x, y);
+                    let mut flags = modifiers(keys);
+                    if entry.mouse_left_down {
+                        flags |= 1 << 4;
+                    }
+                    if let Some(browser) = entry.ctx.browser.get()
+                        && let Some(host) = browser.host()
+                    {
+                        host.send_mouse_move_event(
+                            Some(&MouseEvent {
+                                x: x as i32,
+                                y: y as i32,
+                                modifiers: flags,
+                            }),
+                            0,
+                        );
+                    }
+                }
+            }
+            EngineCommand::MouseButton {
+                tab,
+                x,
+                y,
+                button,
+                pressed,
+                click_count,
+                modifiers: keys,
+            } => {
+                if let Some(entry) = self.tab_mut(tab) {
+                    if button == BrowserMouseButton::Left {
+                        entry.mouse_left_down = pressed;
+                    }
+                    let (cef_button, flag) = match button {
+                        BrowserMouseButton::Left => (MouseButtonType::LEFT, 1 << 4),
+                        BrowserMouseButton::Middle => (MouseButtonType::MIDDLE, 1 << 5),
+                        BrowserMouseButton::Right => (MouseButtonType::RIGHT, 1 << 6),
+                    };
+                    let mut flags = modifiers(keys);
+                    if pressed {
+                        flags |= flag;
+                    }
+                    if let Some(browser) = entry.ctx.browser.get()
+                        && let Some(host) = browser.host()
+                    {
+                        if pressed {
+                            host.set_focus(1);
+                        }
+                        let event = MouseEvent {
+                            x: x as i32,
+                            y: y as i32,
+                            modifiers: flags,
+                        };
+                        host.send_mouse_move_event(Some(&event), 0);
+                        host.send_mouse_click_event(
+                            Some(&event),
+                            cef_button,
+                            i32::from(!pressed),
+                            i32::from(click_count.max(1)),
+                        );
+                    }
+                }
+            }
+            EngineCommand::MouseLeave { tab } => {
+                if let Some(entry) = self.tab_mut(tab) {
+                    entry.mouse_left_down = false;
+                    let (x, y) = *entry
+                        .ctx
+                        .last_mouse
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some(browser) = entry.ctx.browser.get()
                         && let Some(host) = browser.host()
                     {
@@ -1855,7 +1965,7 @@ impl Worker {
                                 y: y as i32,
                                 modifiers: 0,
                             }),
-                            0,
+                            1,
                         );
                     }
                 }
@@ -2228,6 +2338,68 @@ fn modifiers(m: keyboard_types::Modifiers) -> u32 {
         flags |= 1 << 7;
     }
     flags
+}
+
+/// Map CEF's cursor vocabulary onto the smaller set the browser view uses.
+/// Uncommon/drag cursors fall back to the default arrow rather than hiding
+/// the pointer.
+fn cursor_from_cef(type_: CursorType) -> BrowserCursor {
+    if type_ == CursorType::HAND {
+        BrowserCursor::Pointer
+    } else if type_ == CursorType::IBEAM || type_ == CursorType::VERTICALTEXT {
+        BrowserCursor::Text
+    } else if type_ == CursorType::CROSS {
+        BrowserCursor::Crosshair
+    } else if type_ == CursorType::MOVE
+        || type_ == CursorType::EASTPANNING
+        || type_ == CursorType::WESTPANNING
+        || type_ == CursorType::NORTHPANNING
+        || type_ == CursorType::SOUTHPANNING
+    {
+        BrowserCursor::Move
+    } else if type_ == CursorType::WAIT {
+        BrowserCursor::Wait
+    } else if type_ == CursorType::PROGRESS {
+        BrowserCursor::Progress
+    } else if type_ == CursorType::HELP {
+        BrowserCursor::Help
+    } else if type_ == CursorType::NOTALLOWED || type_ == CursorType::NODROP {
+        BrowserCursor::NotAllowed
+    } else if type_ == CursorType::CONTEXTMENU {
+        BrowserCursor::ContextMenu
+    } else if type_ == CursorType::COPY || type_ == CursorType::ALIAS {
+        BrowserCursor::Copy
+    } else if type_ == CursorType::CELL {
+        BrowserCursor::Cell
+    } else if type_ == CursorType::GRAB {
+        BrowserCursor::Grab
+    } else if type_ == CursorType::GRABBING {
+        BrowserCursor::Grabbing
+    } else if type_ == CursorType::ZOOMIN {
+        BrowserCursor::ZoomIn
+    } else if type_ == CursorType::ZOOMOUT {
+        BrowserCursor::ZoomOut
+    } else if type_ == CursorType::EASTRESIZE
+        || type_ == CursorType::WESTRESIZE
+        || type_ == CursorType::EASTWESTRESIZE
+    {
+        BrowserCursor::ResizeHorizontal
+    } else if type_ == CursorType::NORTHRESIZE
+        || type_ == CursorType::SOUTHRESIZE
+        || type_ == CursorType::NORTHSOUTHRESIZE
+    {
+        BrowserCursor::ResizeVertical
+    } else if type_ == CursorType::NORTHWESTSOUTHEASTRESIZE {
+        BrowserCursor::ResizeNwSe
+    } else if type_ == CursorType::NORTHEASTSOUTHWESTRESIZE {
+        BrowserCursor::ResizeNeSw
+    } else if type_ == CursorType::COLUMNRESIZE {
+        BrowserCursor::ResizeColumn
+    } else if type_ == CursorType::ROWRESIZE {
+        BrowserCursor::ResizeRow
+    } else {
+        BrowserCursor::Default
+    }
 }
 
 fn send_key(host: &BrowserHost, key: &TabKey) {

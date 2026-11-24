@@ -96,6 +96,23 @@ pub enum EngineCommand {
         tab: TabId,
         x: f32,
         y: f32,
+        /// Keyboard modifiers currently held (passed to CEF hover/drag).
+        modifiers: keyboard_types::Modifiers,
+    },
+    /// Physical page mouse button transition. Click counts >1 are
+    /// double/triple clicks for word/paragraph selection.
+    MouseButton {
+        tab: TabId,
+        x: f32,
+        y: f32,
+        button: BrowserMouseButton,
+        pressed: bool,
+        click_count: u8,
+        modifiers: keyboard_types::Modifiers,
+    },
+    /// Pointer left the page: clear CEF hover and any selection capture.
+    MouseLeave {
+        tab: TabId,
     },
     /// The UI cursor jumped: force a fresh DOM target cull around the
     /// current mouse position (the live set is culled around its pull
@@ -215,6 +232,8 @@ impl EngineCommand {
             Self::Navigate { tab, .. }
             | Self::ScrollBy { tab, .. }
             | Self::MouseMove { tab, .. }
+            | Self::MouseButton { tab, .. }
+            | Self::MouseLeave { tab }
             | Self::ReseedDom { tab, .. }
             | Self::ClickAt { tab, .. }
             | Self::ProbeEventLoop { tab, .. }
@@ -322,6 +341,12 @@ pub enum EngineEvent {
         can_back: bool,
         can_forward: bool,
     },
+    /// CEF's cursor over the page changed (link hand, text I-beam, resize,
+    /// etc.). The browser view applies it to the page `mouse_area`.
+    CursorChanged {
+        tab: TabId,
+        cursor: BrowserCursor,
+    },
     /// An exact history jump could not be resolved or executed through the
     /// DevTools protocol. The UI falls back to loading the requested URL.
     HistoryJumpFailed {
@@ -373,11 +398,51 @@ impl EngineEvent {
             | Self::HistoryChanged { tab, .. }
             | Self::HistoryCapability { tab, .. }
             | Self::HistoryJumpFailed { tab, .. }
+            | Self::CursorChanged { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),
             Self::A11yTree { tab, .. } => Some(*tab),
             Self::TabOpened { .. } | Self::TabClosed { .. } => None,
         }
     }
+}
+
+/// Physical mouse buttons the page accepts. Right/middle are defined for the
+/// eventual context-menu path but the current UI only emits left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Page cursor shape reported by CEF. Mapped to iced's OS cursor on the page
+/// `mouse_area`; keep this independent of UI rendering types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrowserCursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    Crosshair,
+    Move,
+    Wait,
+    Progress,
+    Help,
+    NotAllowed,
+    ContextMenu,
+    Copy,
+    Cell,
+    NoDrop,
+    Grab,
+    Grabbing,
+    ZoomIn,
+    ZoomOut,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeNwSe,
+    ResizeNeSw,
+    ResizeColumn,
+    ResizeRow,
 }
 
 /// One canonical CEF session-history entry. The UI keeps a projection for

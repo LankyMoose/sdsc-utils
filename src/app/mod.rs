@@ -2117,11 +2117,15 @@ impl App {
                 }
             }
             Message::LauncherCursorActivity(id) => {
-                if !crate::platform::debug_quiet::input_dropped()
-                    && Some(id) == self.launcher_window
-                    && self.launcher_visible
-                {
-                    self.note_start_cursor_activity();
+                if !crate::platform::debug_quiet::input_dropped() {
+                    if Some(id) == self.launcher_window && self.launcher_visible {
+                        self.note_start_cursor_activity();
+                    }
+                    if Some(id) == self.browser_window && self.browser_visible {
+                        // Any real pointer activity on the Browser window wins
+                        // over the pad ring, including header hovers.
+                        self.browser.panel.page_mouse_active = true;
+                    }
                 }
                 Task::none()
             }
@@ -2325,6 +2329,11 @@ impl App {
             } else {
                 self.close_launcher()
             }
+        } else if Some(id) == self.browser_window && self.browser_visible {
+            // A drag/selection must not survive alt-tab; clear held buttons
+            // and stale Shift/Ctrl state.
+            self.browser_pointer_focus_lost();
+            Task::none()
         } else {
             Task::none()
         }

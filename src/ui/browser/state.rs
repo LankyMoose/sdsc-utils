@@ -159,6 +159,18 @@ pub struct BrowserPanel {
     /// events use this point; replay sets it explicitly so automation never
     /// depends on the OS cursor position.
     pub page_mouse: (f32, f32),
+    /// Physical mouse is the active pointer (pad ring hides, OS cursor shows).
+    pub page_mouse_active: bool,
+    /// Left page button currently held (drag selection).
+    pub page_mouse_down: bool,
+    /// Keyboard modifiers for page mouse/drag events.
+    pub page_mouse_modifiers: keyboard_types::Modifiers,
+    /// Last click timestamp/point/count for double/triple-click detection.
+    pub page_last_click: Option<(Instant, f32, f32, u8)>,
+    /// Click count for the current press (used on release).
+    pub page_click_count: u8,
+    /// Cursor shape reported by CEF for the page.
+    pub page_cursor: crate::browser::engine::BrowserCursor,
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
     /// Last dock transition (None→Some) wall-clock, for settled dock shots.
@@ -236,6 +248,12 @@ impl Default for BrowserPanel {
                 crate::browser::cursor::VIEWPORT_W * 0.5,
                 crate::browser::cursor::VIEWPORT_H * 0.5,
             ),
+            page_mouse_active: false,
+            page_mouse_down: false,
+            page_mouse_modifiers: keyboard_types::Modifiers::empty(),
+            page_last_click: None,
+            page_click_count: 1,
+            page_cursor: crate::browser::engine::BrowserCursor::Default,
             last_shot: None,
             last_dock_change: None,
             js_click: false,

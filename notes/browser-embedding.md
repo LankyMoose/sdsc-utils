@@ -130,16 +130,16 @@ meters still use the legacy per-surface bank.
   (text needs the separate `CHAR` leg). `Ctrl+L`/`Ctrl+R` and
   `Alt+Left`/`Alt+Right` stay app shortcuts; the URL field owns printable
   keys while editing.
-- Real page mouse is minimal today: left click uses the trusted CEF click
-  path at the page-local point, and the wheel forwards to CEF's native wheel
-  (lines × 120). Drag, right/middle click, and cursor-shape fidelity are not
-  wired yet.
+- Real page mouse supports left click, double/triple-click word/paragraph
+  selection, drag selection, and native CEF wheel (lines × 120); CEF cursor
+  shapes drive the OS cursor over the page. Right/middle click and a custom
+  context menu are still unwired.
 - Automated sessions set `SDSC_DEBUG_INPUT=0`, which locks real pad,
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also
   suppress the startup toast and controller auto-open Home. Replay drives the
-  same handlers through synthetic `text`, `key`, `mouse.click`, and
-  `mouse.wheel` steps and closes the Browser window at `replay.done`; never
-  use OS input injection for QA and do not leave test windows on screen.
+  same handlers through synthetic `text`, `key`, `mouse.click`, `mouse.drag`,
+  and `mouse.wheel` steps and closes the Browser window at `replay.done`;
+  never use OS input injection for QA and do not leave test windows on screen.
 - Tabs: favicon (CEF icon URLs, 64px cache keyed by origin) + minimum-width
   title + close, active highlighted; crowded strips switch to an overflow
   chip instead of collapsing titles. Background tabs suspend, strip

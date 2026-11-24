@@ -182,6 +182,12 @@ fn map_modifiers(modifiers: &keyboard::Modifiers) -> keyboard_types::Modifiers {
     out
 }
 
+/// Public conversion for shell state that must remember the current modifiers
+/// for later mouse/drag events.
+pub fn engine_modifiers(modifiers: &keyboard::Modifiers) -> keyboard_types::Modifiers {
+    map_modifiers(modifiers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +276,16 @@ mod tests {
         assert!(down.modifiers.shift());
         assert_eq!(down.location, keyboard::Location::Standard);
         assert!(synthetic_named("NotAKey", keyboard::Modifiers::empty()).is_none());
+    }
+
+    #[test]
+    fn engine_modifiers_convert_iced_flags() {
+        let mut iced = keyboard::Modifiers::empty();
+        iced |= keyboard::Modifiers::CTRL;
+        iced |= keyboard::Modifiers::SHIFT;
+        let engine = engine_modifiers(&iced);
+        assert!(engine.ctrl());
+        assert!(engine.shift());
+        assert!(!engine.alt());
     }
 }

@@ -172,6 +172,30 @@ const REPLAY_STEP_WAIT: std::time::Duration = std::time::Duration::from_millis(1
 /// A selector jump that neither lands nor reports a DevTools error settles as
 /// a timeout so the action cannot hang the trace or the selector state.
 const HISTORY_TRAVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Double/triple-click window and movement tolerance for page selection.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const MULTI_CLICK_SLOP: f32 = 4.0;
+
+/// Advance the double/triple-click chain. Returns the count for this press and
+/// the stamp to store for the next one.
+fn next_click_count(
+    last: Option<(Instant, f32, f32, u8)>,
+    now: Instant,
+    x: f32,
+    y: f32,
+) -> (u8, Option<(Instant, f32, f32, u8)>) {
+    let count = match last {
+        Some((at, last_x, last_y, count))
+            if now.saturating_duration_since(at) <= MULTI_CLICK_WINDOW
+                && (x - last_x).abs() <= MULTI_CLICK_SLOP
+                && (y - last_y).abs() <= MULTI_CLICK_SLOP =>
+        {
+            count.saturating_add(1).min(3)
+        }
+        _ => 1,
+    };
+    (count, Some((now, x, y, count)))
+}
 
 impl super::App {
     /// Replay driver tick. Opens the Browser surface first, validates stable
@@ -355,7 +379,26 @@ impl super::App {
             #[cfg(debug_assertions)]
             "mouse.click" => {
                 if let Some((x, y)) = replay_point(&step.params) {
-                    self.inject_browser_click(x, y, "replay");
+                    let count = step
+                        .params
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1)
+                        .clamp(1, 3);
+                    for _ in 0..count {
+                        self.inject_browser_click(x, y, "replay");
+                    }
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "mouse.drag" => {
+                let x1 = step.params.get("x1").and_then(serde_json::Value::as_f64);
+                let y1 = step.params.get("y1").and_then(serde_json::Value::as_f64);
+                let x2 = step.params.get("x2").and_then(serde_json::Value::as_f64);
+                let y2 = step.params.get("y2").and_then(serde_json::Value::as_f64);
+                if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) {
+                    self.inject_browser_drag(x1 as f32, y1 as f32, x2 as f32, y2 as f32, "replay");
                 }
                 Task::none()
             }
@@ -936,13 +979,10 @@ impl super::App {
             }
             BrowserMessage::BookmarkSave => self.on_browser_bookmark_save(),
             BrowserMessage::BookmarkRemove => self.on_browser_bookmark_remove(),
-            BrowserMessage::PagePointerMoved { x, y } => {
-                if !crate::platform::debug_quiet::input_dropped() {
-                    self.browser.panel.page_mouse = (x, y);
-                }
-                Task::none()
-            }
-            BrowserMessage::PageClick => self.on_browser_page_click(),
+            BrowserMessage::PagePointerMoved { x, y } => self.on_browser_page_pointer_moved(x, y),
+            BrowserMessage::PagePress => self.on_browser_page_press(),
+            BrowserMessage::PageRelease => self.on_browser_page_release(),
+            BrowserMessage::PagePointerLeft => self.on_browser_page_pointer_left(),
             BrowserMessage::PageWheel { dx, dy } => self.on_browser_page_wheel(dx, dy),
             BrowserMessage::Scrolled(y) => {
                 self.browser.panel.note_scrolled(y);
@@ -953,12 +993,37 @@ impl super::App {
         }
     }
 
-    fn on_browser_page_click(&mut self) -> Task<Message> {
+    fn on_browser_page_pointer_moved(&mut self, x: f32, y: f32) -> Task<Message> {
+        if !crate::platform::debug_quiet::input_dropped() {
+            self.inject_browser_move(x, y);
+        }
+        Task::none()
+    }
+
+    fn on_browser_page_press(&mut self) -> Task<Message> {
         if crate::platform::debug_quiet::input_dropped() {
             return Task::none();
         }
         let (x, y) = self.browser.panel.page_mouse;
-        self.inject_browser_click(x, y, "mouse");
+        self.inject_browser_press(x, y, "mouse");
+        Task::none()
+    }
+
+    fn on_browser_page_release(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_release(x, y, "mouse");
+        Task::none()
+    }
+
+    fn on_browser_page_pointer_left(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_pointer_left(x, y, "mouse");
         Task::none()
     }
 
@@ -971,32 +1036,119 @@ impl super::App {
         Task::none()
     }
 
-    /// Shared page-click path for hardware and replay injection. Replay
-    /// supplies explicit page-local coordinates, so tests never move or read
-    /// the OS cursor.
-    pub(crate) fn inject_browser_click(&mut self, x: f32, y: f32, source: &'static str) {
+    /// Shared page-pointer move path for hardware and replay injection.
+    fn inject_browser_move(&mut self, x: f32, y: f32) {
         let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseMove {
+                tab: self.browser_tab(),
+                x,
+                y,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// Shared page-button-down path for hardware and replay injection.
+    pub(crate) fn inject_browser_press(&mut self, x: f32, y: f32, source: &'static str) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
         if self.browser.panel.url_editing {
             // A page click leaves the omnibox; the field disappears and the
-            // page receives keyboard focus on the next CEF click.
+            // page receives keyboard focus on the CEF button-down event.
             self.browser.panel.url_editing = false;
         }
-        let Some(engine) = &self.browser.engine else {
-            return;
-        };
-        let tab = self.browser_tab();
-        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_click")
+        let count = self.next_page_click_count(x, y);
+        self.browser.panel.page_click_count = count;
+        self.browser.panel.page_mouse_down = true;
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_press")
             .field("x", x)
             .field("y", y)
+            .field("count", count)
             .field("source", source)
             .emit();
-        engine.send(EngineCommand::ClickAt {
-            tab,
-            x,
-            y,
-            target: None,
-            trusted: true,
-        });
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.browser_tab(),
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: true,
+                click_count: count,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// Shared page-button-up path. Uses the count from the matching press so
+    /// Chromium sees the same click count on down and up.
+    pub(crate) fn inject_browser_release(&mut self, x: f32, y: f32, source: &'static str) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        if !self.browser.panel.page_mouse_down {
+            return;
+        }
+        self.browser.panel.page_mouse_down = false;
+        let count = self.browser.panel.page_click_count.max(1);
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.page_release",
+        )
+        .field("x", x)
+        .field("y", y)
+        .field("count", count)
+        .field("source", source)
+        .emit();
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.browser_tab(),
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: false,
+                click_count: count,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// One full trusted left click at an explicit page point.
+    #[cfg(debug_assertions)]
+    pub(crate) fn inject_browser_click(&mut self, x: f32, y: f32, source: &'static str) {
+        self.inject_browser_press(x, y, source);
+        self.inject_browser_release(x, y, source);
+    }
+
+    /// Synthetic drag: down at the start, interpolated moves with the button
+    /// flag, then up at the end. Exercises text selection without OS input.
+    #[cfg(debug_assertions)]
+    pub(crate) fn inject_browser_drag(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        source: &'static str,
+    ) {
+        self.inject_browser_press(x1, y1, source);
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            self.inject_browser_move(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        }
+        self.inject_browser_release(x2, y2, source);
+    }
+
+    /// Pointer left the page: finish any drag and clear CEF hover.
+    fn inject_browser_pointer_left(&mut self, x: f32, y: f32, source: &'static str) {
+        if self.browser.panel.page_mouse_down {
+            self.inject_browser_release(x, y, source);
+        }
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseLeave {
+                tab: self.browser_tab(),
+            });
+        }
     }
 
     /// Shared page-wheel path for hardware and replay injection.
@@ -1009,6 +1161,7 @@ impl super::App {
         source: &'static str,
     ) {
         let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_wheel")
             .field("x", x)
             .field("y", y)
@@ -1031,12 +1184,29 @@ impl super::App {
         });
     }
 
+    /// Double/triple-click count for a press at `(x, y)`. Chromium treats the
+    /// second and third presses as word/paragraph selection.
+    fn next_page_click_count(&mut self, x: f32, y: f32) -> u8 {
+        let (next, stamp) =
+            next_click_count(self.browser.panel.page_last_click, Instant::now(), x, y);
+        self.browser.panel.page_last_click = stamp;
+        next
+    }
+
     fn clamp_page_mouse(&mut self, x: f32, y: f32) -> (f32, f32) {
         let (w, h) = self.browser.panel.viewport;
         let x = x.clamp(0.0, (w - 1.0).max(0.0));
         let y = y.clamp(0.0, (h - 1.0).max(0.0));
         self.browser.panel.page_mouse = (x, y);
         (x, y)
+    }
+
+    /// Window focus loss: finish a drag and drop keyboard modifiers so a
+    /// later page move cannot inherit a stale Shift/Ctrl state.
+    pub(crate) fn browser_pointer_focus_lost(&mut self) {
+        self.browser.panel.page_mouse_modifiers = keyboard_types::Modifiers::empty();
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_pointer_left(x, y, "unfocus");
     }
 
     /// Replay text injection: press+release each character through the real
@@ -1314,6 +1484,13 @@ impl super::App {
         if readings.is_empty() {
             return Task::none();
         }
+        if readings
+            .iter()
+            .any(|reading| !crate::domain::pad::sample_nav_resting(&reading.sample))
+        {
+            // Real pad input takes pointer ownership back from the mouse.
+            self.browser.panel.page_mouse_active = false;
+        }
         // PS is global: while Browser owns the pad it must still open Home
         // (Home-open path routes PS to close once visible).
         if self.home_chord_fires(readings) {
@@ -1496,6 +1673,8 @@ impl super::App {
         use crate::ui::browser::BrowserMessage;
         use iced::keyboard::Key;
         use iced::keyboard::key::Named;
+        self.browser.panel.page_mouse_modifiers =
+            crate::browser::keys::engine_modifiers(&raw.modifiers);
         if matches!(raw.key, Key::Named(Named::Escape)) {
             if !raw.pressed {
                 return Task::none();
@@ -2363,5 +2542,47 @@ mod tests {
         assert!(modifiers.control());
         assert!(modifiers.shift());
         assert!(!modifiers.alt());
+    }
+
+    #[test]
+    fn click_chain_counts_double_triple_and_resets() {
+        let now = Instant::now();
+        let (first, stamp) = next_click_count(None, now, 10.0, 20.0);
+        assert_eq!(first, 1);
+        let (second, stamp) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(100),
+            11.0,
+            20.0,
+        );
+        assert_eq!(second, 2);
+        let (third, stamp) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(200),
+            10.0,
+            20.0,
+        );
+        assert_eq!(third, 3);
+        let (capped, _) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(300),
+            10.0,
+            20.0,
+        );
+        assert_eq!(capped, 3);
+        let (moved, _) = next_click_count(
+            Some((now, 10.0, 20.0, 1)),
+            now + std::time::Duration::from_millis(100),
+            20.0,
+            20.0,
+        );
+        assert_eq!(moved, 1);
+        let (late, _) = next_click_count(
+            Some((now, 10.0, 20.0, 1)),
+            now + std::time::Duration::from_millis(600),
+            10.0,
+            20.0,
+        );
+        assert_eq!(late, 1);
     }
 }

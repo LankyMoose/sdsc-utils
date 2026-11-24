@@ -116,7 +116,10 @@ synthetic input steps for automation:
 
 - `text` — `{"text": "hello"}` presses/releases each character.
 - `key` — `{"key": "Enter", "modifiers": ["ctrl"]}` taps one named key.
-- `mouse.click` — `{"x": 120, "y": 70}` left-clicks page-local coordinates.
+- `mouse.click` — `{"x": 120, "y": 70, "count": 1}` left-clicks page-local
+  coordinates; `count` 2/3 produces double/triple-click selection.
+- `mouse.drag` — `{"x1": 45, "y1": 150, "x2": 600, "y2": 150}` drags a
+  selection.
 - `mouse.wheel` — `{"x": 300, "y": 400, "dy": -240}` wheels at page-local
   coordinates.
 
@@ -131,6 +134,10 @@ When the plan ends (`replay.done`), the driver closes the Browser window
 immediately so automated runs do not leave UI on the secondary display.
 Quiet sessions also suppress the tray-startup toast and controller auto-open
 Home.
+
+`python scripts/qa_browser_input.py` is the checked-in smoke test: it builds a
+local page, runs these synthetic steps, asserts typed text / wheel scroll /
+drag selection / cursor-shape trace, and kills the process immediately.
 
 ## Adding instrumentation
 
@@ -181,10 +188,13 @@ Rules:
 - `history.devtools` records each exact-jump protocol leg
   (`getNavigationHistory` / `navigateToHistoryEntry`, index, entry id,
   message id), and `history.jump_failed` records why it stopped.
-- `browser.page_click` / `browser.page_wheel` record the page-local point and
-  whether the event came from hardware (`mouse`) or replay. Synthetic replay
-  also emits `browser.synthetic_text` (length only) and
-  `browser.synthetic_key` (named key only); typed characters are never logged.
+- `browser.page_press` / `browser.page_release` record the page-local point,
+  click count, and whether the event came from hardware (`mouse`) or replay.
+  `browser.page_wheel` records the wheel point/deltas. Synthetic replay also
+  emits `browser.synthetic_text` (length only) and `browser.synthetic_key`
+  (named key only); typed characters are never logged.
+- `engine.cursor` records CEF page cursor-shape changes (link hand, text
+  I-beam, resize, etc.).
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).
