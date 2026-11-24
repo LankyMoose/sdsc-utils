@@ -366,6 +366,7 @@ struct TabContext {
     query_seq: Arc<AtomicU64>,
     last_dom_hash: Arc<Mutex<u64>>,
     last_active: Arc<Mutex<u64>>,
+    last_editable: Arc<Mutex<Option<bool>>>,
     scroll: Arc<Mutex<(f32, f32)>>,
     extent: Arc<Mutex<(f32, f32)>>,
     /// Last icon candidate set fetched for this tab (dedupe repeated
@@ -1046,6 +1047,18 @@ cef::wrap_load_handler! {
             trace_engine(&self.ctx, "load.end")
                 .field("generation", generation)
                 .emit();
+            // New document: recompute whether the focused node accepts text,
+            // even if it carries the same focus state as the old page.
+            *self
+                .ctx
+                .last_editable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .ctx
+                .last_dom_hash
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = 0;
             self.ctx.handle.emit(EngineEvent::LoadFinished {
                 tab: self.ctx.tab,
                 generation,
@@ -1522,6 +1535,11 @@ fn handle_dom_json(ctx: &TabContext, json: &str) {
     let scroll = (num("sx"), num("sy"));
     let extent = (num("dw"), num("dh"));
     let active = num("ax").max(0.0) as u64;
+    let editable = root
+        .get("ae")
+        .and_then(|v| v.get("e"))
+        .and_then(|v| v.as_u64())
+        .is_some_and(|value| value != 0);
 
     let mut items = Vec::new();
     if let Some(rows) = root.get("nodes").and_then(|v| v.as_array()) {
@@ -1583,6 +1601,14 @@ fn handle_dom_json(ctx: &TabContext, json: &str) {
         ctx.handle.emit(EngineEvent::FocusChanged {
             tab: ctx.tab,
             id: active,
+        });
+    }
+    let before_editable = *ctx.last_editable.lock().unwrap_or_else(|e| e.into_inner());
+    if before_editable != Some(editable) {
+        *ctx.last_editable.lock().unwrap_or_else(|e| e.into_inner()) = Some(editable);
+        ctx.handle.emit(EngineEvent::EditableFocusChanged {
+            tab: ctx.tab,
+            editable,
         });
     }
 }
@@ -1716,6 +1742,7 @@ impl Worker {
             query_seq: Arc::new(AtomicU64::new(0)),
             last_dom_hash: Arc::new(Mutex::new(0)),
             last_active: Arc::new(Mutex::new(0)),
+            last_editable: Arc::new(Mutex::new(None)),
             scroll: Arc::new(Mutex::new((0.0, 0.0))),
             extent: Arc::new(Mutex::new((0.0, 0.0))),
             favicon_key: Arc::new(Mutex::new(String::new())),
@@ -2190,6 +2217,21 @@ impl Worker {
                 }
                 self.active = tab;
                 self.active_tab.store(tab.0, Ordering::Release);
+                // A newly foregrounded tab must publish its focus state even
+                // when the last snapshot while it was background already
+                // matches: the UI closed any auto-OSK on the switch.
+                if let Some(entry) = self.tab(tab) {
+                    *entry
+                        .ctx
+                        .last_dom_hash
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = 0;
+                    *entry
+                        .ctx
+                        .last_editable
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 let show = self.visible && !self.suspended;
                 for (id, entry) in &self.tabs {
                     let on = *id == tab.0;

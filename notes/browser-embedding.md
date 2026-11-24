@@ -137,8 +137,10 @@ meters still use the legacy per-surface bank.
 - Page `window.open` / `target=_blank` is canceled as a native popup and
   opened as a normal foreground tab instead. The source tab is preserved.
 - The on-screen keyboard (Square, or F6 on a hardware keyboard) types into
-  the focused page field or the URL draft; page IME flows through
-  `ime_bridge` and CEF composition calls. See
+  the focused page field or the URL draft. It also opens automatically when a
+  pointer click lands on an editable field and closes on blur; page-load
+  autofocus is ignored until the user points at the field. Page IME flows
+  through `ime_bridge` and CEF composition calls. See
   [browser-osk.md](browser-osk.md).
 - Automated sessions set `SDSC_DEBUG_INPUT=0`, which locks real pad,
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also

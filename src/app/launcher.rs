@@ -529,6 +529,8 @@ impl App {
         self.browser.panel.draft = url.clone();
         self.browser.panel.scroll_y = 0.0;
         self.browser.panel.url_editing = false;
+        self.browser.panel.osk.close_auto();
+        self.browser.panel.page_user_input_at = None;
         self.browser.panel.bookmark_bubble = false;
         self.browser.panel.history_selector = None;
         // Fresh page: cursor back to center; focusables arrive with the
@@ -1287,6 +1289,7 @@ impl App {
                 None => "Clicking…",
             };
         self.browser.panel.last_click = Some(((x, y), Instant::now()));
+        self.browser.panel.page_user_input_at = Some(Instant::now());
         self.browser.panel.action_hint = Some((label.to_string(), Instant::now()));
         let trace =
             crate::platform::trace::action(crate::platform::trace::Lane::Browser, "browser.click")
@@ -1796,7 +1799,7 @@ impl App {
             panel.history_selector = None;
             panel.bookmark_bubble = false;
             panel.url_editing = false;
-            panel.osk.open = false;
+            panel.osk.close();
             let generation = panel.page.session.begin_load(url.clone());
             panel.rebuild_chrome();
             panel.save_tabs();
@@ -1828,6 +1831,9 @@ impl App {
         needs_open: bool,
         url: String,
     ) {
+        // Auto-OSK belongs to the tab that opened it; the newly active tab
+        // republishes its own focus state after `SetActiveTab`.
+        self.browser.panel.osk.close_auto();
         if let Some(engine) = &self.browser.engine {
             if needs_open {
                 let generation = self.browser.panel.session.begin_load(url.clone());
@@ -2208,6 +2214,9 @@ impl App {
                     self.browser.panel.pending_focus = None;
                 }
             }
+            EngineEvent::EditableFocusChanged { tab: _, editable } => {
+                self.on_browser_editable_focus(editable);
+            }
             EngineEvent::LoadFinished {
                 tab,
                 generation,
@@ -2311,6 +2320,9 @@ impl App {
                 EngineEvent::FocusChanged { id, .. } => {
                     // Docked when foregrounded (if still live then).
                     stored.page.pending_focus = Some(id);
+                }
+                EngineEvent::EditableFocusChanged { .. } => {
+                    // Background focus cannot drive the shared OSK.
                 }
                 EngineEvent::LoadFinished {
                     generation, result, ..

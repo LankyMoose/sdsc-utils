@@ -242,9 +242,40 @@ pub struct OskState {
     pub open: bool,
     pub focus: usize,
     pub layer: OskLayer,
+    /// Opened because a page text target gained focus rather than by Square.
+    /// Blur closes only this kind, so a deliberately opened OSK stays put.
+    pub auto_opened: bool,
 }
 
 impl OskState {
+    /// Open from a page-focus event (no-op if already open).
+    pub fn open_auto(&mut self) {
+        if !self.open {
+            self.open = true;
+            self.auto_opened = true;
+        }
+    }
+
+    /// Open from an explicit Square/F6 press. The caller's manual choice
+    /// wins over focus-based lifetime from here on.
+    pub fn open_manual(&mut self) {
+        self.open = true;
+        self.auto_opened = false;
+    }
+
+    /// Close and forget why it was open.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.auto_opened = false;
+    }
+
+    /// Close only when focus opened it; a manual OSK survives blur.
+    pub fn close_auto(&mut self) {
+        if self.auto_opened {
+            self.close();
+        }
+    }
+
     pub fn rows(&self) -> &'static [&'static [OskKey]] {
         match self.layer {
             OskLayer::Alpha => OSK_ALPHA,
@@ -352,6 +383,11 @@ pub struct BrowserPanel {
     /// events use this point; replay sets it explicitly so automation never
     /// depends on the OS cursor position.
     pub page_mouse: (f32, f32),
+    /// Last page-pointer action (mouse click or pad Cross). Auto-OSK ignores
+    /// programmatic page-load autofocus unless this is recent, so opening the
+    /// Browser on a search page does not immediately cover it with the
+    /// keyboard.
+    pub page_user_input_at: Option<Instant>,
     /// Physical mouse is the active pointer (pad ring hides, OS cursor shows).
     pub page_mouse_active: bool,
     /// Left page button currently held (drag selection).
@@ -443,6 +479,7 @@ impl Default for BrowserPanel {
                 crate::browser::cursor::VIEWPORT_W * 0.5,
                 crate::browser::cursor::VIEWPORT_H * 0.5,
             ),
+            page_user_input_at: None,
             page_mouse_active: false,
             page_mouse_down: false,
             page_mouse_modifiers: keyboard_types::Modifiers::empty(),
@@ -519,6 +556,8 @@ impl BrowserPanel {
     pub fn reset_live_page(&mut self) {
         self.page = BrowserTabPage::default();
         self.sync_live_cursor();
+        // Auto-OSK belongs to the old page's focused field.
+        self.osk.close_auto();
     }
 
     /// Find a background tab's stored state.
@@ -1444,5 +1483,28 @@ mod tests {
         assert_eq!(osk.layer, OskLayer::Symbol);
         assert!(osk.focus < osk.key_count());
         assert_eq!(OskKey::Layer.label(osk.layer), "abc");
+    }
+
+    #[test]
+    fn auto_osk_closes_on_blur_but_manual_osk_survives_it() {
+        let mut osk = OskState::default();
+        osk.open_auto();
+        assert!(osk.open && osk.auto_opened);
+        osk.close_auto();
+        assert!(!osk.open && !osk.auto_opened);
+
+        osk.open_manual();
+        assert!(osk.open && !osk.auto_opened);
+        osk.close_auto();
+        assert!(osk.open, "manual OSK must survive a page blur");
+        osk.close();
+        assert!(!osk.open && !osk.auto_opened);
+
+        osk.open_manual();
+        osk.open_auto();
+        assert!(
+            !osk.auto_opened,
+            "auto-open must not take ownership of a manual OSK"
+        );
     }
 }

@@ -398,10 +398,35 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     if (de) { dw = de.scrollWidth || 0; dh = de.scrollHeight || 0; }
   } catch (e) {}
   // Focused element in the snapshot's own id space (0 = none/body):
-  // drives cursor docking on autofocus / JS .focus().
+  // drives cursor docking on autofocus / JS .focus(). `ae` additionally
+  // reports whether it accepts text, which drives the on-screen keyboard.
   var ax = 0;
-  try { var ae = document.activeElement; if (ae && ae !== document.body && ae !== document.documentElement) { ax = idFor(ae); } } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, dt: S.doc};
+  var aeInfo = null;
+  try {
+    var ae = document.activeElement;
+    if (ae && ae !== document.body && ae !== document.documentElement) {
+      ax = idFor(ae);
+      var tag = (ae.tagName || "").toLowerCase();
+      var typ = "";
+      try { typ = (ae.getAttribute ? (ae.getAttribute("type") || "") : "").toLowerCase(); } catch (e5) {}
+      var editable = 0;
+      try {
+        if (tag === "input" || tag === "textarea") {
+          // Text-like inputs only: buttons, checkboxes, file pickers and
+          // colour/range controls focus without accepting typed text.
+          var nonText = /^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/;
+          editable = (!ae.disabled && !ae.readOnly && !nonText.test(typ)) ? 1 : 0;
+        } else if (ae.isContentEditable) {
+          editable = 1;
+        } else {
+          var arole = (ae.getAttribute ? (ae.getAttribute("role") || "") : "").toLowerCase();
+          editable = (arole === "textbox" || arole === "searchbox") ? 1 : 0;
+        }
+      } catch (e6) {}
+      aeInfo = {e: editable, t: tag, y: typ};
+    }
+  } catch (e) {}
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, ae: aeInfo, dt: S.doc};
 })()"###;
 
 pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {
@@ -446,6 +471,8 @@ mod tests {
         assert!(js.contains("__sdsc_cx=10"));
         assert!(js.contains("role=\"button\""));
         assert!(js.contains("role=\"option\""));
+        assert!(js.contains("isContentEditable"));
+        assert!(js.contains("ae: aeInfo"));
         assert_eq!(dom_kind("div", "option", ""), FocusKind::Button);
         assert_eq!(dom_kind("a", "", ""), FocusKind::Link);
         assert_eq!(dom_kind("input", "", "text"), FocusKind::Field);

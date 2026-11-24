@@ -348,6 +348,14 @@ pub enum EngineEvent {
         tab: TabId,
         id: u64,
     },
+    /// The active node changed between accepting typed text and not
+    /// (text input/textarea/contenteditable/ARIA textbox). Unlike
+    /// `FocusChanged`, this also fires on blur-to-nothing so the UI can
+    /// dismiss an auto-shown on-screen keyboard.
+    EditableFocusChanged {
+        tab: TabId,
+        editable: bool,
+    },
     /// Canonical session history (engine-provided entries +
     /// current index). Overwrites the UI's locally-maintained session
     /// stack so the hold-bumper selector shows exact back/forward targets.
@@ -423,6 +431,7 @@ impl EngineEvent {
             | Self::ScrollOffset { tab, .. }
             | Self::ScrollExtent { tab, .. }
             | Self::FocusChanged { tab, .. }
+            | Self::EditableFocusChanged { tab, .. }
             | Self::HistoryChanged { tab, .. }
             | Self::HistoryCapability { tab, .. }
             | Self::HistoryJumpFailed { tab, .. }

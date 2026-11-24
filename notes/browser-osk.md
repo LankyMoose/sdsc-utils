@@ -13,6 +13,17 @@ entry in the Browser (page fields or URL bar).
   - Triangle backspaces,
   - Square switches Alpha/Symbol,
   - Circle/Esc closes.
+- **Auto display on editable focus.** The DOM query reports whether the active
+  element accepts text (text-like `input`, `textarea`, `contenteditable`, or
+  an ARIA `textbox`/`searchbox`; buttons, selects, checkboxes, file/colour/
+  range controls do not qualify). `EditableFocusChanged` opens the OSK when
+  focus lands there and closes it on blur. The engine also resets the state on
+  a new document so a fresh autofocus field is re-evaluated.
+- To avoid covering a page that autofocuses its search box on load, auto-open
+  requires a recent page pointer click (mouse or pad Cross,
+  `BrowserPanel::page_user_input_at`). Programmatic `.focus()` and page-load
+  `autofocus` stay closed until the user points at the field. A manual Square
+  open sets `auto_opened = false`, so focus loss does not dismiss it.
 - Keys are ordinary iced buttons, so the mouse can click them too.
 - Character and Space keys append to the URL draft while URL editing, else
   they synthesize page key events through the same `on_browser_key` path as
@@ -46,9 +57,14 @@ entry in the Browser (page fields or URL bar).
   the same handlers with synthetic events. `scripts/qa_browser_input.py`
   verifies typed text (`hello`), IME commit (`é`), OSK commit (`!`), wheel
   scroll, drag/double-click selection, and cursor-shape tracing without using
-  the OS keyboard/mouse.
+  the OS keyboard/mouse. `scripts/qa_browser_osk.py` clicks a field, blurs it,
+  and refocuses it, asserting the trace sequence `browser.osk_focus` open →
+  close → open and that page-load autofocus did not open it first.
 
 ## Deferred
 
 - Predictive text, clipboard history, alternate layouts beyond QWERTY +
   symbols, pretty key art, and native OSK-touch-keyboard integration.
+- Text fields inside iframes: the focus probe is top-document only (the same
+  boundary as the cursor target query), so those need the manual Square
+  toggle for now.

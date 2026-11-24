@@ -146,7 +146,9 @@ drag selection / cursor-shape trace, and kills the process immediately.
 `python scripts/qa_browser_popup.py` does the same for target=_blank popups
 becoming a second Browser tab. `python scripts/qa_browser_visual.py` captures
 a debug screenshot and verifies the actual page pixels, catching widget-tree
-render regressions that traces cannot see.
+render regressions that traces cannot see. `python scripts/qa_browser_osk.py`
+clicks/blurs/refocuses a field and checks the `browser.osk_focus` auto-open /
+auto-close sequence.
 
 ## Adding instrumentation
 

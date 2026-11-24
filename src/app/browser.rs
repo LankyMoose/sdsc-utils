@@ -175,6 +175,10 @@ const HISTORY_TRAVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Double/triple-click window and movement tolerance for page selection.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 const MULTI_CLICK_SLOP: f32 = 4.0;
+/// A focus change this soon after a page pointer click is treated as
+/// user-driven (auto-OSK); older focus changes are page autofocus or
+/// programmatic `.focus()`.
+const AUTO_OSK_INPUT_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Advance the double/triple-click chain. Returns the count for this press and
 /// the stamp to store for the next one.
@@ -646,7 +650,7 @@ impl super::App {
                 return self.osk_activate_key(key);
             }
             Some(NavAction::Cancel) => {
-                self.browser.panel.osk.open = false;
+                self.browser.panel.osk.close();
             }
             Some(NavAction::Triangle) => return self.osk_backspace(),
             Some(NavAction::CycleSort) => self.browser.panel.osk.toggle_layer(),
@@ -1114,13 +1118,62 @@ impl super::App {
     /// Toggle the controller on-screen keyboard. Square opens it; while open
     /// its keys are driven by D-pad + Cross.
     pub(crate) fn toggle_browser_osk(&mut self) {
-        let open = !self.browser.panel.osk.open;
-        self.browser.panel.osk.open = open;
-        if open {
-            self.browser.panel.history_selector = None;
-            self.browser.panel.bookmark_bubble = false;
+        if self.browser.panel.osk.open {
+            self.browser.panel.osk.close();
+            return;
+        }
+        self.browser.panel.osk.open_manual();
+        self.browser.panel.history_selector = None;
+        self.browser.panel.bookmark_bubble = false;
+        self.note_launcher_activity();
+        self.play_ui_cue(UiSoundKind::Action);
+    }
+
+    /// Page text focus changed. Auto-show the OSK for editable targets and
+    /// dismiss it when focus leaves; an OSK opened with Square stays until
+    /// the user closes it.
+    pub(crate) fn on_browser_editable_focus(&mut self, editable: bool) {
+        if !self.browser_visible {
+            return;
+        }
+        if editable {
+            let recent_input = self
+                .browser
+                .panel
+                .page_user_input_at
+                .is_some_and(|at| at.elapsed() <= AUTO_OSK_INPUT_WINDOW);
+            let modal =
+                self.browser.panel.history_selector.is_some() || self.browser.panel.bookmark_bubble;
+            if !recent_input
+                || self.browser.panel.osk.open
+                || self.browser.panel.url_editing
+                || modal
+            {
+                return;
+            }
+            self.browser.panel.osk.open_auto();
             self.note_launcher_activity();
             self.play_ui_cue(UiSoundKind::Action);
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.osk_focus",
+            )
+            .field("editable", true)
+            .field("open", true)
+            .field("auto", true)
+            .emit();
+            return;
+        }
+        if self.browser.panel.osk.auto_opened {
+            self.browser.panel.osk.close();
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.osk_focus",
+            )
+            .field("editable", false)
+            .field("open", false)
+            .field("auto", true)
+            .emit();
         }
     }
 
@@ -1134,7 +1187,7 @@ impl super::App {
             OskKey::Backspace => self.osk_backspace(),
             OskKey::Enter => {
                 if self.browser.panel.url_editing {
-                    self.browser.panel.osk.open = false;
+                    self.browser.panel.osk.close();
                     self.on_browser_navigate()
                 } else {
                     self.osk_named("Enter");
@@ -1146,7 +1199,7 @@ impl super::App {
                 Task::none()
             }
             OskKey::Close => {
-                self.browser.panel.osk.open = false;
+                self.browser.panel.osk.close();
                 Task::none()
             }
         }
@@ -1201,6 +1254,7 @@ impl super::App {
     pub(crate) fn inject_browser_press(&mut self, x: f32, y: f32, source: &'static str) {
         let (x, y) = self.clamp_page_mouse(x, y);
         self.browser.panel.page_mouse_active = true;
+        self.browser.panel.page_user_input_at = Some(Instant::now());
         if self.browser.panel.url_editing {
             // A page click leaves the omnibox; the field disappears and the
             // page receives keyboard focus on the CEF button-down event.
@@ -1442,6 +1496,7 @@ impl super::App {
         // previous open's cursor position.
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.last_sent_mouse = None;
+        self.browser.panel.page_user_input_at = None;
         self.browser_visible = true;
         self.browser_pending_show = true;
         let was_open = self.browser.panel.session.is_open();
@@ -1810,7 +1865,7 @@ impl super::App {
     /// closing the window.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
         if self.browser.panel.osk.open {
-            self.browser.panel.osk.open = false;
+            self.browser.panel.osk.close();
             return Task::none();
         }
         if self.browser.panel.bookmark_bubble {
