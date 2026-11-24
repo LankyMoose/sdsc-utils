@@ -147,6 +147,7 @@ use std::time::Instant;
 use super::Message;
 
 /// Map source-side tap actions to the Browser's semantic nav actions.
+/// Tap only: no hold actions, no history selector, no hints/status.
 fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
     actions.iter().find_map(|action| {
         let nav = match (action.button, action.action) {
@@ -154,12 +155,12 @@ fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
             (PadButton::Circle, PadButtonAction::Tap) => NavAction::Cancel,
             (PadButton::Square, PadButtonAction::Tap) => NavAction::CycleSort,
             (PadButton::Triangle, PadButtonAction::Tap) => NavAction::Triangle,
+            // Semantic action: Options reloads.
             (PadButton::Options, PadButtonAction::Tap) => NavAction::ToggleSettings,
             (PadButton::Create, PadButtonAction::Tap) => NavAction::ToggleControllers,
+            // Semantic actions: L1 back, R1 forward.
             (PadButton::L1, PadButtonAction::Tap) => NavAction::BumperLeft,
             (PadButton::R1, PadButtonAction::Tap) => NavAction::BumperRight,
-            (PadButton::L1, PadButtonAction::Hold) => NavAction::BumperHoldLeft,
-            (PadButton::R1, PadButtonAction::Hold) => NavAction::BumperHoldRight,
             (PadButton::L3, PadButtonAction::Tap) => NavAction::ToggleMagnetism,
             _ => return None,
         };
@@ -276,8 +277,7 @@ impl super::App {
                 let Some(url) = step.params.get("url").and_then(serde_json::Value::as_str) else {
                     return Task::none();
                 };
-                self.browser.panel.draft = url.to_string();
-                self.on_browser_navigate()
+                self.navigate_browser_to(url.to_string())
             }
             "click" => {
                 let x = step.params.get("x").and_then(serde_json::Value::as_f64);
@@ -323,38 +323,6 @@ impl super::App {
                     self.on_browser_go_forward()
                 }
             }
-            "history.open" => {
-                let back = step
-                    .params
-                    .get("back")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true);
-                self.on_browser_history_open(back)
-            }
-            "history.pick" => {
-                let requested = step
-                    .params
-                    .get("index")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|index| index as usize);
-                let target_url = step.params.get("url").and_then(serde_json::Value::as_str);
-                // Resolve by URL first: indices shift when the stack differs.
-                let resolved = target_url
-                    .and_then(|url| {
-                        self.browser
-                            .panel
-                            .session
-                            .nav_entries()
-                            .iter()
-                            .position(|entry| entry.url == url)
-                    })
-                    .or(requested);
-                match resolved {
-                    Some(index) => self.on_browser_history_pick(index),
-                    None => Task::none(),
-                }
-            }
-            "history.cancel" => self.on_browser_history_cancel(),
             #[cfg(debug_assertions)]
             "text" => {
                 if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str) {
@@ -851,8 +819,7 @@ impl super::App {
             .field("reason", "jump_failed")
             .field("engine_reason", reason)
             .emit();
-            self.browser.panel.draft = url;
-            let _ = self.on_browser_navigate();
+            let _ = self.navigate_browser_to(url);
         }
     }
 
@@ -881,8 +848,7 @@ impl super::App {
             .field("url", &url)
             .field("reason", reason)
             .emit();
-        self.browser.panel.draft = url;
-        let _ = self.on_browser_navigate();
+        let _ = self.navigate_browser_to(url);
     }
 
     fn send_history_command(
@@ -1027,36 +993,9 @@ impl super::App {
     ) -> Task<Message> {
         use crate::ui::browser::BrowserMessage;
         match message {
-            BrowserMessage::Close => self.close_browser_window(),
-            BrowserMessage::UrlChanged(draft) => {
-                self.browser.panel.draft = draft;
-                Task::none()
-            }
-            BrowserMessage::ToggleUrlEntry => self.on_toggle_url_entry(),
-            BrowserMessage::Navigate => self.on_browser_navigate(),
-            BrowserMessage::AutocompletePick(url) => {
-                self.browser.panel.draft = url;
-                self.on_browser_navigate()
-            }
             BrowserMessage::Back => self.on_browser_go_back(),
             BrowserMessage::Forward => self.on_browser_go_forward(),
-            BrowserMessage::HistoryOpen { back } => self.on_browser_history_open(back),
-            BrowserMessage::HistoryPick(index) => self.on_browser_history_pick(index),
-            BrowserMessage::HistoryCancel => self.on_browser_history_cancel(),
-            BrowserMessage::OpenExternal => self.on_browser_open_external(),
             BrowserMessage::Reload => self.on_browser_reload(),
-            BrowserMessage::DefaultPage => self.on_browser_go_default(),
-            BrowserMessage::TabNew => self.on_browser_tab_new(),
-            BrowserMessage::TabNext => self.on_browser_tab_next(),
-            BrowserMessage::TabSwitch(id) => self.on_browser_tab_switch(id),
-            BrowserMessage::TabClose(id) => self.on_browser_tab_close(id),
-            BrowserMessage::BookmarkStar => self.on_browser_bookmark_star(),
-            BrowserMessage::BookmarkNameChanged(draft) => {
-                self.browser.panel.bookmark_name_draft = draft;
-                Task::none()
-            }
-            BrowserMessage::BookmarkSave => self.on_browser_bookmark_save(),
-            BrowserMessage::BookmarkRemove => self.on_browser_bookmark_remove(),
             BrowserMessage::PagePointerMoved { x, y } => self.on_browser_page_pointer_moved(x, y),
             BrowserMessage::PagePress => self.on_browser_page_press(),
             BrowserMessage::PageRelease => self.on_browser_page_release(),
@@ -1115,16 +1054,15 @@ impl super::App {
         Task::none()
     }
 
-    /// Toggle the controller on-screen keyboard. Square opens it; while open
-    /// its keys are driven by D-pad + Cross.
+    /// Toggle the controller on-screen keyboard (debug replay path).
+    /// While open its keys are driven by the pad.
+    #[cfg(debug_assertions)]
     pub(crate) fn toggle_browser_osk(&mut self) {
         if self.browser.panel.osk.open {
             self.browser.panel.osk.close();
             return;
         }
         self.browser.panel.osk.open_manual();
-        self.browser.panel.history_selector = None;
-        self.browser.panel.bookmark_bubble = false;
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
     }
@@ -1142,13 +1080,7 @@ impl super::App {
                 .panel
                 .page_user_input_at
                 .is_some_and(|at| at.elapsed() <= AUTO_OSK_INPUT_WINDOW);
-            let modal =
-                self.browser.panel.history_selector.is_some() || self.browser.panel.bookmark_bubble;
-            if !recent_input
-                || self.browser.panel.osk.open
-                || self.browser.panel.url_editing
-                || modal
-            {
+            if !recent_input || self.browser.panel.osk.open {
                 return;
             }
             self.browser.panel.osk.open_auto();
@@ -1178,7 +1110,7 @@ impl super::App {
     }
 
     /// Activate one OSK key. Character/space keys commit text; Enter/Backspace
-    /// target the URL draft while editing, otherwise the focused page field.
+    /// target the focused page field.
     pub(crate) fn osk_activate_key(&mut self, key: crate::ui::browser::OskKey) -> Task<Message> {
         use crate::ui::browser::OskKey;
         match key {
@@ -1186,13 +1118,8 @@ impl super::App {
             OskKey::Space => self.osk_type(" "),
             OskKey::Backspace => self.osk_backspace(),
             OskKey::Enter => {
-                if self.browser.panel.url_editing {
-                    self.browser.panel.osk.close();
-                    self.on_browser_navigate()
-                } else {
-                    self.osk_named("Enter");
-                    Task::none()
-                }
+                self.osk_named("Enter");
+                Task::none()
             }
             OskKey::Layer => {
                 self.browser.panel.osk.toggle_layer();
@@ -1206,10 +1133,6 @@ impl super::App {
     }
 
     fn osk_type(&mut self, text: &str) -> Task<Message> {
-        if self.browser.panel.url_editing {
-            self.browser.panel.draft.push_str(text);
-            return Task::none();
-        }
         let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
         for raw in events {
             let _ = self.on_browser_key(raw);
@@ -1218,10 +1141,6 @@ impl super::App {
     }
 
     fn osk_backspace(&mut self) -> Task<Message> {
-        if self.browser.panel.url_editing {
-            self.browser.panel.draft.pop();
-            return Task::none();
-        }
         self.osk_named("Backspace");
         Task::none()
     }
@@ -1255,11 +1174,6 @@ impl super::App {
         let (x, y) = self.clamp_page_mouse(x, y);
         self.browser.panel.page_mouse_active = true;
         self.browser.panel.page_user_input_at = Some(Instant::now());
-        if self.browser.panel.url_editing {
-            // A page click leaves the omnibox; the field disappears and the
-            // page receives keyboard focus on the CEF button-down event.
-            self.browser.panel.url_editing = false;
-        }
         let count = self.next_page_click_count(x, y);
         self.browser.panel.page_click_count = count;
         self.browser.panel.page_mouse_down = true;
@@ -1519,10 +1433,6 @@ impl super::App {
         });
         self.browser_window = Some(id);
         self.arm_chord_release_latch();
-        // Fetch conventional bookmark icons once the engine and the UI event
-        // subscription are alive; restored bookmarks would otherwise stay
-        // iconless until each site is visited.
-        self.prefetch_bookmark_favicons();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
         let opened = open.map(Message::BrowserOpened);
         let opened = if was_open {
@@ -1561,28 +1471,6 @@ impl super::App {
             return task.chain(crate::ui::layout::focus_window(start));
         }
         task
-    }
-
-    /// Ask the engine for `/favicon.ico` for remembered sites that have no
-    /// cached icon yet. Space is bounded and origins are deduped; the worker
-    /// also dedupes across opens.
-    fn prefetch_bookmark_favicons(&mut self) {
-        let Some(engine) = &self.browser.engine else {
-            return;
-        };
-        let mut seen = std::collections::HashSet::new();
-        for bookmark in self.browser.panel.bookmarks.iter().take(32) {
-            let key = crate::browser::bookmarks::origin_key(&bookmark.url);
-            if key == bookmark.url
-                || self.browser.panel.favicons.contains_key(&key)
-                || !seen.insert(key)
-            {
-                continue;
-            }
-            engine.send(crate::browser::engine::EngineCommand::PrefetchFavicon {
-                url: bookmark.url.clone(),
-            });
-        }
     }
 
     pub(crate) fn on_browser_opened(&mut self, id: iced::window::Id) -> Task<Message> {
@@ -1700,27 +1588,17 @@ impl super::App {
             return self.toggle_home();
         }
         let now = std::time::Instant::now();
-        let history_open = self.browser.panel.history_selector.is_some();
         let engine_mode = self.browser.panel.session.has_frame();
-        // History selector uses D-pad nav; engine mode parks it (cursor
-        // jumps run on the dedicated stepper).
-        let allow_nav = history_open || !engine_mode;
+        // Reader fallback uses the D-pad nav bank; engine mode parks it
+        // (cursor jumps run on the dedicated stepper).
+        let allow_nav = !engine_mode;
         let mut tick = self.browser.nav.tick(
             readings, now, allow_nav, true, false, false, false, false, false,
         );
         // Source-side taps replace the old per-surface face-edge reconstruction.
         if let Some((pad, action)) = browser_tap_action(tap_actions) {
-            // A hold that started before a URL/bookmark surface opened must
-            // not pop the history selector over it.
-            let hold_blocked = matches!(
-                action,
-                NavAction::BumperHoldLeft | NavAction::BumperHoldRight
-            ) && (self.browser.panel.url_editing
-                || self.browser.panel.bookmark_bubble);
-            if !hold_blocked {
-                tick.action = Some(action);
-                tick.action_pad = Some(pad);
-            }
+            tick.action = Some(action);
+            tick.action_pad = Some(pad);
         }
         self.set_haptic_pad_from_id(
             tick.action_pad
@@ -1728,15 +1606,8 @@ impl super::App {
                 .or(tick.cross_completed_pad.as_ref())
                 .or(tick.triangle_completed_pad.as_ref()),
         );
-        if history_open {
-            return self.tick_browser_history_selector(readings, tick.action);
-        }
         if self.browser.panel.osk.open {
             return self.tick_browser_osk(readings, tick.action, now);
-        }
-        if tick.action == Some(NavAction::CycleSort) {
-            self.toggle_browser_osk();
-            return Task::none();
         }
         if engine_mode {
             self.tick_browser_cursor(readings, now);
@@ -1777,32 +1648,19 @@ impl super::App {
                     self.browser.panel.jump_cursor(JumpDir::Right);
                     Task::none()
                 }
-                Some(NavAction::Confirm) => {
-                    if self.browser.panel.url_editing {
-                        self.on_browser_message(crate::ui::browser::BrowserMessage::Navigate)
-                    } else {
-                        self.click_browser_cursor()
-                    }
-                }
+                Some(NavAction::Confirm) => self.click_browser_cursor(),
+                // Escape does not close the Browser; Home/PS is the only
+                // close path.
                 Some(NavAction::Cancel) => self.browser_cancel(),
+                // Semantic actions: L1 back, R1 forward, Options reload.
                 Some(NavAction::BumperLeft) => {
                     self.on_browser_message(crate::ui::browser::BrowserMessage::Back)
                 }
                 Some(NavAction::BumperRight) => {
                     self.on_browser_message(crate::ui::browser::BrowserMessage::Forward)
                 }
-                Some(NavAction::BumperHoldLeft) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryOpen {
-                        back: true,
-                    })
-                }
-                Some(NavAction::BumperHoldRight) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryOpen {
-                        back: false,
-                    })
-                }
-                Some(NavAction::Triangle) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::ToggleUrlEntry)
+                Some(NavAction::ToggleSettings) => {
+                    self.on_browser_message(crate::ui::browser::BrowserMessage::Reload)
                 }
                 Some(NavAction::ToggleMagnetism) => {
                     self.play_ui_cue(UiSoundKind::Action);
@@ -1823,7 +1681,7 @@ impl super::App {
             let sync = self.sync_browser_mouse();
             Task::batch(vec![flag, action, sync])
         } else {
-            // Reader fallback: D-pad scrolls text, Cross navigates.
+            // Reader fallback: D-pad scrolls text, Cross restores the page.
             match tick.action {
                 Some(NavAction::Up) | Some(NavAction::Left) => {
                     self.play_ui_cue(UiSoundKind::Nav);
@@ -1833,12 +1691,7 @@ impl super::App {
                     self.play_ui_cue(UiSoundKind::Nav);
                     self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
-                Some(NavAction::Confirm) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::Navigate)
-                }
-                Some(NavAction::Triangle) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::ToggleUrlEntry)
-                }
+                Some(NavAction::Confirm) => self.on_browser_go_default(),
                 Some(NavAction::Cancel) => self.browser_cancel(),
                 Some(NavAction::BumperLeft) => {
                     self.on_browser_message(crate::ui::browser::BrowserMessage::Back)
@@ -1846,53 +1699,32 @@ impl super::App {
                 Some(NavAction::BumperRight) => {
                     self.on_browser_message(crate::ui::browser::BrowserMessage::Forward)
                 }
-                Some(NavAction::BumperHoldLeft) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryOpen {
-                        back: true,
-                    })
-                }
-                Some(NavAction::BumperHoldRight) => {
-                    self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryOpen {
-                        back: false,
-                    })
+                Some(NavAction::ToggleSettings) => {
+                    self.on_browser_message(crate::ui::browser::BrowserMessage::Reload)
                 }
                 _ => Task::none(),
             }
         }
     }
 
-    /// Circle/Esc at the root unwinds the browser's own modal layers before
-    /// closing the window.
+    /// Escape while the page has focus: close the controller text keyboard if
+    /// it is open. Home/PS is the only Browser close path.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
         if self.browser.panel.osk.open {
             self.browser.panel.osk.close();
-            return Task::none();
         }
-        if self.browser.panel.bookmark_bubble {
-            self.browser.panel.bookmark_bubble = false;
-            return Task::none();
-        }
-        if self.browser.panel.url_editing {
-            return self.on_browser_message(crate::ui::browser::BrowserMessage::ToggleUrlEntry);
-        }
-        if self.browser.panel.history_selector.is_some() {
-            return self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryCancel);
-        }
-        self.close_browser_window()
+        Task::none()
     }
 
-    /// Platform IME events for the page. The URL text field owns IME natively
-    /// while editing; in page mode these become CEF composition/commit calls.
+    /// Platform IME events for the page. These become CEF
+    /// composition/commit calls.
     pub(crate) fn on_browser_ime(
         &mut self,
         id: iced::window::Id,
         event: iced::advanced::input_method::Event,
     ) -> Task<Message> {
         use iced::advanced::input_method::Event;
-        if Some(id) != self.browser_window
-            || !self.browser_visible
-            || self.browser.panel.url_editing
-        {
+        if Some(id) != self.browser_window || !self.browser_visible {
             return Task::none();
         }
         let tab = self.browser_tab();
@@ -1950,23 +1782,12 @@ impl super::App {
             }
             return self.browser_cancel();
         }
-        if raw.pressed && matches!(raw.key, Key::Named(Named::F6)) {
-            self.toggle_browser_osk();
-            return Task::none();
-        }
-        // The address field owns printable input natively while editing.
-        if self.browser.panel.url_editing {
-            return Task::none();
-        }
         if raw.pressed {
             if raw.modifiers.control()
                 && let Key::Character(text) = &raw.key
+                && text.to_lowercase().as_str() == "r"
             {
-                match text.to_lowercase().as_str() {
-                    "l" => return self.on_browser_message(BrowserMessage::ToggleUrlEntry),
-                    "r" => return self.on_browser_message(BrowserMessage::Reload),
-                    _ => {}
-                }
+                return self.on_browser_message(BrowserMessage::Reload);
             }
             if raw.modifiers.alt() {
                 match &raw.key {
@@ -2003,7 +1824,7 @@ impl super::App {
             Key::Named(Named::ArrowDown) => {
                 self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
             }
-            Key::Named(Named::Enter) => self.on_browser_message(BrowserMessage::Navigate),
+            Key::Named(Named::Enter) => self.on_browser_go_default(),
             _ => Task::none(),
         }
     }
@@ -2647,30 +2468,6 @@ pub(crate) fn trace_browser_state(
 
     let page = &panel.page;
     let session = &page.session;
-    let selector = page.history_selector.as_ref().map(|sel| {
-        let list = if sel.back {
-            session.back_entries()
-        } else {
-            session.forward_entries()
-        };
-        let rows: Vec<serde_json::Value> = list
-            .iter()
-            .enumerate()
-            .map(|(shown, (index, entry))| {
-                json!({
-                    "shown": shown,
-                    "index": index,
-                    "url": entry.url,
-                    "title": entry.title,
-                })
-            })
-            .collect();
-        json!({
-            "back": sel.back,
-            "highlight": sel.highlight,
-            "entries": rows,
-        })
-    });
     let engine_history = page.last_engine_history.as_ref().map(|history| {
         let center = history.current.min(history.entries.len().saturating_sub(1));
         let start = center.saturating_sub(8);
@@ -2703,11 +2500,7 @@ pub(crate) fn trace_browser_state(
             "title": session.title(),
             "loading": session.loading(),
             "generation": session.generation(),
-            "engine_activity": page.engine_activity.label(),
-            "url_editing": panel.url_editing,
-            "bookmark_bubble": panel.bookmark_bubble,
             "nav": nav_window(session.nav_entries(), session.nav_current()),
-            "selector": selector,
         },
         "engine": {
             "history": engine_history,
@@ -2739,7 +2532,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_state_exposes_nav_and_selector_entries() {
+    fn trace_state_exposes_nav_entries() {
         let mut panel = crate::ui::browser::state::BrowserPanel::default();
         panel.session.open_surface();
         panel.session.begin_load("https://b.test/".to_string());
@@ -2762,18 +2555,11 @@ mod tests {
             ],
             1,
         );
-        panel.page.history_selector = Some(crate::ui::browser::HistorySelector {
-            back: true,
-            highlight: 0,
-        });
         let state = trace_browser_state(&panel);
         assert_eq!(state["ui"]["nav"]["current"], 1);
         assert_eq!(state["ui"]["nav"]["entries"][0]["url"], "https://a.test/");
-        assert_eq!(state["ui"]["selector"]["entries"][0]["index"], 0);
-        assert_eq!(
-            state["ui"]["selector"]["entries"][0]["url"],
-            "https://a.test/"
-        );
+        assert!(state["ui"].get("selector").is_none());
+        assert!(state["ui"].get("url_editing").is_none());
     }
 
     #[test]
@@ -2785,20 +2571,16 @@ mod tests {
             (PadButton::L3, NavAction::ToggleMagnetism),
             (PadButton::L1, NavAction::BumperLeft),
             (PadButton::R1, NavAction::BumperRight),
+            (PadButton::Options, NavAction::ToggleSettings),
         ] {
             assert_eq!(
                 browser_tap_action(&[tap(button)]).map(|(_, action)| action),
                 Some(expected)
             );
         }
-        assert_eq!(
-            browser_tap_action(&[hold(PadButton::L1)]).map(|(_, action)| action),
-            Some(NavAction::BumperHoldLeft)
-        );
-        assert_eq!(
-            browser_tap_action(&[hold(PadButton::R1)]).map(|(_, action)| action),
-            Some(NavAction::BumperHoldRight)
-        );
+        // Tap only: holds never invoke actions.
+        assert!(browser_tap_action(&[hold(PadButton::L1)]).is_none());
+        assert!(browser_tap_action(&[hold(PadButton::R1)]).is_none());
         assert!(browser_tap_action(&[tap(PadButton::R3)]).is_none());
         assert!(browser_tap_action(&[hold(PadButton::Cross)]).is_none());
     }

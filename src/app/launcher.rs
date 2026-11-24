@@ -396,22 +396,21 @@ impl App {
         // The card's 16:9 page area drives the engine viewport; sync before
         // the first frame so the cursor space and image are the same size.
         self.sync_browser_viewport();
-        // First fresh surface: restore the persisted strip when one exists,
-        // else start at the default page instead of the empty state. The engine already
-        // preloaded the saved active URL at boot, so the session URL is never
-        // empty here; a one-shot flag distinguishes the first open from a
-        // reopen of the cached page.
+        // First fresh surface: restore the last page when one exists, else
+        // start at the default page instead of the empty state. The engine
+        // already preloaded the saved active URL at boot, so the session URL
+        // is never empty here; a one-shot flag distinguishes the first open
+        // from a reopen of the cached page.
         if !self.browser.tabs_restored {
             self.browser.tabs_restored = true;
             let saved = crate::browser::tabs::load();
             if !saved.tabs.is_empty() {
-                let task = self.restore_browser_tabs(saved);
+                let task = self.restore_browser_page(saved);
                 self.resume_browser_engine();
                 crate::controller::hid::diag::diag_info("ui-diag: browser session open (restore)");
                 return task;
             }
-            self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
-            let task = self.on_browser_navigate();
+            let task = self.on_browser_go_default();
             self.resume_browser_engine();
             crate::controller::hid::diag::diag_info("ui-diag: browser session open (default page)");
             return task;
@@ -422,11 +421,9 @@ impl App {
     }
 
     /// Browser default page. Hardcoded until the settings screen lands, then a
-    /// pref. Reuses the navigate path (fresh-page cursor/focusable reset,
-    /// theme sync) with the draft pinned to the default page.
+    /// pref; navigation is via page links/search plus back/forward/reload.
     pub(crate) fn on_browser_go_default(&mut self) -> Task<Message> {
-        self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
-        self.on_browser_navigate()
+        self.navigate_browser_to(crate::browser::BROWSER_DEFAULT_URL.to_string())
     }
 
     /// Active tab id for engine commands. The backend gates input to the
@@ -502,15 +499,10 @@ impl App {
         }
     }
 
-    pub(crate) fn on_browser_navigate(&mut self) -> Task<Message> {
+    pub(crate) fn navigate_browser_to(&mut self, url: String) -> Task<Message> {
         self.cancel_history_travel("navigate");
-        let draft = self.browser.panel.draft.clone();
         let current = self.browser.panel.session.url().to_string();
-        let raw = if draft.trim().is_empty() {
-            current
-        } else {
-            draft
-        };
+        let raw = if url.trim().is_empty() { current } else { url };
         let url = crate::browser::nav::resolve_navigate_target(&raw);
         if url.is_empty() {
             self.trace_browser_noop("browser.navigate", "ui", "empty_url");
@@ -526,13 +518,9 @@ impl App {
         } else {
             None
         };
-        self.browser.panel.draft = url.clone();
         self.browser.panel.scroll_y = 0.0;
-        self.browser.panel.url_editing = false;
         self.browser.panel.osk.close_auto();
         self.browser.panel.page_user_input_at = None;
-        self.browser.panel.bookmark_bubble = false;
-        self.browser.panel.history_selector = None;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree. Recenter the existing cursor so the live
         // viewport bounds (not the 800x600 defaults) survive navigation.
@@ -545,8 +533,8 @@ impl App {
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
         if self.browser.engine.is_none() {
-            // The engine is mandatory in phase 4; Home tile handles the
-            // missing-engine install flow before a window ever opens.
+            // The engine is mandatory; Home tile handles the missing-engine
+            // install flow before a window ever opens.
             self.browser
                 .panel
                 .session
@@ -593,9 +581,8 @@ impl App {
     }
 
     /// Raw keyboard routing for Launcher. Controller-first: with the engine
-    /// page focused, keys go to the page (typing, shortcuts, focus nav);
-    /// URL-edit mode and the reader fall back to the legacy Launcher-key map
-    /// (arrows navigate, Enter confirms, Esc cancels).
+    /// page focused, keys go to the page (typing, shortcuts, focus nav); the
+    /// reader falls back to the legacy Launcher-key map.
     pub(crate) fn on_browser_raw_key(&mut self, id: window::Id, raw: RawKey) -> Task<Message> {
         self.haptic_pad_serial = None;
         if Some(id) == self.home_window && self.home_visible {
@@ -652,30 +639,6 @@ impl App {
         Task::none()
     }
 
-    /// URL-edit mode: keyboard goes to the address field (the widget owns
-    /// printable keys natively); the field is focused so typing lands there.
-    /// Exits on navigate, Esc/Circle, or surface close.
-    pub(crate) fn on_toggle_url_entry(&mut self) -> Task<Message> {
-        if !self.browser.panel.session.is_open() {
-            return Task::none();
-        }
-        let next = !self.browser.panel.url_editing;
-        self.browser.panel.url_editing = next;
-        if next {
-            self.browser.panel.history_selector = None;
-        }
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: browser url entry {}",
-            if next { "open" } else { "close" }
-        ));
-        if next {
-            return operation::focus(crate::ui::browser::view::browser_url_id());
-        }
-        Task::none()
-    }
-
     pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
         if self.browser.engine.is_none() {
             self.trace_browser_noop("browser.history.back", "pad", "engine_unavailable");
@@ -710,82 +673,11 @@ impl App {
         Task::none()
     }
 
-    /// Browser: open the hold-bumper history selector (B2.4). `back` picks
-    /// the L1/back direction, else R1/forward. No-op when that direction
-    /// has no entries (never an empty dropdown) or the selector is already
-    /// open (a second hold never restacks). Default highlight is the
-    /// closest entry — the quick-press target.
-    pub(crate) fn on_browser_history_open(&mut self, back: bool) -> Task<Message> {
-        if !self.browser.panel.session.is_open() {
-            self.trace_browser_noop("browser.history.open", "pad", "surface_closed");
-            return Task::none();
-        }
-        if self.browser.panel.history_selector.is_some() {
-            self.trace_browser_noop("browser.history.open", "pad", "already_open");
-            return Task::none();
-        }
-        let has = if back {
-            self.browser.panel.can_go_back()
-        } else {
-            self.browser.panel.can_go_forward()
-        };
-        if !has {
-            self.trace_browser_noop(
-                "browser.history.open",
-                "pad",
-                if back {
-                    "no_back_entry"
-                } else {
-                    "no_forward_entry"
-                },
-            );
-            return Task::none();
-        }
-        let source = if crate::platform::trace::replay::replaying() {
-            "replay"
-        } else {
-            "pad"
-        };
-        let trace = crate::platform::trace::action(
-            crate::platform::trace::Lane::Browser,
-            "browser.history.open",
-        )
-        .app("browser")
-        .source(source)
-        .field("back", back)
-        .pre(crate::app::browser::trace_browser_state(
-            &self.browser.panel,
-        ))
-        .repro(serde_json::json!({
-            "app": "browser",
-            "action": "history.open",
-            "params": { "back": back },
-        }))
-        .begin();
-        self.browser.panel.history_selector =
-            Some(crate::ui::browser::HistorySelector { back, highlight: 0 });
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        trace
-            .finish("opened")
-            .post(crate::app::browser::trace_browser_state(
-                &self.browser.panel,
-            ))
-            .check(
-                "selector_open",
-                self.browser.panel.history_selector.is_some(),
-            )
-            .emit();
-        Task::none()
-    }
-
-    /// Browser: selector pick — traverse to the absolute session index.
+    /// Dormant DevTools history jump: traverse to an absolute session index.
     /// History travel jumps directly through CEF's DevTools protocol
     /// (`Page.navigateToHistoryEntry`), so skippable entries cannot be skipped
-    /// and the forward tail survives; only a normal navigation truncates it.
-    /// Closes the selector first so the loadbehind never renders under it,
-    /// and swallows an in-flight Cross press so the confirming release
-    /// cannot also click the fresh page.
+    /// and the forward tail survives. No v0 UI invokes this; the backend stays
+    /// exact for the future redesign.
     pub(crate) fn on_browser_history_pick(&mut self, index: usize) -> Task<Message> {
         let prepared = {
             let session = &self.browser.panel.session;
@@ -795,29 +687,25 @@ impl App {
             }
         };
         let Some((current, url)) = prepared else {
-            self.trace_browser_noop("browser.history.pick", "pad", "missing_entry");
+            self.trace_browser_noop("browser.history.pick", "action", "missing_entry");
             return Task::none();
         };
         if self.browser.engine.is_none() {
-            self.trace_browser_noop("browser.history.pick", "pad", "engine_unavailable");
+            self.trace_browser_noop("browser.history.pick", "action", "engine_unavailable");
             // Reader fallback has no session-history traversal; keep the
-            // old fetch path (forward tail may prune there).
-            self.browser.panel.history_selector = None;
-            self.browser.panel.draft = url;
-            return self.on_browser_navigate();
+            // plain fetch path (forward tail may prune there).
+            return self.navigate_browser_to(url);
         }
         if index == current {
             let pre = crate::app::browser::trace_browser_state(&self.browser.panel);
-            self.browser.panel.history_selector = None;
-            self.browser.panel.draft = url;
             crate::platform::trace::action(
                 crate::platform::trace::Lane::Browser,
                 "browser.history.pick",
             )
             .app("browser")
-            .source("pad")
+            .source("action")
             .field("requested_index", index)
-            .field("requested_url", self.browser.panel.draft.as_str())
+            .field("requested_url", url.as_str())
             .pre(pre)
             .begin()
             .finish("noop")
@@ -829,52 +717,9 @@ impl App {
             .emit();
             return Task::none();
         }
-        self.browser.panel.history_selector = None;
-        self.browser.panel.draft = url.clone();
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
-        self.start_history_travel("browser.history.pick", "pad", index, Some(url));
-        Task::none()
-    }
-
-    /// Browser: dismiss the history selector without navigating.
-    pub(crate) fn on_browser_history_cancel(&mut self) -> Task<Message> {
-        if self.browser.panel.history_selector.is_none() {
-            self.trace_browser_noop("browser.history.cancel", "pad", "not_open");
-            return Task::none();
-        }
-        let source = if crate::platform::trace::replay::replaying() {
-            "replay"
-        } else {
-            "pad"
-        };
-        let trace = crate::platform::trace::action(
-            crate::platform::trace::Lane::Browser,
-            "browser.history.cancel",
-        )
-        .app("browser")
-        .source(source)
-        .pre(crate::app::browser::trace_browser_state(
-            &self.browser.panel,
-        ))
-        .repro(serde_json::json!({
-            "app": "browser",
-            "action": "history.cancel",
-        }))
-        .begin();
-        self.browser.panel.history_selector = None;
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        trace
-            .finish("cancelled")
-            .post(crate::app::browser::trace_browser_state(
-                &self.browser.panel,
-            ))
-            .check(
-                "selector_closed",
-                self.browser.panel.history_selector.is_none(),
-            )
-            .emit();
+        self.start_history_travel("browser.history.pick", "action", index, Some(url));
         Task::none()
     }
 
@@ -911,146 +756,16 @@ impl App {
         true
     }
 
-    /// Pad tick while the history selector is open (B2.4). The selector owns
-    /// the pad: Up/Down/Left/Right moves the highlight (highlight 0 =
-    /// closest = quick-press default), Cross confirms, Circle cancels.
-    /// Releasing the bumpers does nothing (the hold is over; the selector
-    /// stays open for D-pad browsing — release-to-confirm fired the moment
-    /// the user let go to reach the D-pad, making navigation impossible).
-    /// Everything else — cursor, scroll, taps, magnetism — stays parked.
-    /// Called before the engine/reader split so both modes share it.
-    pub(crate) fn tick_browser_history_selector(
-        &mut self,
-        readings: &[launcher_input::NavReading],
-        action: Option<NavAction>,
-    ) -> Task<Message> {
-        let _ = readings;
-        match action {
-            Some(NavAction::Up) | Some(NavAction::Left) => {
-                if let Some(sel) = self.browser.panel.history_selector.as_mut()
-                    && sel.highlight > 0
-                {
-                    sel.highlight -= 1;
-                    self.note_launcher_activity();
-                    self.play_ui_cue(UiSoundKind::Nav);
-                }
-                Task::none()
-            }
-            Some(NavAction::Down) | Some(NavAction::Right) => {
-                let len = {
-                    let panel = &self.browser.panel;
-                    match &panel.history_selector {
-                        Some(sel) if sel.back => panel.session.back_entries().len(),
-                        Some(_) => panel.session.forward_entries().len(),
-                        None => 0,
-                    }
-                };
-                if let Some(sel) = self.browser.panel.history_selector.as_mut()
-                    && len > 0
-                {
-                    sel.highlight += 1;
-                    sel.clamp(len);
-                    self.note_launcher_activity();
-                    self.play_ui_cue(UiSoundKind::Nav);
-                }
-                Task::none()
-            }
-            Some(NavAction::Confirm) => {
-                if let Some(sel) = &self.browser.panel.history_selector
-                    && let Some(index) = sel.picked(&self.browser.panel.session)
-                {
-                    return self.on_browser_message(
-                        crate::ui::browser::BrowserMessage::HistoryPick(index),
-                    );
-                }
-                self.browser.panel.history_selector = None;
-                Task::none()
-            }
-            Some(NavAction::Cancel) => {
-                self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryCancel)
-            }
-            // Taps, holds, magnetism, and cursor moves stay parked: the
-            // hold claimed the press and the selector owns the outcome.
-            _ => Task::none(),
-        }
-    }
-
-    /// Star toggle: bookmark the current page (opening the rename bubble),
-    /// or open the bubble for an already-bookmarked page. No page, no-op
-    /// (fresh surface navigates to the default page first — nothing to star yet).
-    pub(crate) fn on_browser_bookmark_star(&mut self) -> Task<Message> {
-        let url = self.browser.panel.session.url().to_string();
-        if url.is_empty() {
-            return Task::none();
-        }
-        let panel = &mut self.browser.panel;
-        if !panel.is_bookmarked(&url) {
-            let title = panel.session.title().unwrap_or(&url).to_string();
-            panel.bookmarks.push(crate::browser::bookmarks::Bookmark {
-                url: url.clone(),
-                title,
-            });
-            crate::browser::bookmarks::save(&panel.bookmarks);
-            panel.rebuild_chrome();
-        }
-        let draft = panel
-            .bookmarks
-            .iter()
-            .find(|b| b.url == url)
-            .map(|b| b.title.clone())
-            .unwrap_or_default();
-        panel.bookmark_name_draft = draft;
-        panel.bookmark_bubble = true;
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        operation::focus(crate::ui::browser::view::bookmark_name_id())
-    }
-
-    /// Star bubble Done: apply a non-empty rename, persist, close.
-    /// An empty draft keeps the existing name (Chrome requires one; v1
-    /// keeps the old instead of deleting).
-    pub(crate) fn on_browser_bookmark_save(&mut self) -> Task<Message> {
-        let url = self.browser.panel.session.url().to_string();
-        let panel = &mut self.browser.panel;
-        if let Some(entry) = panel.bookmarks.iter_mut().find(|b| b.url == url) {
-            let renamed = panel.bookmark_name_draft.trim().to_string();
-            if !renamed.is_empty() {
-                entry.title = renamed;
-            }
-            crate::browser::bookmarks::save(&panel.bookmarks);
-        }
-        self.browser.panel.bookmark_bubble = false;
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        Task::none()
-    }
-
-    /// Star bubble Remove: delete the current page's bookmark, persist,
-    /// close.
-    pub(crate) fn on_browser_bookmark_remove(&mut self) -> Task<Message> {
-        let url = self.browser.panel.session.url().to_string();
-        let panel = &mut self.browser.panel;
-        panel.bookmarks.retain(|b| b.url != url);
-        crate::browser::bookmarks::save(&panel.bookmarks);
-        panel.rebuild_chrome();
-        panel.bookmark_bubble = false;
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        Task::none()
-    }
-
+    /// Semantic reload action (Options default).
     pub(crate) fn on_browser_reload(&mut self) -> Task<Message> {
-        if self.browser.engine.is_none() {
-            return self.on_browser_navigate();
-        }
-        if self.browser.panel.session.url().is_empty() {
-            return self.on_browser_navigate();
+        if self.browser.engine.is_none() || self.browser.panel.session.url().is_empty() {
+            return self.on_browser_go_default();
         }
         let url = self.browser.panel.session.url().to_string();
         let source = if crate::platform::trace::replay::replaying() {
             "replay"
         } else {
-            "ui"
+            "action"
         };
         let flow =
             self.begin_browser_action_trace("browser.reload", source, None, Some(url.clone()));
@@ -1058,8 +773,6 @@ impl App {
         if let Some(pending) = self.pending_browser_trace.as_mut() {
             pending.generation = Some(generation);
         }
-        self.browser.panel.draft = url;
-        self.browser.panel.history_selector = None;
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
         let tab = self.browser_tab();
@@ -1079,24 +792,6 @@ impl App {
                 ignore_cache: false,
             },
         );
-        Task::none()
-    }
-
-    /// Escape hatch for pages the reader backend cannot render.
-    pub(crate) fn on_browser_open_external(&mut self) -> Task<Message> {
-        let session = &self.browser.panel.session;
-        let raw = if session.url().is_empty() {
-            self.browser.panel.draft.clone()
-        } else {
-            session.url().to_string()
-        };
-        let url = crate::browser::nav::resolve_navigate_target(&raw);
-        if url.is_empty() {
-            return Task::none();
-        }
-        if let Err(err) = launch::launch_target(&url, "") {
-            app_log::warn(format!("browser: external open failed: {err}"));
-        }
         Task::none()
     }
 
@@ -1216,44 +911,12 @@ impl App {
     /// Links use trusted CEF mouse input (with a delayed JS fallback), so
     /// Chromium keeps user activation and does not mark the navigation as
     /// skippable. Buttons use trusted input unless the Diagnostics JS-click
-    /// toggle is on. A chrome dock isn't a page click at all — it runs the
-    /// header action instead.
+    /// toggle is on.
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
-        // Chrome dock first: pad action, never an engine click.
-        if let Some(target) = self.browser.panel.chrome_attached() {
-            self.browser.panel.last_click = Some((
-                (self.browser.panel.cursor.x, self.browser.panel.cursor.y),
-                Instant::now(),
-            ));
-            if let Some(message) = self.browser.panel.chrome_message(target) {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: browser chrome activate {target:?}"
-                ));
-                return self.on_browser_message(message);
-            }
-            return Task::none();
-        }
-        // Precise click inside the header: hit the rect under the point even
-        // without a magnet dock. Empty header space must not fall through to
-        // a page click at negative coordinates.
-        if self.browser.panel.cursor.y < 0.0 {
-            if let Some(target) = self
-                .browser
-                .panel
-                .chrome_target_at(self.browser.panel.cursor.x, self.browser.panel.cursor.y)
-                && let Some(message) = self.browser.panel.chrome_message(target)
-            {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: browser precise chrome activate {target:?}"
-                ));
-                return self.on_browser_message(message);
-            }
-            return Task::none();
-        }
         let (x, y, target, trusted) = {
             let panel = &self.browser.panel;
-            let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
-            let (x, y) = panel.cursor.click_point(&targets);
+            let targets = &panel.focusables;
+            let (x, y) = panel.cursor.click_point(targets);
             // Links use trusted CEF mouse input so Chromium keeps user
             // activation and does not mark the resulting history entry
             // skippable. The backend falls back to the JS element click if
@@ -1277,20 +940,8 @@ impl App {
             }
             (x, y, target, trusted)
         };
-        // Instant header feedback ("Opening link…"): the click is
-        // acknowledged now; the page changing (or not) tells the rest.
-        let label =
-            match target.and_then(|id| self.browser.panel.focusables.iter().find(|o| o.id == id)) {
-                Some(o) => match o.kind {
-                    crate::browser::cursor::FocusKind::Link => "Opening link…",
-                    crate::browser::cursor::FocusKind::Field => "Focusing field…",
-                    _ => "Activating…",
-                },
-                None => "Clicking…",
-            };
         self.browser.panel.last_click = Some(((x, y), Instant::now()));
         self.browser.panel.page_user_input_at = Some(Instant::now());
-        self.browser.panel.action_hint = Some((label.to_string(), Instant::now()));
         let trace =
             crate::platform::trace::action(crate::platform::trace::Lane::Browser, "browser.click")
                 .app("browser")
@@ -1336,10 +987,7 @@ impl App {
     /// scroll, url, wells) and forces a debug shot, so the backend pull log
     /// around this timestamp tells the rest of the story.
     pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
-        let targets = crate::ui::browser::cursor_targets(
-            &self.browser.panel.page.focusables,
-            &self.browser.panel.chrome,
-        );
+        let targets = self.browser.panel.page.focusables.clone();
         let panel = &mut self.browser.panel;
         let (cx, cy) = (panel.cursor.x, panel.cursor.y);
         let dock = panel.cursor.attached;
@@ -1432,14 +1080,14 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
         let panel = &self.browser.panel;
-        let targets = crate::ui::browser::cursor_targets(&panel.focusables, &panel.chrome);
+        let targets = &panel.focusables;
         let cursor = (panel.cursor.x, panel.cursor.y);
         let magnet = panel.cursor.magnet;
         let dock = panel.cursor.attached;
         let blend = panel.cursor.dock_blend;
         let rect = panel
             .cursor
-            .attached_rect(&targets)
+            .attached_rect(targets)
             .map(|(x, y, w, h)| format!("({x:.0},{y:.0}) {w:.0}x{h:.0}"))
             .unwrap_or_else(|| "-".to_string());
         let wells = panel.focusables.len();
@@ -1473,37 +1121,6 @@ impl App {
         Task::none()
     }
 
-    /// Engine-created tab (popup `request_create_new`): the backend already
-    /// foregrounded the view — adopt it. Stash the live page, reset the
-    /// live slot, point the draft at the incoming navigation.
-    pub(crate) fn on_tab_opened(
-        &mut self,
-        tab: crate::browser::engine::TabId,
-        slot: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
-    ) -> Task<Message> {
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: browser tab opened tab{}",
-            tab.0
-        ));
-        {
-            let panel = &mut self.browser.panel;
-            panel.stash_live();
-            panel.reset_live_page();
-            panel.page.session.open_surface();
-            panel.page.session.set_frame_slot(slot);
-            panel.page.action_hint = Some(("New tab…".to_string(), std::time::Instant::now()));
-            panel.active_tab = tab;
-            if !panel.order.contains(&tab) {
-                panel.order.push(tab);
-            }
-            panel.draft.clear();
-            panel.rebuild_chrome();
-            panel.save_tabs();
-        }
-        self.sync_live_mouse();
-        Task::none()
-    }
-
     /// Worker-owned frame slot handoff for a tab the UI already knows
     /// (the boot tab, delivered on the first visible tick).
     pub(crate) fn on_frame_slot(
@@ -1520,478 +1137,61 @@ impl App {
         Task::none()
     }
 
-    /// Engine reports a tab's page called `window.close()`: the view is
-    /// already gone backend-side — adopt the most recent survivor (or a
-    /// fresh default tab when none).
-    pub(crate) fn on_tab_closed(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: browser tab closed tab{}",
-            tab.0
-        ));
-        let active = self.browser.panel.active_tab;
-        if tab != active {
-            self.browser.panel.drop_stored(tab);
-            self.save_strip();
-            return Task::none();
-        }
-        // Active tab closed by its page: forget it, adopt a survivor.
-        self.browser.panel.order.retain(|o| *o != tab);
-        let survivor = self.browser.panel.order.pop();
-        match survivor {
-            Some(next) => {
-                let needs_open = self
-                    .browser
-                    .panel
-                    .stored
-                    .iter()
-                    .find(|t| t.id == next)
-                    .is_some_and(|t| !t.loaded);
-                let ok = self.browser.panel.activate_stored(next);
-                debug_assert!(ok);
-                let url = self.browser.panel.session.url().to_string();
-                self.browser.panel.draft = url.clone();
-                self.save_strip();
-                if self.browser.engine.is_none() {
-                    // Reader fallback: fetch the adopted tab.
-                    return self.on_browser_navigate();
-                }
-                self.foreground_live_tab(next, needs_open, url);
-                Task::none()
-            }
-            None => self.reopen_home_tab(tab),
-        }
-    }
-
-    /// Fresh default tab reusing `tab` (backend dropped it): recreate the view
-    /// with the default URL from birth and navigate the session there. Tab-less
-    /// engine has no boot path back, so the last tab never truly closes.
-    fn reopen_home_tab(&mut self, tab: crate::browser::engine::TabId) -> Task<Message> {
-        let url = crate::browser::BROWSER_DEFAULT_URL.to_string();
-        let (generation, frame) = {
-            let panel = &mut self.browser.panel;
-            panel.reset_live_page();
-            panel.page.session.open_surface();
-            panel.active_tab = tab;
-            panel.order.push(tab);
-            panel.draft = url.clone();
-            let generation = panel.page.session.begin_load(url.clone());
-            let frame = std::sync::Arc::clone(panel.page.session.frame_slot());
-            (generation, frame)
-        };
-        self.save_strip();
-        if let Some(engine) = &self.browser.engine {
-            engine.send(EngineCommand::OpenTab {
-                tab,
-                url,
-                generation,
-                frame,
-            });
-            engine.send(EngineCommand::SetActiveTab { tab });
-        }
-        self.sync_browser_theme();
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
-        Task::none()
-    }
-
-    /// First-open restore from `tabs.json`: rebuild the strip (live +
-    /// stored), pre-seed titles, and drive every tab. Backend views are
-    /// fresh, so each tab re-navigates — engine history starts over by
-    /// construction. Falls back to the default flow when nothing restorable
-    /// survives validation.
-    pub(crate) fn restore_browser_tabs(
+    /// First-open restore from `tabs.json`: v0 is single-tab, so only the
+    /// saved active page survives. Backend views are fresh, so the page
+    /// re-navigates and engine history starts over by construction.
+    /// Crash-restart boots use the default page instead (the restored page is
+    /// the one that killed CEF).
+    pub(crate) fn restore_browser_page(
         &mut self,
         saved: crate::browser::tabs::SavedTabs,
     ) -> Task<Message> {
-        use crate::browser::engine::TabId;
         crate::platform::trace::manifest("browser_tabs", &saved);
-        let mut tabs: Vec<crate::browser::tabs::SavedTab> = saved
+        let page = saved
             .tabs
-            .into_iter()
-            .filter(|t| !t.url.is_empty() && t.url != crate::browser::BLANK_PAGE_URL)
-            .take(crate::browser::tabs::MAX_SAVED_TABS)
-            .collect();
-        if tabs.is_empty() {
-            self.browser.panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
-            return self.on_browser_navigate();
-        }
+            .get(saved.active.min(saved.tabs.len().saturating_sub(1)))
+            .filter(|page| !page.url.is_empty() && page.url != crate::browser::BLANK_PAGE_URL);
         if self.crash_restart_boot {
-            // Safe mode: the restored active tab is the page that killed
-            // CEF. Start on the default page and keep every saved tab stored (the
-            // user can switch deliberately); never auto-load the crash page
-            // again on relaunch.
             crate::platform::app_log::info(
-                "crash-restart: safe tab restore (default live, saved tabs stored)",
+                "crash-restart: safe page restore (default page, saved page skipped)",
             );
-            let generation = {
-                let panel = &mut self.browser.panel;
-                panel.stored.clear();
-                panel.order.clear();
-                panel.active_tab = TabId::BOOT;
-                panel.reset_live_page();
-                panel.page.session.open_surface();
-                let generation = panel
-                    .page
-                    .session
-                    .begin_load(crate::browser::BROWSER_DEFAULT_URL.to_string());
-                panel.draft = crate::browser::BROWSER_DEFAULT_URL.to_string();
-                panel.order.push(TabId::BOOT);
-                let mut next_id = panel.next_tab_id.max(2);
-                for saved_tab in tabs {
-                    let id = TabId(next_id);
-                    next_id += 1;
-                    let mut page = crate::ui::browser::BrowserTabPage::default();
-                    page.session.open_surface();
-                    page.session.note_url(saved_tab.url.clone());
-                    if !saved_tab.title.is_empty() {
-                        page.session.note_title(Some(saved_tab.title));
-                    }
-                    panel.stored.push(crate::ui::browser::StoredTab {
-                        id,
-                        page,
-                        loaded: false,
-                    });
-                    panel.order.push(id);
-                }
-                panel.next_tab_id = next_id;
-                panel.rebuild_chrome();
-                generation
-            };
-            self.save_strip();
-            if let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::Navigate {
-                    tab: TabId::BOOT,
-                    url: crate::browser::BROWSER_DEFAULT_URL.to_string(),
-                    generation,
-                });
-            }
-            return Task::none();
+            return self.on_browser_go_default();
         }
-        let active_pos = saved.active.min(tabs.len() - 1);
-        // The live tab's load (restored tabs behind it stay unloaded until
-        // first switch — the worker only ever pays for visible tabs).
-        let mut live_load: Option<(TabId, String, u64)> = None;
+        let Some(page) = page else {
+            return self.on_browser_go_default();
+        };
+        let url = page.url.clone();
+        let title = (!page.title.is_empty()).then(|| page.title.clone());
         {
             let panel = &mut self.browser.panel;
             panel.stored.clear();
             panel.order.clear();
-            let mut next_id = panel.next_tab_id.max(2);
-            for (pos, saved_tab) in tabs.drain(..).enumerate() {
-                if pos == active_pos {
-                    panel.active_tab = TabId::BOOT;
-                    panel.reset_live_page();
-                    panel.page.session.open_surface();
-                    let generation = panel.page.session.begin_load(saved_tab.url.clone());
-                    if !saved_tab.title.is_empty() {
-                        panel.page.session.note_title(Some(saved_tab.title.clone()));
-                    }
-                    panel.order.push(TabId::BOOT);
-                    panel.draft = saved_tab.url.clone();
-                    live_load = Some((TabId::BOOT, saved_tab.url, generation));
-                } else {
-                    // Unloaded: URL + title recorded for the strip, no
-                    // generation, no view — first switch opens and loads it.
-                    let id = TabId(next_id);
-                    next_id += 1;
-                    let mut page = crate::ui::browser::BrowserTabPage::default();
-                    page.session.open_surface();
-                    page.session.note_url(saved_tab.url.clone());
-                    if !saved_tab.title.is_empty() {
-                        page.session.note_title(Some(saved_tab.title));
-                    }
-                    panel.stored.push(crate::ui::browser::StoredTab {
-                        id,
-                        page,
-                        loaded: false,
-                    });
-                    panel.order.push(id);
-                }
-            }
-            panel.next_tab_id = next_id;
-            panel.rebuild_chrome();
-        }
-        if let Some(engine) = &self.browser.engine {
-            if let Some((tab, url, generation)) = live_load {
-                engine.send(EngineCommand::Navigate {
-                    tab,
-                    url,
-                    generation,
-                });
-            }
-        } else {
-            // Reader fallback: fetch the live tab only; stored tabs fetch
-            // when switched to.
-            return self.on_browser_navigate();
-        }
-        self.prefetch_stored_tab_favicons();
-        self.sync_browser_theme();
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
-        Task::none()
-    }
-
-    /// Restored background tabs have URLs but no loaded page (and therefore
-    /// no CEF favicon callback). Fetch their conventional icons so the strip
-    /// does not look half-finished until each tab is visited.
-    fn prefetch_stored_tab_favicons(&mut self) {
-        let Some(engine) = &self.browser.engine else {
-            return;
-        };
-        let mut seen = std::collections::HashSet::new();
-        for stored in &self.browser.panel.stored {
-            let url = stored.page.session.url().to_string();
-            if url.is_empty() {
-                continue;
-            }
-            let key = crate::browser::bookmarks::origin_key(&url);
-            if key == url || self.browser.panel.favicons.contains_key(&key) || !seen.insert(key) {
-                continue;
-            }
-            engine.send(crate::browser::engine::EngineCommand::PrefetchFavicon { url });
-        }
-    }
-
-    /// User-opened tab (`+`): stash live, reset, create the default-loaded view
-    /// and foreground it. Reader fallback (no engine) just goes to the default page in
-    /// place — tabs need views.
-    pub(crate) fn on_browser_tab_new(&mut self) -> Task<Message> {
-        if self.browser.engine.is_none() {
-            return self.on_browser_go_default();
-        }
-        self.open_browser_tab(crate::browser::BROWSER_DEFAULT_URL.to_string())
-    }
-
-    /// `window.open` / `target=_blank` from the page: open the requested URL
-    /// in a normal foreground tab. The native popup browser is canceled in the
-    /// CEF life-span handler.
-    pub(crate) fn on_browser_open_url_in_new_tab(&mut self, url: String) -> Task<Message> {
-        if !self.browser_visible {
-            return Task::none();
-        }
-        let url = if url.trim().is_empty() {
-            "about:blank".to_string()
-        } else {
-            url
-        };
-        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.popup_open")
-            .field("url", &url)
-            .emit();
-        if self.browser.engine.is_none() {
-            self.browser.panel.draft = url;
-            return self.on_browser_navigate();
-        }
-        self.open_browser_tab(url)
-    }
-
-    fn open_browser_tab(&mut self, url: String) -> Task<Message> {
-        let (tab, generation, frame) = {
-            let panel = &mut self.browser.panel;
-            panel.stash_live();
+            panel.active_tab = crate::browser::engine::TabId::BOOT;
             panel.reset_live_page();
             panel.page.session.open_surface();
-            let tab = crate::browser::engine::TabId(panel.next_tab_id);
-            panel.next_tab_id = panel.next_tab_id.wrapping_add(1).max(2);
-            panel.active_tab = tab;
-            panel.order.push(tab);
-            panel.draft = url.clone();
-            panel.history_selector = None;
-            panel.bookmark_bubble = false;
-            panel.url_editing = false;
-            panel.osk.close();
-            let generation = panel.page.session.begin_load(url.clone());
-            panel.rebuild_chrome();
-            panel.save_tabs();
-            let frame = std::sync::Arc::clone(panel.page.session.frame_slot());
-            (tab, generation, frame)
-        };
-        if let Some(engine) = &self.browser.engine {
-            engine.send(EngineCommand::OpenTab {
-                tab,
-                url,
-                generation,
-                frame,
-            });
-            engine.send(EngineCommand::SetActiveTab { tab });
+            panel.page.session.begin_load(url.clone());
+            if let Some(title) = title {
+                panel.page.session.note_title(Some(title));
+            }
+            panel.order.push(crate::browser::engine::TabId::BOOT);
         }
-        self.sync_browser_theme();
+        self.save_page();
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
-        Task::none()
-    }
-
-    /// Foreground the live tab's view: open it on first show (restored tabs
-    /// start unloaded), then activate + re-sync the mouse. `needs_open`
-    /// comes from the stored entry's `loaded` flag, read before the swap.
-    pub(crate) fn foreground_live_tab(
-        &mut self,
-        tab: crate::browser::engine::TabId,
-        needs_open: bool,
-        url: String,
-    ) {
-        // Auto-OSK belongs to the tab that opened it; the newly active tab
-        // republishes its own focus state after `SetActiveTab`.
-        self.browser.panel.osk.close_auto();
-        if let Some(engine) = &self.browser.engine {
-            if needs_open {
-                let generation = self.browser.panel.session.begin_load(url.clone());
-                engine.send(EngineCommand::OpenTab {
-                    tab,
-                    url,
-                    generation,
-                    frame: std::sync::Arc::clone(self.browser.panel.session.frame_slot()),
-                });
-            }
-            engine.send(EngineCommand::SetActiveTab { tab });
-            engine.send(EngineCommand::QueryHistory { tab });
+        if self.browser.engine.is_some() {
+            // The engine already preloaded the saved active URL at boot; the
+            // session is aligned with it, so no duplicate navigate is needed.
+            self.sync_browser_theme();
+            crate::controller::hid::diag::diag_info("ui-diag: browser restore page");
+            Task::none()
+        } else {
+            self.navigate_browser_to(url)
         }
-        self.sync_live_mouse();
-        self.sync_browser_theme();
     }
 
-    /// Strip changed shape or membership: persist it (`tabs.json`) and
-    /// rebuild the chrome snap map (rects derive from order/bookmarks).
-    /// URL/title-only traffic uses `save_tabs` directly (no geometry
-    /// change, mapping stays valid).
-    pub(crate) fn save_strip(&mut self) {
-        self.browser.panel.rebuild_chrome();
+    /// Persist the live page (`tabs.json`) without touching UI geometry.
+    pub(crate) fn save_page(&self) {
         self.browser.panel.save_tabs();
-    }
-
-    /// User switches tab (strip click): swap the live page with the stored
-    /// one (order untouched), foreground the view, mirror the URL to the
-    /// draft, re-sync the mouse.
-    pub(crate) fn on_browser_tab_switch(
-        &mut self,
-        tab: crate::browser::engine::TabId,
-    ) -> Task<Message> {
-        if tab == self.browser.panel.active_tab {
-            return Task::none();
-        }
-        self.cancel_history_travel("tab_switch");
-        let old = self.browser.panel.active_tab;
-        let needs_open = self
-            .browser
-            .panel
-            .stored
-            .iter()
-            .find(|t| t.id == tab)
-            .is_some_and(|t| !t.loaded);
-        let old_scroll = self.browser.panel.scroll_offset;
-        if !self.browser.panel.activate_stored(tab) {
-            return Task::none();
-        }
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: browser tab switch tab{} -> tab{} scroll ({:.0},{:.0}) -> ({:.0},{:.0})",
-            old.0,
-            tab.0,
-            old_scroll.0,
-            old_scroll.1,
-            self.browser.panel.scroll_offset.0,
-            self.browser.panel.scroll_offset.1
-        ));
-        // The shelved page keeps its backing view.
-        if let Some(prev) = self.browser.panel.stored.iter_mut().find(|t| t.id == old) {
-            prev.loaded = true;
-        }
-        let url = self.browser.panel.session.url().to_string();
-        self.browser.panel.draft = url.clone();
-        // The visible tab window follows the active tab, so the strip
-        // geometry changes on every switch (not just membership).
-        self.save_strip();
-        if self.browser.engine.is_none() {
-            // Reader fallback: no views to foreground — fetch the newly
-            // live tab's URL through the normal path instead.
-            return self.on_browser_navigate();
-        }
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        self.foreground_live_tab(tab, needs_open, url);
-        Task::none()
-    }
-
-    /// Cycle to the next tab in strip order (wraps). Used by the tab
-    /// strip's overflow chip, which stands in for tabs hidden by the
-    /// fit pass; switching windows the strip around the new active tab.
-    pub(crate) fn on_browser_tab_next(&mut self) -> Task<Message> {
-        let order = self.browser.panel.order.clone();
-        if order.len() < 2 {
-            return Task::none();
-        }
-        let active = self.browser.panel.active_tab;
-        let index = order.iter().position(|id| *id == active).unwrap_or(0);
-        let next = order[(index + 1) % order.len()];
-        self.on_browser_tab_switch(next)
-    }
-
-    /// User closes a tab (`×`): background tabs drop outright; closing the
-    /// active tab adopts the most recent survivor first. The last tab
-    /// resets to the default page instead of closing.
-    pub(crate) fn on_browser_tab_close(
-        &mut self,
-        tab: crate::browser::engine::TabId,
-    ) -> Task<Message> {
-        if tab != self.browser.panel.active_tab {
-            let loaded = self
-                .browser
-                .panel
-                .stored
-                .iter()
-                .find(|t| t.id == tab)
-                .map(|t| t.loaded)
-                .unwrap_or(false);
-            self.browser.panel.drop_stored(tab);
-            self.save_strip();
-            // Unloaded tabs have no view to close (restored, never shown).
-            if loaded && let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::CloseTab { tab });
-            }
-            return Task::none();
-        }
-        self.cancel_history_travel("tab_close");
-        // Active tab: survivors live in `stored`.
-        if self.browser.panel.stored.is_empty() {
-            return self.on_browser_go_default();
-        }
-        let next = self
-            .browser
-            .panel
-            .order
-            .iter()
-            .rev()
-            .find(|o| **o != tab)
-            .copied();
-        let Some(next) = next else {
-            return self.on_browser_go_default();
-        };
-        let needs_open = self
-            .browser
-            .panel
-            .stored
-            .iter()
-            .find(|t| t.id == next)
-            .is_some_and(|t| !t.loaded);
-        let ok = self.browser.panel.activate_stored(next);
-        if !ok {
-            return self.on_browser_go_default();
-        }
-        self.browser.panel.order.retain(|o| *o != tab);
-        let url = self.browser.panel.session.url().to_string();
-        self.browser.panel.draft = url.clone();
-        self.save_strip();
-        if self.browser.engine.is_none() {
-            // Reader fallback: fetch the adopted tab like a fresh navigate.
-            return self.on_browser_navigate();
-        }
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-        self.foreground_live_tab(next, needs_open, url);
-        if let Some(engine) = &self.browser.engine {
-            engine.send(EngineCommand::CloseTab { tab });
-        }
-        Task::none()
     }
 
     /// Pad/keyboard body scroll. Engine mode scrolls Chromium at the cursor
@@ -2024,16 +1224,24 @@ impl App {
     /// Engine worker event. Deliberately no activity stamp: frames flow
     /// continuously while visible and must not defeat idle-dim.
     ///
-    /// Tab routing: events for the active tab apply to the live page state;
-    /// background-tab events apply to the matching stored tab (the draft
-    /// mirrors the active tab only). Unknown (closed-race) ids are ignored.
+    /// v0 is single-tab; background events still route to a stored page if one
+    /// exists (dormant multi-tab data), but popups/tab lifecycle never create
+    /// or adopt a tab.
     pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
         match event {
-            EngineEvent::TabOpened { tab, slot } => return self.on_tab_opened(tab, slot),
             EngineEvent::FrameSlot { tab, slot } => return self.on_frame_slot(tab, slot),
-            EngineEvent::TabClosed { tab } => return self.on_tab_closed(tab),
+            EngineEvent::TabOpened { .. } | EngineEvent::TabClosed { .. } => {
+                return Task::none();
+            }
             EngineEvent::PopupRequested { url, .. } => {
-                return self.on_browser_open_url_in_new_tab(url);
+                // Popups are denied entirely: no new tab, no navigation.
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Browser,
+                    "browser.popup_denied",
+                )
+                .field("url", &url)
+                .emit();
+                return Task::none();
             }
             _ => {}
         }
@@ -2080,15 +1288,11 @@ impl App {
                 if let Some(flow) = flow {
                     crate::platform::trace::set_current_flow(Some(flow));
                 }
-                self.browser.panel.session.note_url(url.clone());
+                self.browser.panel.session.note_url(url);
                 crate::platform::trace::set_current_flow(previous);
-                self.browser.panel.draft = url;
                 if self.browser.tabs_restored {
                     self.browser.panel.save_tabs();
                 }
-                // A new document underneath invalidates the selector's
-                // snapshot (link click, redirect, history travel).
-                self.browser.panel.history_selector = None;
                 self.settle_history_travel_on_url(tab);
             }
             EngineEvent::FaviconChanged {
@@ -2096,21 +1300,18 @@ impl App {
                 url,
                 width,
                 height,
-                rgba,
+                rgba: _,
             } => {
-                let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                // No settings/bookmark chrome in v0; keep the engine callback
+                // observable in the log without caching UI handles.
                 crate::platform::app_log::info(format!(
                     "browser-dom: favicon {} {width}x{height}",
                     crate::browser::bookmarks::origin_key(&url)
                 ));
-                self.browser.panel.note_favicon(url, handle);
             }
             EngineEvent::A11yTree { tab: _, items } => {
                 self.browser.panel.page.focusables = items;
-                let targets = {
-                    let panel = &self.browser.panel;
-                    crate::ui::browser::cursor_targets(&panel.page.focusables, &panel.chrome)
-                };
+                let targets = self.browser.panel.page.focusables.clone();
                 self.browser.panel.page.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
                 // after one tree if it never does (culled targets never
@@ -2144,9 +1345,7 @@ impl App {
             EngineEvent::ScrollExtent { extent, .. } => {
                 self.browser.panel.page_extent = extent;
             }
-            EngineEvent::ActivityChanged { tab: _, phase } => {
-                self.browser.panel.engine_activity = phase;
-            }
+            EngineEvent::ActivityChanged { .. } => {}
             EngineEvent::HistoryCapability {
                 tab: _,
                 can_back,
@@ -2169,28 +1368,6 @@ impl App {
                     .session
                     .apply_engine_history(&entries, current);
                 self.advance_history_travel(tab);
-                // The stack moved under an open selector: clamp the highlight,
-                // close if the direction ran dry.
-                let dir_is_back = self
-                    .browser
-                    .panel
-                    .page
-                    .history_selector
-                    .as_ref()
-                    .map(|sel| sel.back);
-                if let Some(back) = dir_is_back {
-                    let panel = &mut self.browser.panel;
-                    let len = if back {
-                        panel.session.back_entries().len()
-                    } else {
-                        panel.session.forward_entries().len()
-                    };
-                    if len == 0 {
-                        panel.history_selector = None;
-                    } else if let Some(sel) = panel.history_selector.as_mut() {
-                        sel.clamp(len);
-                    }
-                }
             }
             EngineEvent::HistoryJumpFailed { tab, index, reason } => {
                 self.on_history_jump_failed(tab, index, reason);
@@ -2242,28 +1419,12 @@ impl App {
     }
 
     /// Background-tab event: same per-tab state updates as the live path,
-    /// but never touches chrome (draft, selector UI, docking). Favicons are
-    /// the exception — the cache is shared by origin across tabs.
+    /// but never touches the live page UI. v0 has no tab switcher, so this
+    /// only keeps dormant stored data coherent.
     fn route_background_event(&mut self, tab: crate::browser::engine::TabId, event: EngineEvent) {
-        // Favicons need no stored state (shared origin cache) — handle
-        // before the stored borrow so the borrow below stays clean.
-        if let EngineEvent::FaviconChanged {
-            url,
-            width,
-            height,
-            rgba,
-            ..
-        } = event
-        {
-            let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
-            self.browser.panel.note_favicon(url, handle);
-            return;
-        }
-        // URL/title changes persist the strip; the borrow ends before the
-        // save (which reborrows the panel). Chrome entries are cloned up
-        // front so the stored borrow below stays uncontended.
-        let mut strip_changed = false;
-        let chrome = self.browser.panel.chrome.clone();
+        // URL/title changes persist the page; the borrow ends before the
+        // save (which reborrows the panel).
+        let mut page_changed = false;
         {
             let Some(stored) = self.browser.panel.stored_mut(tab) else {
                 return;
@@ -2271,17 +1432,16 @@ impl App {
             match event {
                 EngineEvent::TitleChanged { title, .. } => {
                     stored.page.session.note_title(title);
-                    strip_changed = true;
+                    page_changed = true;
                 }
                 EngineEvent::UrlChanged { url, .. } => {
                     stored.page.session.note_url(url);
-                    strip_changed = true;
+                    page_changed = true;
                 }
                 EngineEvent::FaviconChanged { .. } => {}
                 EngineEvent::A11yTree { items, .. } => {
                     stored.page.focusables = items;
-                    let mut all = stored.page.focusables.clone();
-                    all.extend(chrome.iter().map(|(_, f)| f.clone()));
+                    let all = stored.page.focusables.clone();
                     stored.page.cursor.retarget(&all);
                 }
                 EngineEvent::ScrollOffset { tab, x, y } => {
@@ -2297,9 +1457,7 @@ impl App {
                 EngineEvent::ScrollExtent { extent, .. } => {
                     stored.page.page_extent = extent;
                 }
-                EngineEvent::ActivityChanged { phase, .. } => {
-                    stored.page.engine_activity = phase;
-                }
+                EngineEvent::ActivityChanged { .. } => {}
                 EngineEvent::HistoryCapability {
                     can_back,
                     can_forward,
@@ -2322,7 +1480,7 @@ impl App {
                     stored.page.pending_focus = Some(id);
                 }
                 EngineEvent::EditableFocusChanged { .. } => {
-                    // Background focus cannot drive the shared OSK.
+                    // Background focus cannot drive the shared keyboard.
                 }
                 EngineEvent::LoadFinished {
                     generation, result, ..
@@ -2343,7 +1501,7 @@ impl App {
                 | EngineEvent::CursorChanged { .. } => {}
             }
         }
-        if strip_changed && self.browser.tabs_restored {
+        if page_changed && self.browser.tabs_restored {
             self.browser.panel.save_tabs();
         }
     }

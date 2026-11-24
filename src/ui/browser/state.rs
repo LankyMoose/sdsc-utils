@@ -1,10 +1,9 @@
-//! Browser app state: tabs, per-tab page state, chrome targets, cursor.
+//! Browser app state: page state, cursor, text keyboard, and dormant tab data.
 //!
-//! Extracted from the Launcher view so the browser is a top-level managed app
-//! (see `notes/browser-Home-pivot.md`, phase 0). UI-only: the render code
-//! stays in `ui::launcher` until the standalone Browser window lands.
+//! v0 is chrome-less: one page surface, no tab strip/toolbar/address/status.
+//! Tab/session/bookmark backends stay available for the future contract work,
+//! but the panel only ever renders and drives the live page.
 
-use crate::ui::text_fit;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -16,46 +15,6 @@ pub struct EngineHistorySnapshot {
     pub entries: Vec<crate::browser::engine::EngineHistoryEntry>,
 }
 
-/// Hold-bumper history selector (B2.4): directional dropdown over the
-/// session stack. `back` selects L1/back targets, else R1/forward targets;
-/// `highlight` indexes the displayed directional list (0 = closest =
-/// quick-press target = default). Rows map to absolute session indices via
-/// [`crate::browser::BrowserSession::back_entries`] /
-/// [`crate::browser::BrowserSession::forward_entries`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistorySelector {
-    pub back: bool,
-    pub highlight: usize,
-}
-
-impl HistorySelector {
-    /// Absolute session index under the highlight, if the list is non-empty.
-    pub fn picked(&self, session: &crate::browser::BrowserSession) -> Option<usize> {
-        let list = if self.back {
-            session.back_entries()
-        } else {
-            session.forward_entries()
-        };
-        list.get(self.highlight.min(list.len().saturating_sub(1)))
-            .or_else(|| list.first())
-            .map(|(i, _)| *i)
-    }
-
-    /// Clamp the highlight after the stack moved underneath the selector.
-    pub fn clamp(&mut self, len: usize) {
-        if len == 0 {
-            self.highlight = 0;
-        } else {
-            self.highlight = self.highlight.min(len - 1);
-        }
-    }
-}
-
-/// Per-tab page state: everything that belongs to one tab's document.
-/// `BrowserPanel::page` is always the ACTIVE tab's; background tabs stash
-/// theirs in `BrowserPanel::stored`. The panel derefs to this, so all
-/// existing live-tab call sites (`panel.session`, `panel.cursor`, …) keep
-/// working.
 /// Dominant right-stick axis for one scroll gesture. Chosen when the stick
 /// leaves neutral and held until it returns, so a diagonal hold cannot drift
 /// sideways while the user scrolls vertically (or vice versa).
@@ -74,6 +33,11 @@ impl ScrollAxis {
     }
 }
 
+/// Per-tab page state: everything that belongs to one tab's document.
+/// `BrowserPanel::page` is always the ACTIVE tab's; background tabs stash
+/// theirs in `BrowserPanel::stored`. The panel derefs to this, so all
+/// existing live-tab call sites (`panel.session`, `panel.cursor`, …) keep
+/// working.
 #[derive(Debug, Clone, Default)]
 pub struct BrowserTabPage {
     pub session: crate::browser::BrowserSession,
@@ -105,19 +69,10 @@ pub struct BrowserTabPage {
     pub last_sent_mouse: Option<(i32, i32)>,
     /// Last click point + time, for the R3 issue-flag correlation.
     pub last_click: Option<((f32, f32), Instant)>,
-    /// Transient action hint shown in the card header ("Opening link…"):
-    /// instant feedback that a click landed, so a slow-or-dead page reads
-    /// as such instead of a dropped input. Superseded by Loading…/Error,
-    /// expires after a few seconds.
-    pub action_hint: Option<(String, Instant)>,
     /// Last canonical engine history; tracing compares it with the UI stack.
     pub last_engine_history: Option<EngineHistorySnapshot>,
     /// Last CEF back/forward capability flag pair.
     pub last_engine_can: Option<(bool, bool)>,
-    /// Hold-bumper history selector overlay (B2.4). `None` = closed.
-    pub history_selector: Option<HistorySelector>,
-    /// Engine phase for the status strip (navigate → load → DOM boot).
-    pub engine_activity: crate::browser::engine::EngineActivity,
 }
 
 /// One background tab: stable id, page state, and whether a backend view
@@ -236,14 +191,14 @@ const OSK_SYMBOL: &[&[OskKey]] = &[
     ],
 ];
 
-/// Controller-driven on-screen keyboard for page/URL text entry.
+/// Controller-driven on-screen keyboard for page text entry.
 #[derive(Debug, Clone, Default)]
 pub struct OskState {
     pub open: bool,
     pub focus: usize,
     pub layer: OskLayer,
-    /// Opened because a page text target gained focus rather than by Square.
-    /// Blur closes only this kind, so a deliberately opened OSK stays put.
+    /// Opened because a page text target gained focus. Blur closes only this
+    /// kind, so a deliberately opened OSK stays put.
     pub auto_opened: bool,
 }
 
@@ -256,8 +211,8 @@ impl OskState {
         }
     }
 
-    /// Open from an explicit Square/F6 press. The caller's manual choice
-    /// wins over focus-based lifetime from here on.
+    /// Open from an explicit press. The caller's manual choice wins over
+    /// focus-based lifetime from here on.
     pub fn open_manual(&mut self) {
         self.open = true;
         self.auto_opened = false;
@@ -354,19 +309,19 @@ impl OskKey {
     }
 }
 
-/// Browser app panel. The URL draft and body scroll offset live
-/// here; load lifecycle (generation-guarded suspend/resume) lives in
+/// Browser app panel. The page surface and cursor live here; load lifecycle
+/// (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
 /// pixels (see [`crate::browser::cursor`]).
 #[derive(Debug, Clone)]
 pub struct BrowserPanel {
     /// Live page state: ALWAYS the active tab's. Swapped with `stored`
-    /// entries on switch (see `activate_stored`).
+    /// entries on switch (see `activate_stored`). v0 is single-tab and has
+    /// no switching UI; the dormant tab data stays for the future contract.
     pub page: BrowserTabPage,
-    /// Background tabs (page state only; chrome stays shared).
+    /// Background tabs (page state only; no chrome).
     pub stored: Vec<StoredTab>,
-    /// Creation-order tab ids (active included): the strip renders in this
-    /// order so switching never shuffles positions.
+    /// Creation-order tab ids (active included).
     pub order: Vec<crate::browser::engine::TabId>,
     /// Active tab id. Defaults to the boot webview — matches the worker's
     /// `TabId::BOOT` with no handshake.
@@ -374,11 +329,6 @@ pub struct BrowserPanel {
     /// Next UI-owned tab id (counts up from boot; engine popups count down
     /// from `u64::MAX` — disjoint by construction).
     pub next_tab_id: u64,
-    pub draft: String,
-    /// URL-edit mode: keyboard goes to the address field (pad Triangle /
-    /// Ctrl+L enters, Enter commits, Esc/Circle backs out). Cleared on
-    /// navigate and close.
-    pub url_editing: bool,
     /// Last page-local hardware/replay pointer position. Clicks and wheel
     /// events use this point; replay sets it explicitly so automation never
     /// depends on the OS cursor position.
@@ -416,35 +366,18 @@ pub struct BrowserPanel {
     pub js_click: bool,
     /// R3 rising-edge latch for the issue flag (R3 carries no NavAction).
     pub r3_latched: bool,
-    /// Synthetic header snap targets: the tab strip, toolbar and bookmarks
-    /// as cursor-space rects above the viewport (negative y), so the pad
-    /// cursor treats chrome and page as one continuous surface. Rebuilt
-    /// whenever the strip or bookmark count changes; ids are stable while
-    /// the set is unchanged so dock attachments survive pulls.
-    pub chrome: Vec<(ChromeTarget, crate::browser::cursor::Focusable)>,
     /// Live page-area size in card pixels (the engine viewport resizes to
     /// this; the cursor space matches it 1:1).
     pub viewport: (f32, f32),
     /// A D-pad jump asked for a fresh DOM target cull around the cursor.
     /// Cleared once the jump flight lands and the engine is told to pull.
     pub dom_reseed_pending: bool,
-    /// Next synthetic id (counts up from [`CHROME_ID_BASE`], far above any
-    /// engine-assigned page id).
-    pub chrome_seq: u64,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
-    /// Chrome-style bookmarks (disk-persisted). The star toggles the current
-    /// page; the bar offers one-click open.
+    /// Chrome-style bookmarks (disk-persisted, dormant in v0). Kept as data
+    /// for the future contract; no UI, bindings, or favicon chrome.
     pub bookmarks: Vec<crate::browser::bookmarks::Bookmark>,
-    /// Star bubble open: rename the current page's bookmark or remove it.
-    pub bookmark_bubble: bool,
-    /// Bubble rename draft (applied on Done, discarded on dismiss).
-    pub bookmark_name_draft: String,
-    /// Favicon handles by full page URL (engine `FaviconChanged`), shared by
-    /// the bookmark bar and history rows. Capped; oldest evicted first.
-    pub favicons: HashMap<String, iced::widget::image::Handle>,
-    pub favicon_order: Vec<String>,
 }
 
 impl std::ops::Deref for BrowserPanel {
@@ -467,14 +400,13 @@ impl Default for BrowserPanel {
     /// Fresh panel: one implicit boot tab (matches the worker's
     /// `TabId::BOOT`); the next explicit tab takes id 2.
     fn default() -> Self {
-        let mut panel = Self {
-            page: BrowserTabPage::default(),
+        let page = BrowserTabPage::default();
+        Self {
+            page,
             stored: Vec::new(),
             order: vec![crate::browser::engine::TabId::BOOT],
             active_tab: crate::browser::engine::TabId::BOOT,
             next_tab_id: 2,
-            draft: String::new(),
-            url_editing: false,
             page_mouse: (
                 crate::browser::cursor::VIEWPORT_W * 0.5,
                 crate::browser::cursor::VIEWPORT_H * 0.5,
@@ -491,22 +423,14 @@ impl Default for BrowserPanel {
             last_dock_change: None,
             js_click: false,
             r3_latched: false,
-            chrome: Vec::new(),
             viewport: (
                 crate::browser::cursor::VIEWPORT_W,
                 crate::browser::cursor::VIEWPORT_H,
             ),
             dom_reseed_pending: false,
-            chrome_seq: crate::browser::cursor::CHROME_ID_BASE,
             debug_overlay: false,
             bookmarks: Vec::new(),
-            bookmark_bubble: false,
-            bookmark_name_draft: String::new(),
-            favicons: HashMap::new(),
-            favicon_order: Vec::new(),
-        };
-        panel.rebuild_chrome();
-        panel
+        }
     }
 }
 
@@ -537,7 +461,6 @@ impl BrowserPanel {
         }
         self.viewport = size;
         self.page.cursor.set_viewport(size.0, size.1);
-        self.rebuild_chrome();
         true
     }
 
@@ -556,7 +479,7 @@ impl BrowserPanel {
     pub fn reset_live_page(&mut self) {
         self.page = BrowserTabPage::default();
         self.sync_live_cursor();
-        // Auto-OSK belongs to the old page's focused field.
+        // The old page's focused field no longer owns the text keyboard.
         self.osk.close_auto();
     }
 
@@ -621,9 +544,9 @@ impl BrowserPanel {
         true
     }
 
-    /// Snapshot the strip for `tabs.json`: creation-order (URL, title),
-    /// active position. Blank/empty URLs never persist (placeholders, not
-    /// visits — same rule as the history stacks).
+    /// Snapshot the persisted page for `tabs.json`: URL, title, active
+    /// position. Blank/empty URLs never persist (placeholders, not visits —
+    /// same rule as the history stacks).
     pub fn snapshot_tabs(&self) -> crate::browser::tabs::SavedTabs {
         let mut tabs = Vec::with_capacity(self.order.len());
         let mut active = 0;
@@ -653,113 +576,9 @@ impl BrowserPanel {
         crate::browser::tabs::SavedTabs { tabs, active }
     }
 
-    /// Overwrite `tabs.json` with the current strip.
+    /// Overwrite `tabs.json` with the current page.
     pub fn save_tabs(&self) {
         crate::browser::tabs::save(&self.snapshot_tabs());
-    }
-
-    /// Rebuild the synthetic chrome map: stable ids while the target set
-    /// is unchanged (dock attachments survive pulls), fresh ids for new
-    /// targets, dropped ids for gone ones (the cursor detaches via the
-    /// normal retarget path). Call after strip/bookmark changes.
-    pub fn rebuild_chrome(&mut self) {
-        use crate::browser::cursor::{FocusKind, Focusable};
-        // The header and cursor share the live page size; keep the cursor
-        // bounds in step even if only the chrome map is being refreshed.
-        self.sync_live_cursor();
-        // Natural-width layout is the single source of truth: the rendered
-        // header and the pad cursor both use these rects, so the dot can be
-        // drawn truthfully in header space.
-        let layout = chrome_layout(self);
-        let mut fresh = Vec::new();
-        for row in layout {
-            for (target, x, w) in row.items {
-                let id = match self.chrome.iter().find(|(t, _)| *t == target) {
-                    Some((_, f)) => f.id,
-                    None => {
-                        let id = self.chrome_seq;
-                        self.chrome_seq = self.chrome_seq.wrapping_add(1);
-                        id
-                    }
-                };
-                // Chrome slots carry no link target: hover status stays on
-                // the engine phase, and activation never touches the page.
-                fresh.push((
-                    target,
-                    Focusable {
-                        id,
-                        x,
-                        y: row.y,
-                        w,
-                        h: row.h,
-                        kind: FocusKind::Button,
-                        url: None,
-                    },
-                ));
-            }
-        }
-        self.chrome = fresh;
-    }
-
-    /// Chrome target for a cursor attachment id, if synthetic.
-    pub fn chrome_target(&self, id: u64) -> Option<ChromeTarget> {
-        self.chrome
-            .iter()
-            .find(|(_, f)| f.id == id)
-            .map(|(t, _)| *t)
-    }
-
-    /// Currently docked chrome target, if the cursor sits on synthetic
-    /// chrome rather than a page element.
-    pub fn chrome_attached(&self) -> Option<ChromeTarget> {
-        self.cursor.attached.and_then(|id| self.chrome_target(id))
-    }
-
-    /// Header target under a precise cursor point (page/chrome coordinates).
-    /// Docked clicks use the attachment id; a free precise click in the
-    /// header must still hit the tab/toolbar/bookmark rect it points at.
-    pub fn chrome_target_at(&self, x: f32, y: f32) -> Option<ChromeTarget> {
-        self.chrome
-            .iter()
-            .find(|(_, f)| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
-            .map(|(target, _)| *target)
-    }
-
-    /// Title for a tab id (live or stored): page title, else URL, else the default page.
-    pub fn tab_title(&self, id: crate::browser::engine::TabId) -> String {
-        let page = if id == self.active_tab {
-            Some(&self.page)
-        } else {
-            self.stored.iter().find(|t| t.id == id).map(|t| &t.page)
-        };
-        match page {
-            Some(p) => {
-                let url = p.session.url();
-                p.session
-                    .title()
-                    .map(str::to_string)
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| {
-                        if url.is_empty() {
-                            crate::browser::BROWSER_DEFAULT_URL.to_string()
-                        } else {
-                            url.to_string()
-                        }
-                    })
-            }
-            None => String::new(),
-        }
-    }
-
-    /// URL for a tab id (live or stored), empty when the tab vanished.
-    pub fn tab_url(&self, id: crate::browser::engine::TabId) -> String {
-        let page = if id == self.active_tab {
-            Some(&self.page)
-        } else {
-            self.stored.iter().find(|t| t.id == id).map(|t| &t.page)
-        };
-        page.map(|p| p.session.url().to_string())
-            .unwrap_or_default()
     }
 
     pub fn toggle(&mut self) {
@@ -768,13 +587,10 @@ impl BrowserPanel {
         } else {
             self.session.open_surface();
         }
-        self.url_editing = false;
     }
 
     pub fn close_surface(&mut self) {
         self.session.close_surface();
-        self.url_editing = false;
-        self.history_selector = None;
         self.pending_focus = None;
         // Drop the analog clock so reopening never applies a huge first dt.
         self.analog_at = None;
@@ -785,35 +601,8 @@ impl BrowserPanel {
         self.scroll_y = y.max(0.0);
     }
 
-    /// Cap on cached favicon handles: oldest evicted first.
-    pub const MAX_FAVICONS: usize = 64;
-
-    /// True when `url` is bookmarked (drives the star state).
-    pub fn is_bookmarked(&self, url: &str) -> bool {
-        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
-    }
-
-    /// Cache a favicon handle, keyed by site origin (see `origin_key`):
-    /// icons are per-site, and arrivals race navigations, so full-URL keys
-    /// miss their rows. Evicts the oldest past the cap.
-    pub fn note_favicon(&mut self, url: String, handle: iced::widget::image::Handle) {
-        if url.is_empty() {
-            return;
-        }
-        let key = crate::browser::bookmarks::origin_key(&url);
-        if !self.favicons.contains_key(&key) {
-            self.favicon_order.push(key.clone());
-            while self.favicon_order.len() > Self::MAX_FAVICONS {
-                let oldest = self.favicon_order.remove(0);
-                self.favicons.remove(&oldest);
-            }
-        }
-        self.favicons.insert(key, handle);
-        // Tab strips size themselves from the icon's presence/absence.
-        self.rebuild_chrome();
-    }
-
-    /// Step the body scroll (reader text); returns the new absolute offset.
+    /// Step the body scroll (reader/non-engine text); returns the new absolute
+    /// offset.
     pub fn scroll_by(&mut self, delta: f32) -> f32 {
         self.scroll_y = (self.scroll_y + delta).max(0.0);
         self.scroll_y
@@ -841,43 +630,23 @@ impl BrowserPanel {
             .unwrap_or(0.0);
         self.analog_at = Some(now);
         self.page.cursor.turbo = r2;
-        // One continuous surface: page targets plus synthetic chrome.
-        let targets = cursor_targets(&self.page.focusables, &self.chrome);
         // Docking transitions are rare and are the cursor's most surprising
         // behavior (magnet centre snap, break-free kick); keep the trace in
         // release too so user-marked nudges are diagnosable.
         let before = self.page.cursor.attached;
         let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
-        // The scroll stick only means anything over the page surface. In
-        // the header (negative y) it must not scroll the page, and it must
-        // not release the dock: each deflection/neutral pair used to
-        // undock/re-dock the chrome target under the point (the nudge
-        // flicker) while also moving the page scrollbar.
-        let in_page = self.page.cursor.x >= 0.0
-            && self.page.cursor.x < self.viewport.0
-            && self.page.cursor.y >= 0.0
-            && self.page.cursor.y < self.viewport.1;
-        let scrolling = in_page && (rx != 0.0 || ry != 0.0);
+        let scrolling = rx != 0.0 || ry != 0.0;
         let cursor = &mut self.page.cursor;
-        cursor.advance_with(lx, ly, dt, &targets, scrolling);
+        cursor.advance_with(lx, ly, dt, &self.page.focusables, scrolling);
         {
             let after = self.page.cursor.attached;
             if before != after {
                 let describe = |id: Option<u64>| match id {
                     None => "free".to_string(),
-                    Some(i) => match targets.iter().find(|o| o.id == i) {
+                    Some(i) => match self.page.focusables.iter().find(|o| o.id == i) {
                         Some(o) => format!(
-                            "#{i} {:?} ({:.0},{:.0},{:.0}x{:.0}){}",
-                            o.kind,
-                            o.x,
-                            o.y,
-                            o.w,
-                            o.h,
-                            if i >= crate::browser::cursor::CHROME_ID_BASE {
-                                " chrome"
-                            } else {
-                                ""
-                            }
+                            "#{i} {:?} ({:.0},{:.0},{:.0}x{:.0})",
+                            o.kind, o.x, o.y, o.w, o.h
                         ),
                         None => format!("#{i} gone"),
                     },
@@ -890,432 +659,70 @@ impl BrowserPanel {
                 ));
             }
         }
-        if in_page {
-            // One axis per gesture: a slightly diagonal hold must not drift
-            // sideways (the scroll-trap). The lock is chosen on the first
-            // deflected sample and cleared only at neutral; if the locked
-            // axis is released while the other stays deflected, adopt the
-            // other so crossing over without a neutral pass never dead-sticks.
-            let axis = match self.scroll_axis {
-                Some(_) if rx == 0.0 && ry == 0.0 => {
-                    self.scroll_axis = None;
-                    None
-                }
-                Some(axis) => {
-                    let (locked, other) = match axis {
-                        ScrollAxis::Vertical => (ry, rx),
-                        ScrollAxis::Horizontal => (rx, ry),
-                    };
-                    if locked == 0.0 && other != 0.0 {
-                        let next = axis.other();
-                        self.scroll_axis = Some(next);
-                        Some(next)
-                    } else {
-                        Some(axis)
-                    }
-                }
-                None if rx == 0.0 && ry == 0.0 => None,
-                None => {
-                    // Tie goes vertical: down-page is the dominant gesture.
-                    let axis = if ry.abs() >= rx.abs() {
-                        ScrollAxis::Vertical
-                    } else {
-                        ScrollAxis::Horizontal
-                    };
-                    self.scroll_axis = Some(axis);
+        // One axis per gesture: a slightly diagonal hold must not drift
+        // sideways (the scroll-trap). The lock is chosen on the first
+        // deflected sample and cleared only at neutral; if the locked
+        // axis is released while the other stays deflected, adopt the
+        // other so crossing over without a neutral pass never dead-sticks.
+        let axis = match self.scroll_axis {
+            Some(_) if rx == 0.0 && ry == 0.0 => {
+                self.scroll_axis = None;
+                None
+            }
+            Some(axis) => {
+                let (locked, other) = match axis {
+                    ScrollAxis::Vertical => (ry, rx),
+                    ScrollAxis::Horizontal => (rx, ry),
+                };
+                if locked == 0.0 && other != 0.0 {
+                    let next = axis.other();
+                    self.scroll_axis = Some(next);
+                    Some(next)
+                } else {
                     Some(axis)
                 }
-            };
-            let scale = if r2 { 2.0 } else { 1.0 };
-            match axis {
-                Some(ScrollAxis::Vertical) => (0.0, ry * SCROLL_SPEED * dt * scale),
-                Some(ScrollAxis::Horizontal) => (rx * SCROLL_SPEED * dt * scale, 0.0),
-                None => (0.0, 0.0),
             }
-        } else {
-            // The scroll stick only applies over the page surface; visiting
-            // the header resets the gesture so re-entry starts clean.
-            self.scroll_axis = None;
-            (0.0, 0.0)
+            None if rx == 0.0 && ry == 0.0 => None,
+            None => {
+                // Tie goes vertical: down-page is the dominant gesture.
+                let axis = if ry.abs() >= rx.abs() {
+                    ScrollAxis::Vertical
+                } else {
+                    ScrollAxis::Horizontal
+                };
+                self.scroll_axis = Some(axis);
+                Some(axis)
+            }
+        };
+        let scale = if r2 { 2.0 } else { 1.0 };
+        match axis {
+            Some(ScrollAxis::Vertical) => (0.0, ry * SCROLL_SPEED * dt * scale),
+            Some(ScrollAxis::Horizontal) => (rx * SCROLL_SPEED * dt * scale, 0.0),
+            None => (0.0, 0.0),
         }
     }
 
-    /// D-pad focus step. Chrome travel is row-stepped: Left/Right stay in
-    /// the row (stop at the ends), Up/Down move exactly one row with the
-    /// column preserved — never skipping rows, never flying into the void.
-    /// Page travel keeps the spatial cone jump.
+    /// D-pad focus step: spatial cone jump over page targets. A press always
+    /// asks the engine for a fresh target set around the new cursor.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
-        use crate::browser::cursor::JumpDir;
-        // A D-pad press always asks the engine for a fresh target set around
-        // the new cursor: the live DOM set is culled around the previous
-        // pull center, and a jump can land where no target was collected
-        // yet (the "skipped target" that works on the second pass).
-        self.dom_reseed_pending = true;
         let from = (self.page.cursor.x, self.page.cursor.y);
         let was = self.page.cursor.attached;
-        self.rebuild_chrome();
-        // Row layout with live rects (stable indices: 0 strip, 1 toolbar,
-        // 2 bookmarks; empties kept so indices never shift).
-        let layout: Vec<Vec<(ChromeTarget, crate::browser::cursor::Focusable)>> = chrome_rows(self)
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .filter_map(|t| {
-                        self.chrome
-                            .iter()
-                            .find(|(tt, _)| *tt == t)
-                            .map(|(t, f)| (*t, f.clone()))
-                    })
-                    .collect()
-            })
-            .collect();
-        let attached = self.page.cursor.attached;
-        let in_chrome = match attached {
-            Some(id) => layout
-                .iter()
-                .flat_map(|r| r.iter())
-                .any(|(_, f)| f.id == id),
-            None => self.page.cursor.y < 0.0,
-        };
-        // Current row: the attached slot's row, else the y-band row.
-        let cur_row: Option<usize> = if in_chrome {
-            attached
-                .and_then(|id| {
-                    layout
-                        .iter()
-                        .position(|r| r.iter().any(|(_, f)| f.id == id))
-                })
-                .or_else(|| {
-                    // Row boundaries: strip ends where toolbar begins,
-                    // toolbar ends where the bookmark row begins.
-                    let y = self.page.cursor.y;
-                    let strip_bottom = CHROME_STRIP_Y + CHROME_ROW_H;
-                    let toolbar_bottom = CHROME_TOOLBAR_Y + CHROME_ROW_H;
-                    if y < strip_bottom {
-                        Some(0)
-                    } else if y < toolbar_bottom {
-                        Some(1)
-                    } else {
-                        Some(2)
-                    }
-                })
-        } else {
-            None
-        };
-        let row_items = |r: usize| -> Vec<crate::browser::cursor::Focusable> {
-            layout
-                .get(r)
-                .map(|row| row.iter().map(|(_, f)| f.clone()).collect())
-                .unwrap_or_default()
-        };
-        // Column-preserving pick: the slot containing the cursor's x, else
-        // the one whose edge is nearest. Deliberately not cone-filtered —
-        // row stepping always moves exactly one row, however far sideways
-        // the nearest slot sits.
-        let col_pick = |items: &[crate::browser::cursor::Focusable],
-                        x: f32|
-         -> Option<crate::browser::cursor::Focusable> {
-            let mut best: Option<(&crate::browser::cursor::Focusable, f32)> = None;
-            for f in items {
-                let d = if x < f.x {
-                    f.x - x
-                } else if x > f.x + f.w {
-                    x - (f.x + f.w)
-                } else {
-                    return Some(f.clone());
-                };
-                if best.is_none_or(|(_, bd)| d < bd) {
-                    best = Some((f, d));
-                }
-            }
-            best.map(|(f, _)| f.clone())
-        };
-        let x = self.page.cursor.x;
-        'jump: {
-            match (cur_row, dir) {
-                // Header horizontals: same row only; nothing in that direction
-                // means a no-op (stop at the row's ends).
-                (Some(r), JumpDir::Left | JumpDir::Right) => {
-                    let items = row_items(r);
-                    self.page.cursor.jump_row(dir, &items);
-                }
-                // Header up: nearest non-empty row above, column preserved;
-                // top row stays put.
-                (Some(r), JumpDir::Up) => {
-                    for prev in (0..r).rev() {
-                        if let Some(f) = col_pick(&row_items(prev), x) {
-                            self.page.cursor.jump_to(&f);
-                            break 'jump;
-                        }
-                    }
-                }
-                // Header down: nearest non-empty row below, column preserved;
-                // the bottom row drops spatially into the page.
-                (Some(r), JumpDir::Down) => {
-                    for next in r + 1..layout.len() {
-                        if let Some(f) = col_pick(&row_items(next), x) {
-                            self.page.cursor.jump_to(&f);
-                            break 'jump;
-                        }
-                    }
-                    let targets = cursor_targets(&self.page.focusables, &self.chrome);
-                    self.page.cursor.jump(dir, &targets);
-                }
-                // Page horizontals never see chrome (header entry/exit is
-                // Up/Down or analog) and never cone into another row: the
-                // row lock stops at the row's ends.
-                (None, JumpDir::Left | JumpDir::Right) => {
-                    let targets = self.page.focusables.clone();
-                    self.page.cursor.jump_row(dir, &targets);
-                }
-                // Page verticals: spatial cone. A page target above wins on
-                // distance; only the topmost page row reaches chrome, and
-                // the nearest chrome row wins (toolbar before strip,
-                // bookmarks before toolbar when present).
-                (None, _) => {
-                    let targets = cursor_targets(&self.page.focusables, &self.chrome);
-                    self.page.cursor.jump(dir, &targets);
-                }
-            }
-        }
+        self.dom_reseed_pending = true;
+        self.page.cursor.jump(dir, &self.page.focusables);
         crate::platform::app_log::info(format!(
-            "cursor jump {dir:?} zone={} from=({:.0},{:.0}) dock={was:?} fly={:?} attached={:?} targets={}",
-            if from.1 < 0.0 { "header" } else { "page" },
+            "cursor jump {dir:?} from=({:.0},{:.0}) dock={was:?} fly={:?} attached={:?} targets={}",
             from.0,
             from.1,
             self.page.cursor.fly_to,
             self.page.cursor.attached,
-            self.page.focusables.len() + self.chrome.len(),
+            self.page.focusables.len(),
         ));
     }
 }
 
-/// Pad-navigable chrome target: every header control the pad cursor docks
-/// onto as if it were in-viewport page chrome (same magnet, same
-/// break-free physics — the header rows live just above y=0 in unified
-/// cursor space).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChromeTarget {
-    Tab(crate::browser::engine::TabId),
-    TabClose(crate::browser::engine::TabId),
-    NewTab,
-    /// Hidden-tab count; activation cycles to the next tab.
-    TabOverflow(usize),
-    Back,
-    Forward,
-    Reload,
-    DefaultPage,
-    Omnibox,
-    Star,
-    Go,
-    Bookmark(usize),
-}
-
-/// Natural-width header layout in unified page pixels. The rendered
-/// header and the pad cursor share these rects, so the cursor dot can be
-/// drawn over header controls at its true position. Widths mirror the
-/// widgets' font sizes and paddings; the omnibox takes the remainder.
-pub struct ChromeRowLayout {
-    pub y: f32,
-    pub h: f32,
-    /// `(target, x, width)` in unified space, left to right.
-    pub items: Vec<(ChromeTarget, f32, f32)>,
-}
-
-fn label_width(label: &str, size: f32, pad_x: f32) -> f32 {
-    text_fit::text_width_px(label, size) + pad_x * 2.0
-}
-
-pub fn chrome_layout(panel: &BrowserPanel) -> Vec<ChromeRowLayout> {
-    let viewport_w = panel.viewport.0;
-    let mut rows = Vec::with_capacity(3);
-
-    // Tab strip: favicon + ellipsized title + close per tab, fitted to the
-    // width. Titles shrink evenly first; when even minimum titles cannot
-    // fit, a window around the active tab is shown plus an overflow chip
-    // that cycles to the next tab (so no tab is unreachable).
-    const TAB_PAD: f32 = 16.0; // button padding [4, 8]
-    const CLOSE_PAD: f32 = 12.0; // close padding [4, 6]
-    const ICON_W: f32 = 22.0; // 16px favicon + 6px spacing
-    const TAB_GAP: f32 = 4.0;
-    // Minimum title budget per tab (~120px tab + close). Below this the
-    // strip switches to the overflow chip instead of collapsing titles to a
-    // few characters.
-    const TITLE_MIN: f32 = 72.0;
-    // Give a lone/few tabs real room. The old fixed 140px cap clipped normal
-    // page titles after a handful of characters on wide screens.
-    let title_max = (viewport_w * 0.55).clamp(200.0, 640.0);
-    let close_w = text_fit::text_width_px("×", 11.0) + CLOSE_PAD;
-    let new_w = text_fit::text_width_px("+", 14.0) + 20.0;
-    let mut plans = Vec::with_capacity(panel.order.len());
-    for id in &panel.order {
-        let url = panel.tab_url(*id);
-        let icon_w = if !url.is_empty()
-            && panel
-                .favicons
-                .contains_key(&crate::browser::bookmarks::origin_key(&url))
-        {
-            ICON_W
-        } else {
-            0.0
-        };
-        let title = text_fit::ellipsize_to_width(panel.tab_title(*id), 11.0, title_max);
-        plans.push((*id, text_fit::text_width_px(&title, 11.0), icon_w));
-    }
-    let count = plans.len();
-    let gaps_all = TAB_GAP * count as f32;
-    let fixed_all: f32 = plans
-        .iter()
-        .map(|(_, _, icon)| TAB_PAD + icon + close_w)
-        .sum();
-    let titles_all: f32 = plans.iter().map(|(_, title, _)| title).sum();
-    let (start, end, title_budget, hidden) = if count == 0 {
-        (0, 0, 0.0, 0)
-    } else if fixed_all + titles_all + gaps_all + new_w <= viewport_w {
-        (0, count, f32::INFINITY, 0)
-    } else {
-        let per = (viewport_w - fixed_all - gaps_all - new_w) / count as f32;
-        if per >= TITLE_MIN {
-            (0, count, per, 0)
-        } else {
-            // Reserve the widest chip and the new-tab button, then fit as
-            // many minimum-title tabs as possible.
-            let chip_max = label_width("+99", 11.0, 10.0);
-            let group_min = TAB_PAD + ICON_W + close_w + TITLE_MIN;
-            let room = viewport_w - new_w - chip_max - TAB_GAP;
-            let fit = (room / (group_min + TAB_GAP)).floor().max(1.0) as usize;
-            let fit = fit.min(count.saturating_sub(1)).max(1);
-            let active = panel
-                .order
-                .iter()
-                .position(|id| *id == panel.active_tab)
-                .unwrap_or(0);
-            let start = if active < fit {
-                0
-            } else {
-                (active + 1 - fit).min(count - fit)
-            };
-            (start, start + fit, TITLE_MIN, count - fit)
-        }
-    };
-    let mut strip = Vec::with_capacity((end - start) * 2 + 2);
-    let mut x = 0.0;
-    for (id, title_w, icon_w) in plans.iter().take(end).skip(start) {
-        let title_w = title_w.min(title_budget);
-        // A few px of slack so the render-side ellipsis safety margin does not
-        // shave the last character off a title that already fits naturally.
-        let tab_w = TAB_PAD + icon_w + title_w + 6.0;
-        strip.push((ChromeTarget::Tab(*id), x, tab_w));
-        strip.push((ChromeTarget::TabClose(*id), x + tab_w, close_w));
-        x += tab_w + close_w + TAB_GAP;
-    }
-    if hidden > 0 {
-        let label = format!("+{hidden}");
-        let chip_w = label_width(&label, 11.0, 10.0);
-        strip.push((ChromeTarget::TabOverflow(hidden), x, chip_w));
-        x += chip_w + TAB_GAP;
-    }
-    if x + new_w <= viewport_w {
-        strip.push((ChromeTarget::NewTab, x, new_w));
-    }
-    rows.push(ChromeRowLayout {
-        y: CHROME_STRIP_Y,
-        h: CHROME_ROW_H,
-        items: strip,
-    });
-
-    // Toolbar: fixed controls, the address field absorbs the remainder.
-    let gaps = 6.0 * 8.0;
-    let back = label_width("←", 14.0, 12.0);
-    let forward = label_width("→", 14.0, 12.0);
-    let reload = label_width("⟳", 14.0, 12.0);
-    let default_page = label_width("⌂", 14.0, 12.0);
-    let star = label_width("★", 16.0, 10.0).max(label_width("☆", 16.0, 10.0));
-    let go = label_width("Go", 14.0, 14.0);
-    let omni =
-        (viewport_w - (back + forward + reload + default_page + star + go + gaps)).max(120.0);
-    let mut bar = Vec::with_capacity(7);
-    let mut x = 0.0;
-    for (target, w) in [
-        (ChromeTarget::Back, back),
-        (ChromeTarget::Forward, forward),
-        (ChromeTarget::Reload, reload),
-        (ChromeTarget::DefaultPage, default_page),
-        (ChromeTarget::Omnibox, omni),
-        (ChromeTarget::Star, star),
-        (ChromeTarget::Go, go),
-    ] {
-        bar.push((target, x, w));
-        x += w + 8.0;
-    }
-    rows.push(ChromeRowLayout {
-        y: CHROME_TOOLBAR_Y,
-        h: CHROME_ROW_H,
-        items: bar,
-    });
-
-    // One bookmark row, natural chip widths, clipped at the viewport edge.
-    let mut marks = Vec::new();
-    let mut x = 0.0;
-    for (i, b) in panel
-        .bookmarks
-        .iter()
-        .take(CHROME_MAX_BOOKMARKS)
-        .enumerate()
-    {
-        let icon = panel
-            .favicons
-            .contains_key(&crate::browser::bookmarks::origin_key(&b.url));
-        let name = text_fit::ellipsize_to_width(b.name(), 13.0, 170.0);
-        let w = 20.0 + text_fit::text_width_px(&name, 13.0) + if icon { 22.0 } else { 0.0 };
-        if x + w > viewport_w {
-            break;
-        }
-        marks.push((ChromeTarget::Bookmark(i), x, w));
-        x += w + 6.0;
-    }
-    rows.push(ChromeRowLayout {
-        y: CHROME_BOOKMARKS_Y,
-        h: CHROME_BOOKMARK_H,
-        items: marks,
-    });
-
-    rows
-}
-
-/// Header rows for pad navigation, targets only (rects live in
-/// [`BrowserPanel::chrome`], built by [`BrowserPanel::rebuild_chrome`]).
-pub fn chrome_rows(panel: &BrowserPanel) -> Vec<Vec<ChromeTarget>> {
-    chrome_layout(panel)
-        .into_iter()
-        .map(|row| row.items.into_iter().map(|(t, _, _)| t).collect())
-        .collect()
-}
-
-/// Unified-space geometry (page px): header rows above the viewport.
-pub const CHROME_STRIP_Y: f32 = -112.0;
-pub const CHROME_TOOLBAR_Y: f32 = -72.0;
-pub const CHROME_BOOKMARKS_Y: f32 = -32.0;
-pub const CHROME_ROW_H: f32 = 36.0;
-pub const CHROME_BOOKMARK_H: f32 = 28.0;
-/// Gap between header rows.
-pub const CHROME_ROW_GAP: f32 = 4.0;
-/// Total header height above the page: three rows plus three gaps. Matches
-/// `CURSOR_MIN_Y` exactly.
-pub const CHROME_HEADER_H: f32 = CHROME_ROW_H
-    + CHROME_ROW_GAP
-    + CHROME_ROW_H
-    + CHROME_ROW_GAP
-    + CHROME_BOOKMARK_H
-    + CHROME_ROW_GAP;
-/// Outer breather against the screen edge: 50px per side (height - 100).
-pub const BROWSER_OUTER_MARGIN: f32 = 50.0;
-/// Card padding around the browser surface.
-pub const BROWSER_CARD_PAD: f32 = 4.0;
-
 /// Browser popup geometry: the card itself is 16:9, sized from the
-/// available viewport height (clamped by width). The fixed header takes
-/// the top of the card; the page area is the rest.
+/// available viewport height (clamped by width). The page surface fills the
+/// card (no browser chrome).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrowserLayout {
     pub page_w: f32,
@@ -1334,7 +741,7 @@ pub fn browser_layout(stage_w: f32, stage_h: f32) -> BrowserLayout {
         card_h = card_w * 9.0 / 16.0;
     }
     let page_w = (card_w - 2.0 * BROWSER_CARD_PAD).max(1.0);
-    let page_h = (card_h - 2.0 * BROWSER_CARD_PAD - CHROME_HEADER_H).max(1.0);
+    let page_h = (card_h - 2.0 * BROWSER_CARD_PAD).max(1.0);
     BrowserLayout {
         page_w: page_w.round(),
         page_h: page_h.round(),
@@ -1342,21 +749,18 @@ pub fn browser_layout(stage_w: f32, stage_h: f32) -> BrowserLayout {
         card_h: card_h.round(),
     }
 }
-/// Cap on bookmark chrome slots (overflow stays mouse-reachable; magnet
-/// slots must stay wide enough to arrive at).
-pub const CHROME_MAX_BOOKMARKS: usize = 12;
 
-/// Cursor physics space: the page's focusables plus the synthetic header
-/// targets — one continuous magnet/jump/click surface.
-pub fn cursor_targets(
-    page: &[crate::browser::cursor::Focusable],
-    chrome: &[(ChromeTarget, crate::browser::cursor::Focusable)],
-) -> Vec<crate::browser::cursor::Focusable> {
-    let mut out = Vec::with_capacity(page.len() + chrome.len());
-    out.extend_from_slice(page);
-    out.extend(chrome.iter().map(|(_, f)| f.clone()));
-    out
-}
+/// Outer breather against the screen edge: 50px per side (height - 100).
+pub const BROWSER_OUTER_MARGIN: f32 = 50.0;
+/// Card padding around the browser surface.
+pub const BROWSER_CARD_PAD: f32 = 4.0;
+
+/// Favicon handle cache cap kept for the dormant bookmark data (no v0 UI).
+pub const MAX_FAVICONS: usize = 64;
+
+/// Dormant favicon handles by origin; retained so bookmark data can regain
+/// icons without touching the engine event path.
+pub type FaviconCache = HashMap<String, iced::widget::image::Handle>;
 
 #[cfg(test)]
 mod tests {
@@ -1450,18 +854,35 @@ mod tests {
     }
 
     #[test]
-    fn header_resets_axis_lock() {
+    fn dpad_jump_steps_through_page_targets() {
+        use crate::browser::cursor::{FocusKind, Focusable};
         let mut panel = panel();
-        let t0 = Instant::now();
-        step(&mut panel, 0.0, 0.0, false, t0);
-        let at = t0 + Duration::from_millis(100);
-        step(&mut panel, 0.2, -0.9, false, at);
-        assert_eq!(panel.scroll_axis, Some(ScrollAxis::Vertical));
-        panel.page.cursor.y = -5.0;
-        let at = at + Duration::from_millis(100);
-        let (dx, dy) = step(&mut panel, 0.2, -0.9, false, at);
-        assert_eq!((dx, dy), (0.0, 0.0));
-        assert_eq!(panel.scroll_axis, None);
+        panel.page.focusables = vec![
+            Focusable {
+                id: 1,
+                x: 100.0,
+                y: 100.0,
+                w: 100.0,
+                h: 40.0,
+                kind: FocusKind::Link,
+                url: None,
+            },
+            Focusable {
+                id: 2,
+                x: 100.0,
+                y: 300.0,
+                w: 100.0,
+                h: 40.0,
+                kind: FocusKind::Link,
+                url: None,
+            },
+        ];
+        panel.page.cursor.x = 150.0;
+        panel.page.cursor.y = 320.0;
+        panel.page.cursor.attached = Some(2);
+        panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
+        assert!(panel.dom_reseed_pending);
+        assert_eq!(panel.page.cursor.fly_to, Some((150.0, 120.0)));
     }
 
     #[test]
@@ -1506,5 +927,50 @@ mod tests {
             !osk.auto_opened,
             "auto-open must not take ownership of a manual OSK"
         );
+    }
+
+    #[test]
+    fn snapshot_persists_the_live_page_only() {
+        let mut panel = BrowserPanel::default();
+        panel.session.begin_load("https://a.test/".to_string());
+        panel.session.note_title(Some("A".to_string()));
+        let snap = panel.snapshot_tabs();
+        assert_eq!(snap.tabs.len(), 1);
+        assert_eq!(snap.tabs[0].url, "https://a.test/");
+        assert_eq!(snap.tabs[0].title, "A");
+        assert_eq!(snap.active, 0);
+        // Blank/empty pages never persist.
+        panel
+            .session
+            .note_url(crate::browser::BLANK_PAGE_URL.to_string());
+        assert!(panel.snapshot_tabs().tabs.is_empty());
+    }
+
+    #[test]
+    fn store_activation_round_trips_page_state() {
+        let mut panel = BrowserPanel::default();
+        assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
+        panel.session.begin_load("https://a.test/".to_string());
+        panel.stash_live();
+        assert_eq!(panel.stored.len(), 1);
+        assert_eq!(panel.stored[0].id, crate::browser::engine::TabId::BOOT);
+        assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
+        assert!(panel.stored[0].loaded);
+        let second = crate::browser::engine::TabId(panel.next_tab_id);
+        panel.next_tab_id += 1;
+        panel.active_tab = second;
+        panel.order.push(second);
+        panel.session.begin_load("https://b.test/".to_string());
+        assert!(panel.activate_stored(crate::browser::engine::TabId::BOOT));
+        assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
+        assert_eq!(panel.session.url(), "https://a.test/");
+        assert_eq!(panel.stored.len(), 1);
+        assert_eq!(panel.stored[0].id, second);
+        assert_eq!(panel.stored[0].page.session.url(), "https://b.test/");
+        assert!(!panel.activate_stored(crate::browser::engine::TabId(999)));
+        assert!(!panel.drop_stored(crate::browser::engine::TabId(999)));
+        assert!(panel.drop_stored(second));
+        assert!(panel.stored.is_empty());
+        assert!(!panel.drop_stored(crate::browser::engine::TabId::BOOT));
     }
 }

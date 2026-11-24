@@ -83,15 +83,6 @@ pub const SCROLL_SPEED: f32 = 1500.0;
 /// startup/default size; live cursors carry their own `view_w/view_h`.
 pub const VIEWPORT_W: f32 = 800.0;
 pub const VIEWPORT_H: f32 = 600.0;
-/// Top of the unified cursor space: the header lives above the viewport as
-/// synthetic snap targets (tab strip, toolbar, bookmarks), so the pad
-/// cursor treats chrome and page as one continuous surface — pushing past
-/// the viewport top walks into the header, pushing back down returns.
-pub const CURSOR_MIN_Y: f32 = -112.0;
-/// Synthetic chrome ids live far above any engine-assigned page id, so a
-/// cursor attachment unambiguously addresses chrome (pad action, never an
-/// engine click) or page (engine click path).
-pub const CHROME_ID_BASE: u64 = 1 << 62;
 
 /// Directional jump axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +220,7 @@ impl Cursor {
         self.view_w = w;
         self.view_h = h;
         self.x = self.x.clamp(0.0, w);
-        self.y = self.y.clamp(CURSOR_MIN_Y, h);
+        self.y = self.y.clamp(0.0, h);
     }
 
     /// Reset for a fresh document: recenter in the **live** viewport and
@@ -259,15 +250,13 @@ impl Cursor {
     }
 
     /// Page targets are only reachable while any part of them intersects
-    /// the viewport; synthetic chrome lives above it and is always
-    /// eligible. The cursor clamps to the viewport, so off-screen page
+    /// the viewport. The cursor clamps to the viewport, so off-screen page
     /// targets can only pin it to an edge with nothing visible beneath it.
     fn within_viewport(&self, item: &Focusable) -> bool {
-        item.id >= CHROME_ID_BASE
-            || (item.x < self.view_w
-                && item.x + item.w > 0.0
-                && item.y < self.view_h
-                && item.y + item.h > 0.0)
+        item.x < self.view_w
+            && item.x + item.w > 0.0
+            && item.y < self.view_h
+            && item.y + item.h > 0.0
     }
 }
 
@@ -283,19 +272,12 @@ impl Default for Cursor {
 }
 
 impl Cursor {
-    /// Clamp a y value to the cursor's current zone (page >= 0, header < 0).
-    /// Jump and centre-snap landings stay in the target's zone; analog
-    /// movement is free to cross the boundary (the stick supersedes the
-    /// explicit D-pad entry/exit).
+    /// Clamp a y value to the page surface.
     fn zone_y(&self, y: f32) -> f32 {
-        if self.y < 0.0 {
-            y.clamp(CURSOR_MIN_Y, -0.5)
-        } else {
-            y.clamp(0.0, self.view_h)
-        }
+        y.clamp(0.0, self.view_h)
     }
 
-    /// Free movement across the unified surface. Any manual move drops the
+    /// Free movement across the page surface. Any manual move drops the
     /// attachment first; docking re-engages on arrival.
     pub fn move_by(&mut self, dx: f32, dy: f32) {
         if dx == 0.0 && dy == 0.0 {
@@ -303,7 +285,7 @@ impl Cursor {
         }
         self.attached = None;
         self.x = (self.x + dx).clamp(0.0, self.view_w);
-        self.y = (self.y + dy).clamp(CURSOR_MIN_Y, self.view_h);
+        self.y = (self.y + dy).clamp(0.0, self.view_h);
     }
 
     /// Analog velocity step, D-pad flights, and dock morph state. The stick
@@ -408,8 +390,7 @@ impl Cursor {
             let t = (self.fly_elapsed / NUDGE_SECS).clamp(0.0, 1.0);
             let e = t * t * (3.0 - 2.0 * t);
             self.x = (self.fly_from.0 + (tx - self.fly_from.0) * e).clamp(0.0, self.view_w);
-            self.y =
-                (self.fly_from.1 + (ty - self.fly_from.1) * e).clamp(CURSOR_MIN_Y, self.view_h);
+            self.y = (self.fly_from.1 + (ty - self.fly_from.1) * e).clamp(0.0, self.view_h);
             self.vx = 0.0;
             self.vy = 0.0;
             if let Some((from, to)) = self.nudge_morph {
@@ -451,10 +432,8 @@ impl Cursor {
         }
         if self.vx != 0.0 || self.vy != 0.0 {
             self.x = (self.x + self.vx * dt_secs).clamp(0.0, self.view_w);
-            // Analog is the free pointer across the unified surface: it may
-            // cross the header/page boundary in either direction. The
-            // explicit D-pad Up/Down rule gates jumps only, not the stick.
-            self.y = (self.y + self.vy * dt_secs).clamp(CURSOR_MIN_Y, self.view_h);
+            // Analog movement stays inside the page surface.
+            self.y = (self.y + self.vy * dt_secs).clamp(0.0, self.view_h);
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
@@ -505,8 +484,8 @@ impl Cursor {
     /// a right target. Inside the band the nearest forward row wins first,
     /// then the widest shared perpendicular extent, then the smallest
     /// column offset. With no dock (or nothing sharing the band) it falls
-    /// back to the 60-degree cone and nearest-point scoring. Page targets
-    /// must intersect the viewport; chrome lives above it.
+    /// back to the 60-degree cone and nearest-point scoring. Targets must
+    /// intersect the viewport.
     pub fn jump(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         self.jump_with(dir, options, false)
     }
@@ -515,9 +494,9 @@ impl Cursor {
     /// only targets sharing the attached rect's vertical band (or, with a
     /// free point, targets containing its y). There is deliberately no
     /// cone fallback: a row end is a no-op, never a diagonal hop into
-    /// another row or into chrome. The dot keeps its row y on arrival
-    /// (clamped into the destination rect), so a tall masonry tile morphs
-    /// into shape without yanking the point to its centre.
+    /// another row. The dot keeps its row y on arrival (clamped into the
+    /// destination rect), so a tall masonry tile morphs into shape without
+    /// yanking the point to its centre.
     pub fn jump_row(&mut self, dir: JumpDir, options: &[Focusable]) -> bool {
         debug_assert!(matches!(dir, JumpDir::Left | JumpDir::Right));
         let from = self.attached_rect(options);
@@ -627,9 +606,7 @@ impl Cursor {
         }
     }
 
-    /// Fly straight to a known target, bypassing directional scoring. Row-
-    /// stepped header navigation picks the slot itself (column-preserved),
-    /// and a pick can sit outside the 60-degree cone the spatial jump uses.
+    /// Fly straight to a known target, bypassing directional scoring.
     pub fn jump_to(&mut self, item: &Focusable) {
         self.jump_to_with(item, false);
     }
@@ -646,22 +623,13 @@ impl Cursor {
         self.vx = 0.0;
         self.vy = 0.0;
         self.scroll_released = false;
-        // Explicit jump: allowed to cross the header/page boundary, but
-        // land in the target's own zone (a partially visible page link
-        // must not park the point inside the header).
         let cy = item.y + item.h / 2.0;
         let y = if keep_row_y {
             // Horizontal nudge: keep the dot on its row, clamped into the
             // destination rect so an edge-overlap still docks. A tall tile
             // must not pull the point to its centre.
             let y = self.y.clamp(item.y, item.y + item.h);
-            if item.id >= CHROME_ID_BASE {
-                y.clamp(CURSOR_MIN_Y, -0.5)
-            } else {
-                y.clamp(0.0, self.view_h)
-            }
-        } else if item.id >= CHROME_ID_BASE {
-            cy.clamp(CURSOR_MIN_Y, -0.5)
+            y.clamp(0.0, self.view_h)
         } else {
             cy.clamp(0.0, self.view_h)
         };
@@ -721,15 +689,7 @@ impl Cursor {
         self.attached = None;
         let mut best: Option<&Focusable> = None;
         let mut best_d = f32::INFINITY;
-        // Zone rule: above the viewport only header chrome competes, below
-        // it only page targets do. Without this a glide across the sparse
-        // header keeps getting yanked down by dense page links (and back
-        // up) — the bounce. Jumps don't need it: they score directionally.
-        let in_header = self.y < 0.0;
         for item in options {
-            if (item.id >= CHROME_ID_BASE) != in_header {
-                continue;
-            }
             if !self.within_viewport(item) {
                 continue;
             }
@@ -800,9 +760,6 @@ impl Cursor {
             && let Some(item) = options.iter().find(|o| o.id == id)
         {
             let (cx, cy) = (item.x + item.w / 2.0, item.y + item.h / 2.0);
-            if item.id >= CHROME_ID_BASE {
-                return (cx, cy);
-            }
             // Page clicks must land inside the viewport: a partially
             // visible target's centre can sit below it (observed click at
             // y=718 for a 600px viewport). The clamped centre stays within
@@ -1053,45 +1010,19 @@ mod tests {
     }
 
     #[test]
-    fn analog_stick_can_cross_the_header_boundary() {
-        // The stick is the free pointer across the unified surface: no
-        // D-pad needed to walk into the header or back out. The unified
-        // top stays the clamp.
+    fn analog_stick_clamps_at_the_page_edges() {
+        // The page surface starts at y=0; no browser chrome above it.
         let mut c = Cursor::new();
         c.x = 400.0;
         c.y = 20.0;
         for _ in 0..60 {
             c.advance(0.0, -1.0, 0.016, &[]);
         }
-        assert!(c.y < 0.0, "stick entered the header, y={}", c.y);
-        assert!(c.y >= CURSOR_MIN_Y);
-        for _ in 0..120 {
-            c.advance(0.0, 1.0, 0.016, &[]);
-        }
-        assert!(c.y > 0.0, "stick returned to the page, y={}", c.y);
+        assert_eq!(c.y, 0.0, "top clamp");
         for _ in 0..300 {
             c.advance(0.0, 1.0, 0.016, &[]);
         }
         assert_eq!(c.y, c.view_h, "bottom clamp");
-    }
-
-    #[test]
-    fn analog_can_cross_and_dock_header_chrome() {
-        // Crossing the boundary by stick must be enough to acquire chrome;
-        // the zone gate applies to the acquisition, not to movement.
-        let mut c = Cursor::new();
-        c.x = 350.0;
-        c.y = 20.0;
-        let chrome = chrome_btn(CHROME_ID_BASE, 300.0, -72.0, 100.0, 36.0);
-        let items = [chrome];
-        for _ in 0..90 {
-            c.advance(0.0, -1.0, 0.016, &items);
-            if c.attached.is_some() {
-                break;
-            }
-        }
-        assert_eq!(c.attached, Some(CHROME_ID_BASE));
-        assert!(c.y < 0.0);
     }
 
     #[test]
@@ -1311,99 +1242,55 @@ mod tests {
     }
 
     #[test]
-    fn jump_flies_into_header_space_and_docks() {
-        // Unified cursor space: a D-pad Up from the top page target lands
-        // on the synthetic header slot above the viewport (negative y).
+    fn jump_flies_to_top_page_target_and_docks() {
+        // D-pad Up from a lower target lands on the target above it.
         let mut c = Cursor::new();
-        let chrome = Focusable {
-            id: 1 << 62,
-            x: 300.0,
-            y: -72.0,
-            w: 100.0,
-            h: 36.0,
-            kind: FocusKind::Button,
-            url: None,
-        };
-        let page = link(1, 300.0, 100.0);
-        let items = [page, chrome];
+        let top = link(1, 300.0, 10.0);
+        let bottom = link(2, 300.0, 100.0);
+        let items = [top, bottom];
         c.x = 350.0;
         c.y = 115.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, Some(1));
-        // Push up past the page target: jump targets the header slot.
+        assert_eq!(c.attached, Some(2));
         assert!(c.jump(JumpDir::Up, &items));
         // Fly until arrival (jump glides, docks on arrival).
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached == Some(1 << 62) {
+            if c.attached == Some(1) {
                 break;
             }
         }
-        assert_eq!(c.attached, Some(1 << 62));
-        assert!(c.y < 0.0);
-    }
-
-    #[test]
-    fn magnet_is_zone_gated() {
-        // While roaming the header (y < 0) only chrome competes for the
-        // magnet: a dense page link directly below never yanks the cursor
-        // back down mid-travel (and vice versa at y >= 0).
-        let mut c = Cursor::new();
-        let chrome = Focusable {
-            id: 1 << 62,
-            x: 300.0,
-            y: -72.0,
-            w: 100.0,
-            h: 36.0,
-            kind: FocusKind::Button,
-            url: None,
-        };
-        // Page link directly below the chrome slot.
-        let page = link(1, 300.0, 10.0);
-        let items = [page, chrome];
-        // Roaming free in the header band docks chrome, not the page link
-        // a few dozen px below.
-        c.x = 350.0;
-        c.y = -54.0;
-        c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, Some(1 << 62));
-        // Roaming free just inside the viewport ignores the chrome above.
-        let mut c2 = Cursor::new();
-        c2.x = 350.0;
-        c2.y = 20.0;
-        c2.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c2.attached, Some(1));
+        assert_eq!(c.attached, Some(1));
+        assert!(c.y >= 0.0);
     }
 
     #[test]
     fn docked_jump_stays_in_the_docked_band() {
-        // Trace case: Left from the wide omnibox must land on the adjacent
-        // toolbar button, not a strip slot two rows up whose nearest edge
-        // is closer in x. Direction is the gate; shared row extent decides
-        // eligibility before any distance scoring.
+        // Direction is the gate; shared row extent decides eligibility
+        // before any distance scoring.
         let mut c = Cursor::new();
         let omni = Focusable {
-            id: CHROME_ID_BASE,
+            id: 1,
             x: 228.0,
-            y: -72.0,
+            y: 100.0,
             w: 456.0,
             h: 36.0,
             kind: FocusKind::Button,
             url: None,
         };
         let reload = Focusable {
-            id: CHROME_ID_BASE + 1,
+            id: 2,
             x: 114.0,
-            y: -72.0,
+            y: 100.0,
             w: 57.0,
             h: 36.0,
             kind: FocusKind::Button,
             url: None,
         };
         let strip = Focusable {
-            id: CHROME_ID_BASE + 2,
+            id: 3,
             x: 246.0,
-            y: -112.0,
+            y: 50.0,
             w: 185.0,
             h: 36.0,
             kind: FocusKind::Button,
@@ -1411,17 +1298,17 @@ mod tests {
         };
         let items = [omni, reload, strip];
         c.x = 456.0;
-        c.y = -54.0;
+        c.y = 118.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert_eq!(c.attached, Some(1));
         assert!(c.jump(JumpDir::Left, &items));
         for _ in 0..60 {
             c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached == Some(CHROME_ID_BASE + 1) {
+            if c.attached == Some(2) {
                 break;
             }
         }
-        assert_eq!(c.attached, Some(CHROME_ID_BASE + 1));
+        assert_eq!(c.attached, Some(2));
     }
 
     #[test]
@@ -1430,10 +1317,10 @@ mod tests {
         // either row-2 slot must pick a: it shares 150px with c and 50px
         // with d, while b shares 0 and 30. Center distance would pick b
         // from d; shared extent picks a.
-        let a = chrome_btn(1, 0.0, 100.0, 200.0, 40.0);
-        let b = chrome_btn(2, 200.0, 100.0, 100.0, 40.0);
-        let c = chrome_btn(3, 0.0, 200.0, 150.0, 40.0);
-        let d = chrome_btn(4, 150.0, 200.0, 80.0, 40.0);
+        let a = page_btn(1, 0.0, 100.0, 200.0, 40.0);
+        let b = page_btn(2, 200.0, 100.0, 100.0, 40.0);
+        let c = page_btn(3, 0.0, 200.0, 150.0, 40.0);
+        let d = page_btn(4, 150.0, 200.0, 80.0, 40.0);
         let items = [a, b, c, d];
         for (from, x) in [(3u64, 75.0f32), (4, 190.0)] {
             let mut cur = Cursor::new();
@@ -1457,9 +1344,9 @@ mod tests {
         // The below-right target is nearer in x and would win any
         // distance/centre score, but shares none of the docked row's
         // vertical extent. Direction gates it out entirely.
-        let current = chrome_btn(1, 100.0, 100.0, 100.0, 100.0);
-        let right = chrome_btn(2, 250.0, 100.0, 100.0, 50.0);
-        let below_right = chrome_btn(3, 220.0, 220.0, 100.0, 50.0);
+        let current = page_btn(1, 100.0, 100.0, 100.0, 100.0);
+        let right = page_btn(2, 250.0, 100.0, 100.0, 50.0);
+        let below_right = page_btn(3, 220.0, 220.0, 100.0, 50.0);
         let items = [current, right, below_right];
         let mut c = Cursor::new();
         c.attached = Some(1);
@@ -1474,15 +1361,15 @@ mod tests {
     }
 
     #[test]
-    fn near_page_logo_beats_the_wide_bookmark_bar() {
-        // R3 trace: Up from link #6 (141-282) skipped the brand logo #1
-        // (8-188) and jumped to the 400px bookmark bar. The logo shares
-        // 47px and sits 12px above; the bookmark shares 141px but is 54px
-        // above. Nearest row wins inside the band.
-        let logo = chrome_btn(1, 8.0, 12.0, 180.0, 26.0);
-        let tile = chrome_btn(6, 141.0, 50.0, 141.0, 36.0);
-        let bookmark = chrome_btn(CHROME_ID_BASE, 0.0, -32.0, 400.0, 28.0);
-        let items = [logo, tile, bookmark];
+    fn near_page_logo_beats_a_wide_far_target() {
+        // R3 trace: Up from a content tile skipped the brand logo and
+        // jumped to a wide banner. The logo shares the tile's band and is
+        // nearer; the wide banner is farther forward. Nearest row wins
+        // inside the band.
+        let logo = page_btn(1, 8.0, 12.0, 180.0, 26.0);
+        let tile = page_btn(6, 141.0, 50.0, 141.0, 36.0);
+        let banner = page_btn(7, 0.0, 0.0, 400.0, 18.0);
+        let items = [logo, tile, banner];
         let mut c = Cursor::new();
         c.attached = Some(6);
         c.x = 211.5;
@@ -1491,23 +1378,22 @@ mod tests {
         assert_eq!(
             c.fly_to,
             Some((98.0, 25.0)),
-            "the brand logo directly above wins, not the wide bookmark bar"
+            "the brand logo directly above wins, not the wide banner"
         );
     }
 
     #[test]
     fn nearest_forward_row_beats_a_wide_far_target() {
-        // R3 trace: Down from the bookmark bar docked a 302px banner at
-        // y=188 instead of the 100px link at y=50. Both crossed the
-        // bookmark centre line; the nearer row must win before width.
-        let bookmark = chrome_btn(CHROME_ID_BASE, 0.0, -32.0, 400.0, 28.0);
+        // R3 trace: Down from a top strip docked a wide banner far below
+        // instead of the nearer link. The nearer row must win before width.
+        let top = page_btn(9, 0.0, 0.0, 400.0, 20.0);
         let near = link(1, 141.0, 50.0);
         let far = link(2, 14.0, 188.0);
-        let items = [bookmark, near, far];
+        let items = [top, near, far];
         let mut c = Cursor::new();
-        c.attached = Some(CHROME_ID_BASE);
+        c.attached = Some(9);
         c.x = 200.0;
-        c.y = -18.0;
+        c.y = 10.0;
         assert!(c.jump(JumpDir::Down, &items));
         assert_eq!(
             c.fly_to,
@@ -1547,20 +1433,16 @@ mod tests {
     fn click_point_stays_inside_viewport_for_partial_target() {
         // R3 trace: docked on a 480x270 link whose centre is y=718 in a
         // 600px viewport; the click must clamp to the visible edge area.
-        let tall = chrome_btn(2, 420.0, 583.0, 480.0, 270.0);
+        let tall = page_btn(2, 420.0, 583.0, 480.0, 270.0);
         let items = [tall];
         let mut c = Cursor::new();
         c.attached = Some(2);
         c.x = 660.0;
         c.y = 600.0;
         assert_eq!(c.click_point(&items), (660.0, 600.0));
-        // Chrome keeps its true centre: header coordinates stay meaningful.
-        let bm = chrome_btn(CHROME_ID_BASE, 400.0, -32.0, 400.0, 28.0);
-        c.attached = Some(CHROME_ID_BASE);
-        assert_eq!(c.click_point(&[bm]), (600.0, -18.0));
     }
 
-    fn chrome_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {
+    fn page_btn(id: u64, x: f32, y: f32, w: f32, h: f32) -> Focusable {
         Focusable {
             id,
             x,
@@ -1570,27 +1452,6 @@ mod tests {
             kind: FocusKind::Button,
             url: None,
         }
-    }
-
-    #[test]
-    fn header_down_picks_slot_below_over_aligned_page_link() {
-        // Trace case: Down from a strip tab landed on a page link two rows
-        // down, skipping the toolbar. Nearest-point scoring prefers the
-        // slot directly below.
-        let mut c = Cursor::new();
-        let omni = chrome_btn(CHROME_ID_BASE, 228.0, -72.0, 457.0, 36.0);
-        let page = link(1, 283.0, 50.0);
-        let items = [page, omni];
-        c.x = 338.0;
-        c.y = -94.0;
-        assert!(c.jump(JumpDir::Down, &items));
-        for _ in 0..60 {
-            c.advance(0.0, 0.0, 0.016, &items);
-            if c.attached == Some(CHROME_ID_BASE) {
-                break;
-            }
-        }
-        assert_eq!(c.attached, Some(CHROME_ID_BASE));
     }
 
     #[test]
@@ -1625,28 +1486,19 @@ mod tests {
 
     #[test]
     fn jump_into_void_stays_put() {
-        // D-pad past the last element is a no-op: it used to nudge the
-        // cursor into empty space above the header (invisible, nothing to
-        // dock to). Jump-only movement stays exactly put.
+        // D-pad past the top element is a no-op: jump-only movement stays
+        // exactly put.
         let mut c = Cursor::new();
-        let tab = Focusable {
-            id: CHROME_ID_BASE,
-            x: 0.0,
-            y: -112.0,
-            w: 185.0,
-            h: 36.0,
-            kind: FocusKind::Button,
-            url: None,
-        };
-        let items = [tab];
-        c.x = 92.0;
-        c.y = -94.0;
+        let top = link(1, 200.0, 0.0);
+        let items = [top];
+        c.x = 250.0;
+        c.y = 15.0;
         c.advance(0.0, 0.0, 0.016, &items);
-        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert_eq!(c.attached, Some(1));
         assert!(!c.jump(JumpDir::Up, &items));
-        assert_eq!(c.attached, Some(CHROME_ID_BASE));
+        assert_eq!(c.attached, Some(1));
         // The blocked press moves nothing; the point keeps its position.
-        assert_eq!((c.x, c.y), (92.0, -94.0));
+        assert_eq!((c.x, c.y), (250.0, 15.0));
         assert!(c.fly_to.is_none());
     }
 

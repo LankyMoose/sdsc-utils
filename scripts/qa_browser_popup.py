@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Synthetic popup/new-tab smoke test (no OS keyboard/mouse injection).
+"""Synthetic popup-denial smoke test (no OS keyboard/mouse injection).
 
 Opens a local page with a target=_blank link, clicks it through the replay
-driver, and verifies the request became a second Browser tab with the popup
-URL/title. The app runs with SDSC_DEBUG_INPUT=0 and is killed as soon as
-replay.done is observed.
+driver, and verifies v0 denies popups: no second tab is created, the popup
+page never loads, and the source page stays current. The app runs with
+SDSC_DEBUG_INPUT=0 and is killed as soon as replay.done is observed.
 """
 
 from __future__ import annotations
@@ -126,14 +126,20 @@ def main() -> int:
         print(f"sandbox={sandbox}")
         print(f"tabs={json.dumps(tabs, ensure_ascii=False)}")
         popup = [tab for tab in tabs if str(tab.get("url", "")).endswith("/popup.html")]
-        if not popup:
-            print("error: target=_blank did not open a new tab", file=sys.stderr)
-            return 1
-        if popup[0].get("title") != "popup ok":
-            print("error: popup tab did not load the popup page", file=sys.stderr)
+        if popup:
+            print("error: target=_blank opened a popup tab (v0 denies popups)", file=sys.stderr)
             return 1
         if not any(str(tab.get("url", "")).endswith("/main.html") for tab in tabs):
-            print("error: source tab was lost", file=sys.stderr)
+            print("error: source page was lost", file=sys.stderr)
+            return 1
+        browser_log = next(sandbox.glob("trace/session-*/browser.jsonl"), None) if sandbox else None
+        text = (
+            browser_log.read_text(encoding="utf-8", errors="replace")
+            if browser_log and browser_log.is_file()
+            else ""
+        )
+        if "browser.popup_denied" not in text:
+            print("error: popup denial was not traced", file=sys.stderr)
             return 1
         return 0
     finally:

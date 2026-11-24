@@ -416,26 +416,9 @@ impl Message {
             Message::TrayLeftClick(_) => Some(input_trace("tray.click", "tray")),
             Message::Popup(_) => Some(input_trace("ui.popup", "popup")),
             Message::Configure(_) => Some(input_trace("ui.settings", "settings")),
-            Message::Browser(message) => message.trace_label().map(|label| {
-                let mut trace = input_trace(label, "browser");
-                match message {
-                    crate::ui::browser::BrowserMessage::HistoryOpen { back } => {
-                        trace = trace.field("back", *back);
-                    }
-                    crate::ui::browser::BrowserMessage::HistoryPick(index) => {
-                        trace = trace.field("index", *index);
-                    }
-                    crate::ui::browser::BrowserMessage::AutocompletePick(url) => {
-                        trace = trace.field("url", url);
-                    }
-                    crate::ui::browser::BrowserMessage::TabSwitch(tab)
-                    | crate::ui::browser::BrowserMessage::TabClose(tab) => {
-                        trace = trace.field("tab", tab.0);
-                    }
-                    _ => {}
-                }
-                trace
-            }),
+            Message::Browser(message) => message
+                .trace_label()
+                .map(|label| input_trace(label, "browser")),
             Message::BrowserRawKey { .. } => Some(input_trace("ui.key", "browser")),
             Message::BrowserIme { .. } => None,
             Message::Home(message) => {
@@ -1263,11 +1246,8 @@ impl App {
         // frame so it never appears near the top-left corner.
         app.browser.panel.cursor.reset_for_page();
 
-        // Disk-persisted bookmarks into the browser panel (the one state
-        // that survives restarts by design). Rebuild chrome after: the
-        // panel default built its snap map with an empty bookmark row.
+        // Disk-persisted bookmarks stay loaded as dormant data (no v0 UI).
         app.browser.panel.bookmarks = crate::browser::bookmarks::load();
-        app.browser.panel.rebuild_chrome();
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
