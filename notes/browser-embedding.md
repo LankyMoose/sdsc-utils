@@ -5,7 +5,8 @@ reader fallback are deleted. The pivot plan and remaining phases live in
 [browser-home-pivot.md](browser-home-pivot.md).
 
 **When to read:** anything touching `src/browser/`, the standalone Browser
-window, the engine worker, DOM targets, or the CEF packaging path.
+window, the engine worker, DOM targets, or the CEF packaging path. For a
+capability/API lookup, start with [cef-api.md](cef-api.md).
 
 ## Decision
 
@@ -37,9 +38,9 @@ window, the engine worker, DOM targets, or the CEF packaging path.
   reload/mouse/key/wheel/click-at/DOM reseed. `--type=` helpers re-exec the
   exe and run `CefExecuteProcess` before argument parsing. Popups are denied
   until engine-created tab adoption lands; canonical `HistoryChanged` is not
-  emitted yet. Favicons come from `DisplayHandler::on_favicon_urlchange`
-  (fetched off-thread with `favicon.rs`); bookmarks with no page visit yet
-  prefetch the site's conventional `/favicon.ico`.
+  emitted yet. Favicons come from `DisplayHandler::on_favicon_urlchange` and
+  CEF `BrowserHost::DownloadImage`; bookmarks with no page visit yet prefetch
+  the site's conventional `/favicon.ico` through the same path.
 - `src/browser/dom.rs` — DOM target query JS. CEF polls it from the page's
   V8 context through a renderer-process message bridge; the browser process
   parses the JSON. Stable per-document ids, viewport boxes, visibility,
@@ -174,8 +175,10 @@ CEF toolchain needs the pinned compiler.
 - **Popups denied**: `window.open`/`target=_blank` are canceled until the UI
   adopts engine-created tabs.
 - **Canonical history events**: tab titles and URLs work; exact back/forward
-  stacks come later. Favicon fetches use the app's own HTTP client (no CEF
-  cookies) and fall back to `/favicon.ico`.
+  stacks come later. Favicons use CEF `DownloadImage` for HTTP(S) (Chromium
+  cache/network stack; `is_favicon` disables cookies), with the local
+  `favicon.rs` decoder as the `data:`/failure fallback and `/favicon.ico`
+  fallback.
 - **Accelerated OSR not wired**: L1 CPU `OnPaint` only; `OnAcceleratedPaint`
   shared-texture import is the L2 performance step.
 - **macOS/Linux untested** for the CEF backend.

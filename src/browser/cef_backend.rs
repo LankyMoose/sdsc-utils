@@ -334,6 +334,8 @@ struct TabContext {
     /// Last icon candidate set fetched for this tab (dedupe repeated
     /// `on_favicon_urlchange` notifications).
     favicon_key: Arc<Mutex<String>>,
+    /// Invalidates in-flight favicon callbacks after navigation/closure.
+    favicon_request: Arc<AtomicU64>,
     /// Causal flow of the last traced navigation/history command. CEF
     /// callbacks join engine log lines to the UI action that caused them.
     trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
@@ -373,6 +375,10 @@ impl BrowserSlot {
 
     fn get(&self) -> Option<cef::Browser> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -622,6 +628,8 @@ cef::wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            self.ctx.browser.clear();
+            self.ctx.favicon_request.fetch_add(1, Ordering::AcqRel);
             self.ctx.handle.emit(EngineEvent::TabClosed { tab: self.ctx.tab });
         }
     }
@@ -786,24 +794,253 @@ cef::wrap_display_handler! {
                 }
                 *last = key;
             }
-            spawn_favicon_fetch(self.ctx.handle.clone(), self.ctx.tab, page_url, urls);
+            let request_id = self.ctx.favicon_request.fetch_add(1, Ordering::AcqRel) + 1;
+            start_favicon_download(&self.ctx, Some(request_id), page_url, urls);
         }
     }
 }
 
+/// One in-flight CEF favicon download. `request_id` is `None` for bookmark
+/// prefetch, where `page_url` is not the live document.
+struct FaviconDownload {
+    ctx: TabContext,
+    request_id: Option<u64>,
+    page_url: String,
+    icon_urls: Vec<String>,
+}
+
+fn favicon_candidates(page_url: &str, icon_urls: &[String]) -> Vec<String> {
+    let mut candidates = icon_urls.to_vec();
+    if let Some(origin) = crate::browser::favicon::origin_url(page_url) {
+        let conventional = format!("{origin}/favicon.ico");
+        if !candidates.iter().any(|url| url == &conventional) {
+            candidates.push(conventional);
+        }
+    }
+    candidates
+}
+
+fn favicon_is_http(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn favicon_page_matches(ctx: &TabContext, page_url: &str) -> bool {
+    let Some(browser) = ctx.browser.get() else {
+        return false;
+    };
+    if browser.is_valid() == 0 {
+        return false;
+    }
+    let Some(frame) = browser.main_frame() else {
+        return false;
+    };
+    let current = CefString::from(&frame.url()).to_string();
+    crate::browser::bookmarks::origin_key(&current)
+        == crate::browser::bookmarks::origin_key(page_url)
+}
+
+fn favicon_request_current(state: &FaviconDownload) -> bool {
+    if let Some(request_id) = state.request_id
+        && state.ctx.favicon_request.load(Ordering::Acquire) != request_id
+    {
+        return false;
+    }
+    if state.request_id.is_some() {
+        favicon_page_matches(&state.ctx, &state.page_url)
+    } else {
+        state
+            .ctx
+            .browser
+            .get()
+            .is_some_and(|browser| browser.is_valid() != 0)
+    }
+}
+
+/// Convert a CEF image to straight-alpha RGBA. Prefer the 2x representation;
+/// fall back to the PNG representation if the bitmap path is unavailable.
+fn favicon_image_to_rgba(image: &mut Image) -> Option<(u32, u32, Vec<u8>)> {
+    if image.is_empty() != 0 {
+        return None;
+    }
+    let scale = if image.has_representation(2.0) != 0 {
+        2.0
+    } else {
+        1.0
+    };
+    let mut width = 0;
+    let mut height = 0;
+    if let Some(bitmap) = image.as_bitmap(
+        scale,
+        ColorType::RGBA_8888,
+        AlphaType::POSTMULTIPLIED,
+        Some(&mut width),
+        Some(&mut height),
+    ) && width > 0
+        && height > 0
+    {
+        let len = bitmap.size();
+        let expected = width as usize * height as usize * 4;
+        if len == expected {
+            let mut rgba = vec![0u8; len];
+            if bitmap.data(Some(&mut rgba), 0) == len {
+                return Some((width as u32, height as u32, rgba));
+            }
+        }
+    }
+
+    let png = image.as_png(scale, 1, Some(&mut width), Some(&mut height))?;
+    let len = png.size();
+    if len == 0 {
+        return None;
+    }
+    let mut bytes = vec![0u8; len];
+    if png.data(Some(&mut bytes), 0) != len {
+        return None;
+    }
+    crate::browser::favicon::decode(&bytes)
+}
+
+cef::wrap_download_image_callback! {
+    struct SdscFaviconDownload {
+        state: Arc<FaviconDownload>,
+    }
+    impl DownloadImageCallback {
+        fn on_download_image_finished(
+            &self,
+            image_url: Option<&CefString>,
+            http_status_code: std::os::raw::c_int,
+            image: Option<&mut Image>,
+        ) {
+            let state = &self.state;
+            if !favicon_request_current(state) {
+                return;
+            }
+            let source_url = image_url
+                .map(|url| url.to_string())
+                .unwrap_or_default();
+            if let Some(image) = image
+                && let Some((width, height, rgba)) = favicon_image_to_rgba(image)
+            {
+                trace_engine(&state.ctx, "favicon.result")
+                    .field("page", &state.page_url)
+                    .field("url", &source_url)
+                    .field("status", http_status_code)
+                    .field("source", "cef")
+                    .field("width", width)
+                    .field("height", height)
+                    .emit();
+                state.ctx.handle.emit(EngineEvent::FaviconChanged {
+                    tab: state.ctx.tab,
+                    url: state.page_url.clone(),
+                    width,
+                    height,
+                    rgba,
+                });
+                return;
+            }
+            trace_engine(&state.ctx, "favicon.result")
+                .field("page", &state.page_url)
+                .field("url", &source_url)
+                .field("status", http_status_code)
+                .field("source", "cef")
+                .field("ok", false)
+                .emit();
+            spawn_favicon_fetch(
+                state.ctx.handle.clone(),
+                state.ctx.tab,
+                state.page_url.clone(),
+                state.icon_urls.clone(),
+                state
+                    .request_id
+                    .map(|request_id| (state.ctx.clone(), request_id)),
+            );
+        }
+    }
+}
+
+/// Start the CEF-native favicon path. HTTP(S) goes through Chromium's network
+/// stack; `data:` URLs and failures fall back to the local decoder.
+fn start_favicon_download(
+    ctx: &TabContext,
+    request_id: Option<u64>,
+    page_url: String,
+    icon_urls: Vec<String>,
+) {
+    let candidate = favicon_candidates(&page_url, &icon_urls)
+        .into_iter()
+        .find(|url| favicon_is_http(url));
+    let Some(candidate) = candidate else {
+        spawn_favicon_fetch(
+            ctx.handle.clone(),
+            ctx.tab,
+            page_url,
+            icon_urls,
+            request_id.map(|request_id| (ctx.clone(), request_id)),
+        );
+        return;
+    };
+    let Some(host) = ctx.browser.get().and_then(|browser| browser.host()) else {
+        spawn_favicon_fetch(
+            ctx.handle.clone(),
+            ctx.tab,
+            page_url,
+            icon_urls,
+            request_id.map(|request_id| (ctx.clone(), request_id)),
+        );
+        return;
+    };
+
+    trace_engine(ctx, "favicon.request")
+        .field("page", &page_url)
+        .field("url", &candidate)
+        .field("source", "cef")
+        .emit();
+    let state = Arc::new(FaviconDownload {
+        ctx: ctx.clone(),
+        request_id,
+        page_url,
+        icon_urls,
+    });
+    let mut callback = SdscFaviconDownload::new(state);
+    let image_url: CefString = candidate.as_str().into();
+    host.download_image(
+        Some(&image_url),
+        1,
+        crate::browser::favicon::MAX_ICON_PX,
+        0,
+        Some(&mut callback),
+    );
+}
+
 /// Fetch off the CEF UI thread (blocking network + image decode), then post
-/// the decoded icon through the normal engine event channel.
-fn spawn_favicon_fetch(handle: EngineHandle, tab: TabId, page_url: String, icon_urls: Vec<String>) {
+/// the decoded icon through the normal engine event channel. This is the
+/// fallback for `data:` URLs, unsupported formats, and CEF download failures.
+fn spawn_favicon_fetch(
+    handle: EngineHandle,
+    tab: TabId,
+    page_url: String,
+    icon_urls: Vec<String>,
+    validate: Option<(TabContext, u64)>,
+) {
     std::thread::spawn(move || {
         let Some((width, height, rgba)) =
             crate::browser::favicon::fetch_best(&page_url, &icon_urls)
         else {
             return;
         };
-        crate::platform::app_log::info(format!(
-            "cef: favicon {} {width}x{height}",
-            crate::browser::bookmarks::origin_key(&page_url)
-        ));
+        if let Some((ctx, request_id)) = &validate {
+            if ctx.favicon_request.load(Ordering::Acquire) != *request_id
+                || !favicon_page_matches(ctx, &page_url)
+            {
+                return;
+            }
+            trace_engine(ctx, "favicon.result")
+                .field("page", &page_url)
+                .field("source", "local")
+                .field("width", width)
+                .field("height", height)
+                .emit();
+        }
         handle.emit(EngineEvent::FaviconChanged {
             tab,
             url: page_url,
@@ -1074,6 +1311,7 @@ impl Worker {
             scroll: Arc::new(Mutex::new((0.0, 0.0))),
             extent: Arc::new(Mutex::new((0.0, 0.0))),
             favicon_key: Arc::new(Mutex::new(String::new())),
+            favicon_request: Arc::new(AtomicU64::new(0)),
             trace_flow: Arc::new(Mutex::new(None)),
         };
         let mut client = SdscClient::new(
@@ -1424,7 +1662,18 @@ impl Worker {
             EngineCommand::PrefetchFavicon { url } => {
                 let key = crate::browser::bookmarks::origin_key(&url);
                 if self.prefetched.insert(key) {
-                    spawn_favicon_fetch(self.handle.clone(), self.active, url, Vec::new());
+                    if let Some(entry) = self.tab(self.active) {
+                        let ctx = entry.ctx.clone();
+                        start_favicon_download(&ctx, None, url, Vec::new());
+                    } else {
+                        spawn_favicon_fetch(
+                            self.handle.clone(),
+                            self.active,
+                            url,
+                            Vec::new(),
+                            None,
+                        );
+                    }
                 }
             }
             EngineCommand::Wake => {}
@@ -1582,4 +1831,36 @@ fn key_code(key: &keyboard_types::Key) -> (i32, u16) {
 #[allow(dead_code)]
 fn activity_label(phase: EngineActivity) -> &'static str {
     phase.label()
+}
+
+#[cfg(test)]
+mod favicon_tests {
+    use super::*;
+
+    #[test]
+    fn candidates_keep_advertised_order_and_append_conventional() {
+        let urls = vec![
+            "https://a.test/icon.png".to_string(),
+            "https://a.test/icon.svg".to_string(),
+        ];
+        let candidates = favicon_candidates("https://a.test/page", &urls);
+        assert_eq!(candidates[0], "https://a.test/icon.png");
+        assert_eq!(candidates[1], "https://a.test/icon.svg");
+        assert_eq!(candidates[2], "https://a.test/favicon.ico");
+    }
+
+    #[test]
+    fn candidates_do_not_duplicate_conventional_icon() {
+        let urls = vec!["https://a.test/favicon.ico".to_string()];
+        let candidates = favicon_candidates("https://a.test/page", &urls);
+        assert_eq!(candidates, urls);
+    }
+
+    #[test]
+    fn only_http_candidates_reach_cef() {
+        assert!(favicon_is_http("https://a.test/icon.png"));
+        assert!(favicon_is_http("http://a.test/icon.png"));
+        assert!(!favicon_is_http("data:image/png;base64,AAAA"));
+        assert!(!favicon_is_http(""));
+    }
 }

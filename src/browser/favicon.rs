@@ -1,12 +1,12 @@
-//! Favicon fetch + decode.
+//! Favicon decode + local fallback.
 //!
-//! CEF hands us the page's advertised icon URLs; bookmarks ask for the
-//! site's `/favicon.ico`. Either way the bytes are fetched off the UI thread
-//! and decoded to straight-alpha RGBA for an iced image handle.
+//! Page icons normally arrive through CEF's `DownloadImage` API (Chromium's
+//! network stack, cache, and image decoder). This module decodes `data:` URLs
+//! inline and remains the fallback when CEF returns no usable image.
 //!
 //! Supported payloads: PNG/JPEG/WebP/GIF/ICO (via `image`) and SVG (via
-//! `resvg`). `data:` URLs are decoded inline; HTTP(S) fetches are capped and
-//! time-limited so a dead site cannot wedge the browser backend.
+//! `resvg`). HTTP(S) fallback fetches are capped and time-limited so a dead
+//! site cannot wedge the browser backend.
 
 use std::io::Read;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use std::time::Duration;
 const MAX_ICON_BYTES: u64 = 2 << 20;
 /// Longest edge of the decoded icon. Rendered at 16px; 64 keeps high-DPI
 /// displays crisp without feeding the atlas a full-resolution photo.
-const MAX_ICON_PX: u32 = 64;
+pub(crate) const MAX_ICON_PX: u32 = 64;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Fetch and decode the first working icon. `icon_urls` are CEF's advertised
@@ -53,7 +53,7 @@ pub fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Site origin (`scheme://host[:port]`) for the conventional favicon path.
-fn origin_url(page_url: &str) -> Option<String> {
+pub(crate) fn origin_url(page_url: &str) -> Option<String> {
     let url = url::Url::parse(page_url).ok()?;
     let origin = url.origin().ascii_serialization();
     if origin == "null" {
