@@ -8,6 +8,12 @@ reader fallback are deleted. The pivot plan and remaining phases live in
 window, the engine worker, DOM targets, or the CEF packaging path. For a
 capability/API lookup, start with [cef-api.md](cef-api.md).
 
+> **Ownership update:** the Browser is moving to a chrome-less optional app
+> with a system OSK and hosted UI/action contract. The CEF engine, page input,
+> cursor, DOM, and frame-slot contracts here still apply. The OSK/popup/
+> address/tab-UI parts are superseded by
+> [controller-os-handoff.md](controller-os-handoff.md).
+
 ## Decision
 
 - Standalone Browser window + open web + no DRM → CEF offscreen rendered as

@@ -1,5 +1,11 @@
 # On-screen keyboard and page IME (built)
 
+> **Superseded (design):** the OSK is now a system input method owned by the
+> main app, not a Browser component. The Browser v0 scope also removes the
+> browser chrome/address/tab UI this note assumes. See
+> [controller-os-handoff.md](controller-os-handoff.md). This note remains only
+> as history for the former browser-coupled OSK/IME work.
+
 **Status:** functional, intentionally plain. **When to read:** changing text
 entry in the Browser (page fields or URL bar).
 

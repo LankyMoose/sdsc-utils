@@ -9,6 +9,11 @@ remain.
 **When to read:** before touching Launcher/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
+> **Ownership update:** the target product model is now the **Browser as a
+> separate optional app** (UI + engine), not only the CEF engine DLC. The
+> CEF/Home/DLC history here remains useful, but the packaging/ownership plan
+> is revised by [controller-os-handoff.md](controller-os-handoff.md).
+
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
 ## Goal
