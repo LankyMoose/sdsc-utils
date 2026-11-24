@@ -249,11 +249,25 @@ impl BrowserSession {
         current: usize,
     ) {
         let before_current = self.nav_index;
+        let previous = self.nav_stack.clone();
         self.nav_stack = entries
             .iter()
-            .map(|entry| HistoryEntry {
-                url: entry.url.clone(),
-                title: entry.title.clone().filter(|title| !title.is_empty()),
+            .enumerate()
+            .map(|(index, entry)| {
+                let title = entry
+                    .title
+                    .clone()
+                    .filter(|title| !title.is_empty())
+                    .or_else(|| {
+                        previous
+                            .get(index)
+                            .filter(|old| old.url == entry.url)
+                            .and_then(|old| old.title.clone())
+                    });
+                HistoryEntry {
+                    url: entry.url.clone(),
+                    title,
+                }
             })
             .collect();
         self.nav_index = if self.nav_stack.is_empty() {
@@ -598,6 +612,17 @@ mod tests {
         s.apply_engine_history(&[], 0);
         assert!(s.nav_current().is_none());
         assert!(s.back_entries().is_empty());
+    }
+
+    #[test]
+    fn engine_history_keeps_known_title_when_snapshot_has_none() {
+        let mut s = BrowserSession::default();
+        s.apply_engine_history(&[entry("https://a.test/", Some("A page"))], 0);
+        s.apply_engine_history(&[entry("https://a.test/", None)], 0);
+        assert_eq!(
+            s.nav_entry(0).and_then(|e| e.title.as_deref()),
+            Some("A page")
+        );
     }
 
     #[test]
