@@ -90,9 +90,6 @@ def main() -> int:
         {"app": "browser", "action": "text", "params": {"text": "hello"}},
         {"app": "browser", "action": "ime.preedit", "params": {"text": "x"}},
         {"app": "browser", "action": "ime.commit", "params": {"text": "é"}},
-        {"app": "browser", "action": "osk.toggle", "params": {}},
-        {"app": "browser", "action": "osk.key", "params": {"char": "!"}},
-        {"app": "browser", "action": "osk.toggle", "params": {}},
         {"app": "browser", "action": "mouse.wheel", "params": {"x": 300, "y": 400, "dy": -240}},
         {"app": "browser", "action": "mouse.drag", "params": {"x1": 45, "y1": 150, "x2": 600, "y2": 150}},
         {"app": "browser", "action": "mouse.click", "params": {"x": 100, "y": 150, "count": 2}},
@@ -177,8 +174,8 @@ def main() -> int:
         )
         print(f"sandbox={sandbox}")
         print(f"title={title}")
-        if "typed=helloé!" not in title:
-            print("error: page did not receive the synthetic/IME/OSK text", file=sys.stderr)
+        if "typed=helloé" not in title:
+            print("error: page did not receive the synthetic/IME text", file=sys.stderr)
             return 1
         if "|scroll=" not in title or "|scroll=0" in title:
             print("error: synthetic wheel did not scroll the page", file=sys.stderr)

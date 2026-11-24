@@ -16,6 +16,7 @@ pub mod launcher;
 pub mod layout;
 pub mod motion;
 pub mod mouse_shield;
+pub mod osk;
 pub mod percent_ring;
 pub mod popup;
 pub mod reveal;

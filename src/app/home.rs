@@ -242,6 +242,7 @@ impl App {
             width: 1920.0,
             height: 1080.0,
         });
+        let close_osk = self.close_osk("home");
         // The backdrop always covers the monitor; the card scales/centers
         // inside it. On an opaque backend the scrim blends over the opaque
         // clear color instead of the desktop.
@@ -291,6 +292,7 @@ impl App {
             .chain(crate::ui::layout::disable_window_transitions(id))
             .chain(Task::done(Message::WindowShowNow(id)))
             .chain(self.check_engine_manifest())
+            .chain(close_osk)
     }
 
     /// Begin hiding Home. The window stays alive (and modal) through the

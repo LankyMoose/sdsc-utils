@@ -12,6 +12,7 @@ mod feedback;
 mod home;
 pub(crate) mod installs;
 mod launcher;
+mod osk;
 mod popup;
 mod toast;
 mod update;
@@ -175,6 +176,10 @@ pub enum Message {
     Browser(crate::ui::browser::BrowserMessage),
     /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
     BrowserFrame,
+    /// System OSK overlay window opened.
+    OskOpened(window::Id),
+    /// System OSK overlay message (no interactive keys; reserved).
+    Osk(crate::ui::osk::OskMessage),
     /// Optional BrowserEngine install/update finished or was cancelled.
     EngineInstallDone {
         generation: u64,
@@ -371,6 +376,8 @@ impl Message {
             | Message::ConfigureOpened(_)
             | Message::BrowserOpened(_)
             | Message::BrowserFrame
+            | Message::OskOpened(_)
+            | Message::Osk(_)
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::HomeProgressTick
@@ -507,6 +514,8 @@ impl Message {
             | Message::FinishStartClose
             | Message::LauncherFrame
             | Message::BrowserFrame
+            | Message::OskOpened(_)
+            | Message::Osk(_)
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
@@ -745,6 +754,8 @@ pub struct App {
     /// Top-level browser app: panel, engine worker, capability flag, and
     /// browser-only D-pad stepper. No longer owned by `LauncherState`.
     browser: browser::BrowserAppState,
+    /// System controller keyboard overlay (owned by the OS, never the Browser).
+    osk: osk::SystemOsk,
     /// Home-owned standalone install policy (download cap shared by every
     /// managed-app installer).
     install_policy: installs::AppInstallPolicy,
@@ -1020,6 +1031,19 @@ impl App {
         #[cfg(debug_assertions)]
         let debug_tune = crate::ui::configure::DebugAmbientTune::default();
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
+        #[cfg(debug_assertions)]
+        let session = {
+            let mut session = session;
+            if let Some(mode) = std::env::var("SDSC_OSK_MODE")
+                .ok()
+                .and_then(|value| crate::persist::prefs::OskMode::parse(&value))
+            {
+                // Debug/QA override only; never persisted.
+                session.prefs.osk_mode = mode;
+            }
+            session
+        };
+        let osk_mode = session.prefs.osk_mode;
         // Boot-only renderer prefs (iced Settings); a later change auto-restarts.
         let (renderer_boot_aa, renderer_boot_vsync) =
             (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
@@ -1159,6 +1183,7 @@ impl App {
                 engine: browser_engine,
                 ..Default::default()
             },
+            osk: osk::SystemOsk::new(osk_mode),
             install_policy: installs::AppInstallPolicy::new(install_limit),
             home_apps: home::HomeApps::new(),
             launcher_monitor_cover: None,
@@ -1411,6 +1436,7 @@ impl App {
         } else if Some(window) == self.launcher_window
             || Some(window) == self.home_window
             || Some(window) == self.browser_window
+            || Some(window) == self.osk.window
         {
             String::new()
         } else {
@@ -1514,6 +1540,7 @@ impl App {
                         | mouse::Event::ButtonReleased(_)
                         | mouse::Event::WheelScrolled { .. },
                     ) => Some(Message::LauncherCursorActivity(id)),
+                    iced::Event::Touch(_) => Some(Message::LauncherCursorActivity(id)),
                     iced::Event::InputMethod(event) => Some(Message::BrowserIme { id, event }),
                     _ => None,
                 }
@@ -1717,6 +1744,10 @@ impl App {
                 &debug_tune,
             )
             .map(Message::Configure);
+        }
+
+        if Some(window) == self.osk.window {
+            return crate::ui::osk::view(&self.osk.state).map(Message::Osk);
         }
 
         if Some(window) == self.browser_window {
@@ -1986,6 +2017,8 @@ impl App {
             Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
+            Message::OskOpened(id) => self.on_osk_opened(id),
+            Message::Osk(_) => Task::none(),
             Message::EngineInstallDone {
                 generation,
                 outcome,
@@ -2109,6 +2142,7 @@ impl App {
             }
             Message::LauncherCursorActivity(id) => {
                 if !crate::platform::debug_quiet::input_dropped() {
+                    let close = self.close_osk("mouse");
                     if Some(id) == self.launcher_window && self.launcher_visible {
                         self.note_start_cursor_activity();
                     }
@@ -2117,6 +2151,7 @@ impl App {
                         // over the pad ring, including header hovers.
                         self.browser.panel.page_mouse_active = true;
                     }
+                    return close;
                 }
                 Task::none()
             }
@@ -2134,6 +2169,13 @@ impl App {
             } => {
                 if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
+                } else if self.osk.state.open {
+                    let close = self.close_osk("keyboard");
+                    if action == LauncherKeyAction::Cancel {
+                        close
+                    } else {
+                        close.chain(self.on_start_key(id, action, pressed))
+                    }
                 } else {
                     self.on_start_key(id, action, pressed)
                 }
@@ -2141,6 +2183,8 @@ impl App {
             Message::BrowserRawKey { id, key } => {
                 if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
+                } else if self.osk.state.open {
+                    self.on_osk_key(id, key)
                 } else {
                     self.on_browser_raw_key(id, key)
                 }
@@ -2149,7 +2193,8 @@ impl App {
                 if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
                 } else {
-                    self.on_browser_ime(id, event)
+                    let close = self.close_osk("ime");
+                    close.chain(self.on_browser_ime(id, event))
                 }
             }
             Message::PadInput(edge) => {
@@ -2232,6 +2277,8 @@ impl App {
                 let _ = self.close_browser_surface();
             }
             Task::none()
+        } else if Some(id) == self.osk.window {
+            self.on_osk_window_closed(id)
         } else if Some(id) == self.home_window {
             self.home_window = None;
             self.home_visible = false;

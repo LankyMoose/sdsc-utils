@@ -176,10 +176,6 @@ const HISTORY_TRAVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Double/triple-click window and movement tolerance for page selection.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 const MULTI_CLICK_SLOP: f32 = 4.0;
-/// A focus change this soon after a page pointer click is treated as
-/// user-driven (auto-OSK); older focus changes are page autofocus or
-/// programmatic `.focus()`.
-const AUTO_OSK_INPUT_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Advance the double/triple-click chain. Returns the count for this press and
 /// the stamp to store for the next one.
@@ -304,6 +300,69 @@ impl super::App {
                 }
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            "cursor.dock" => {
+                if let Some((x, y)) = replay_point(&step.params) {
+                    let panel = &mut self.browser.panel;
+                    let id = panel
+                        .focusables
+                        .iter()
+                        .find(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+                        .map(|f| f.id);
+                    panel.cursor.attached = id;
+                    panel.cursor.x = x;
+                    panel.cursor.y = y;
+                    panel.cursor.dock_blend = if id.is_some() { 1.0 } else { 0.0 };
+                    panel.cursor.last_dock = id.and_then(|id| {
+                        panel
+                            .focusables
+                            .iter()
+                            .find(|f| f.id == id)
+                            .map(|f| (f.x, f.y, f.w, f.h))
+                    });
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "pad.tap" => {
+                let button = match step
+                    .params
+                    .get("button")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("cross") => PadButton::Cross,
+                    Some("circle") => PadButton::Circle,
+                    Some("square") => PadButton::Square,
+                    Some("triangle") => PadButton::Triangle,
+                    Some("l3") => PadButton::L3,
+                    Some("r3") => PadButton::R3,
+                    Some("options") => PadButton::Options,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_tap(button)
+            }
+            #[cfg(debug_assertions)]
+            "osk.stick" => {
+                let x = step
+                    .params
+                    .get("x")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let y = step
+                    .params
+                    .get("y")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let pair = (x, y);
+                match step.params.get("side").and_then(serde_json::Value::as_str) {
+                    Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
+                    _ => self.replay_osk_stick(pair, (0.0, 0.0)),
+                }
+            }
+            #[cfg(debug_assertions)]
+            "osk.open" => self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage),
+            #[cfg(debug_assertions)]
+            "osk.close" => self.close_osk("replay"),
             "history.back" | "history.forward" => {
                 let target_url = step.params.get("url").and_then(serde_json::Value::as_str);
                 let resolved = target_url.and_then(|url| {
@@ -336,17 +395,27 @@ impl super::App {
                     return Task::none();
                 };
                 let modifiers = replay_modifiers(step.params.get("modifiers"));
-                if !self.replay_press_key(key, modifiers) {
-                    crate::platform::trace::event(
-                        crate::platform::trace::Lane::Platform,
-                        "replay.unsupported",
-                    )
-                    .field("app", &step.app)
-                    .field("action", &step.action)
-                    .field("key", key)
-                    .emit();
+                // Synthetic real keyboard: close the OSK first; Escape is
+                // consumed, other keys still reach the page (hand-off).
+                let close = self.close_osk("keyboard");
+                if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
+                    return close;
                 }
-                Task::none()
+                if !self.replay_press_key(key, modifiers) {
+                    if key.chars().count() == 1 {
+                        self.replay_type_text(key);
+                    } else {
+                        crate::platform::trace::event(
+                            crate::platform::trace::Lane::Platform,
+                            "replay.unsupported",
+                        )
+                        .field("app", &step.app)
+                        .field("action", &step.action)
+                        .field("key", key)
+                        .emit();
+                    }
+                }
+                close
             }
             #[cfg(debug_assertions)]
             "screenshot" => {
@@ -355,48 +424,40 @@ impl super::App {
                 self.shoot_browser_window(true)
             }
             #[cfg(debug_assertions)]
-            "osk.toggle" => {
-                self.toggle_browser_osk();
-                Task::none()
-            }
-            #[cfg(debug_assertions)]
-            "osk.key" => {
-                if let Some(ch) = step
-                    .params
-                    .get("char")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|text| text.chars().next())
-                {
-                    let _ = self.osk_activate_key(crate::ui::browser::OskKey::Char(ch));
-                }
-                Task::none()
-            }
-            #[cfg(debug_assertions)]
             "ime.preedit" => {
+                let close = self.close_osk("ime");
                 if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
                     && let Some(id) = self.browser_window
                 {
-                    let _ = self.on_browser_ime(
+                    let task = self.on_browser_ime(
                         id,
                         iced::advanced::input_method::Event::Preedit(text.to_string(), None),
                     );
+                    return close.chain(task);
                 }
-                Task::none()
+                close
             }
             #[cfg(debug_assertions)]
             "ime.commit" => {
+                let close = self.close_osk("ime");
                 if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
                     && let Some(id) = self.browser_window
                 {
-                    let _ = self.on_browser_ime(
+                    let task = self.on_browser_ime(
                         id,
                         iced::advanced::input_method::Event::Commit(text.to_string()),
                     );
+                    return close.chain(task);
                 }
-                Task::none()
+                close
             }
             #[cfg(debug_assertions)]
             "mouse.click" => {
+                if self.osk.state.open {
+                    // Real mouse input dismisses the controller-only OSK; the
+                    // click does not need to reach the page.
+                    return self.close_osk("mouse");
+                }
                 if let Some((x, y)) = replay_point(&step.params) {
                     let count = step
                         .params
@@ -412,6 +473,9 @@ impl super::App {
             }
             #[cfg(debug_assertions)]
             "mouse.drag" => {
+                if self.osk.state.open {
+                    return self.close_osk("mouse");
+                }
                 let x1 = step.params.get("x1").and_then(serde_json::Value::as_f64);
                 let y1 = step.params.get("y1").and_then(serde_json::Value::as_f64);
                 let x2 = step.params.get("x2").and_then(serde_json::Value::as_f64);
@@ -423,6 +487,9 @@ impl super::App {
             }
             #[cfg(debug_assertions)]
             "mouse.wheel" => {
+                if self.osk.state.open {
+                    return self.close_osk("mouse");
+                }
                 if let Some((x, y)) = replay_point(&step.params) {
                     let dx = step
                         .params
@@ -598,33 +665,6 @@ impl super::App {
             started: Instant::now(),
         });
         self.send_history_command(flow, tab, back);
-    }
-
-    /// OSK owns the pad while open: D-pad moves key focus, Cross types,
-    /// Triangle backspaces, Square changes layer, Circle closes.
-    fn tick_browser_osk(
-        &mut self,
-        readings: &[crate::ui::launcher::input::NavReading],
-        action: Option<NavAction>,
-        now: std::time::Instant,
-    ) -> Task<Message> {
-        if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
-            self.browser.panel.osk.move_focus(jump);
-            self.play_ui_cue(UiSoundKind::Nav);
-        }
-        match action {
-            Some(NavAction::Confirm) => {
-                let key = self.browser.panel.osk.focus_key();
-                return self.osk_activate_key(key);
-            }
-            Some(NavAction::Cancel) => {
-                self.browser.panel.osk.close();
-            }
-            Some(NavAction::Triangle) => return self.osk_backspace(),
-            Some(NavAction::CycleSort) => self.browser.panel.osk.toggle_layer(),
-            _ => {}
-        }
-        Task::none()
     }
 
     /// Advance an in-flight history action after a canonical snapshot.
@@ -1001,7 +1041,6 @@ impl super::App {
             BrowserMessage::PageRelease => self.on_browser_page_release(),
             BrowserMessage::PagePointerLeft => self.on_browser_page_pointer_left(),
             BrowserMessage::PageWheel { dx, dy } => self.on_browser_page_wheel(dx, dy),
-            BrowserMessage::OskKey(key) => self.osk_activate_key(key),
             BrowserMessage::Scrolled(y) => {
                 self.browser.panel.note_scrolled(y);
                 Task::none()
@@ -1054,100 +1093,30 @@ impl super::App {
         Task::none()
     }
 
-    /// Toggle the controller on-screen keyboard (debug replay path).
-    /// While open its keys are driven by the pad.
-    #[cfg(debug_assertions)]
-    pub(crate) fn toggle_browser_osk(&mut self) {
-        if self.browser.panel.osk.open {
-            self.browser.panel.osk.close();
-            return;
-        }
-        self.browser.panel.osk.open_manual();
-        self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
-    }
-
-    /// Page text focus changed. Auto-show the OSK for editable targets and
-    /// dismiss it when focus leaves; an OSK opened with Square stays until
-    /// the user closes it.
-    pub(crate) fn on_browser_editable_focus(&mut self, editable: bool) {
-        if !self.browser_visible {
-            return;
-        }
-        if editable {
-            let recent_input = self
-                .browser
-                .panel
-                .page_user_input_at
-                .is_some_and(|at| at.elapsed() <= AUTO_OSK_INPUT_WINDOW);
-            if !recent_input || self.browser.panel.osk.open {
-                return;
-            }
-            self.browser.panel.osk.open_auto();
-            self.note_launcher_activity();
-            self.play_ui_cue(UiSoundKind::Action);
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "browser.osk_focus",
-            )
-            .field("editable", true)
-            .field("open", true)
-            .field("auto", true)
-            .emit();
-            return;
-        }
-        if self.browser.panel.osk.auto_opened {
-            self.browser.panel.osk.close();
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "browser.osk_focus",
-            )
-            .field("editable", false)
-            .field("open", false)
-            .field("auto", true)
-            .emit();
-        }
-    }
-
-    /// Activate one OSK key. Character/space keys commit text; Enter/Backspace
-    /// target the focused page field.
-    pub(crate) fn osk_activate_key(&mut self, key: crate::ui::browser::OskKey) -> Task<Message> {
-        use crate::ui::browser::OskKey;
-        match key {
-            OskKey::Char(ch) => self.osk_type(&ch.to_string()),
-            OskKey::Space => self.osk_type(" "),
-            OskKey::Backspace => self.osk_backspace(),
-            OskKey::Enter => {
-                self.osk_named("Enter");
-                Task::none()
-            }
-            OskKey::Layer => {
-                self.browser.panel.osk.toggle_layer();
-                Task::none()
-            }
-            OskKey::Close => {
-                self.browser.panel.osk.close();
-                Task::none()
-            }
-        }
-    }
-
-    fn osk_type(&mut self, text: &str) -> Task<Message> {
+    /// Browser text-session client: insert committed text into the focused
+    /// page field through CEF's key path.
+    pub(crate) fn browser_text_insert(&mut self, text: &str) {
         let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
         for raw in events {
             let _ = self.on_browser_key(raw);
         }
-        Task::none()
     }
 
-    fn osk_backspace(&mut self) -> Task<Message> {
-        self.osk_named("Backspace");
-        Task::none()
-    }
-
-    fn osk_named(&mut self, name: &str) {
+    /// Browser text-session client: backspace in the focused page field.
+    pub(crate) fn browser_text_backspace(&mut self) {
         if let Some(events) =
-            crate::browser::keys::synthetic_named(name, iced::keyboard::Modifiers::empty())
+            crate::browser::keys::synthetic_named("Backspace", iced::keyboard::Modifiers::empty())
+        {
+            for raw in events {
+                let _ = self.on_browser_key(raw);
+            }
+        }
+    }
+
+    /// Browser text-session client: Enter in the focused page field.
+    pub(crate) fn browser_text_enter(&mut self) {
+        if let Some(events) =
+            crate::browser::keys::synthetic_named("Enter", iced::keyboard::Modifiers::empty())
         {
             for raw in events {
                 let _ = self.on_browser_key(raw);
@@ -1173,7 +1142,6 @@ impl super::App {
     pub(crate) fn inject_browser_press(&mut self, x: f32, y: f32, source: &'static str) {
         let (x, y) = self.clamp_page_mouse(x, y);
         self.browser.panel.page_mouse_active = true;
-        self.browser.panel.page_user_input_at = Some(Instant::now());
         let count = self.next_page_click_count(x, y);
         self.browser.panel.page_click_count = count;
         self.browser.panel.page_mouse_down = true;
@@ -1410,7 +1378,6 @@ impl super::App {
         // previous open's cursor position.
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.last_sent_mouse = None;
-        self.browser.panel.page_user_input_at = None;
         self.browser_visible = true;
         self.browser_pending_show = true;
         let was_open = self.browser.panel.session.is_open();
@@ -1458,7 +1425,8 @@ impl super::App {
         self.browser_window_size = None;
         self.browser_pending_show = false;
         self.browser_backdrop_fade = None;
-        let task = self.close_browser_surface();
+        let task = self.close_osk("browser_close");
+        let task = task.chain(self.close_browser_surface());
         let Some(id) = self.browser_window.take() else {
             return task;
         };
@@ -1606,9 +1574,6 @@ impl super::App {
                 .or(tick.cross_completed_pad.as_ref())
                 .or(tick.triangle_completed_pad.as_ref()),
         );
-        if self.browser.panel.osk.open {
-            return self.tick_browser_osk(readings, tick.action, now);
-        }
         if engine_mode {
             self.tick_browser_cursor(readings, now);
             if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
@@ -1707,12 +1672,8 @@ impl super::App {
         }
     }
 
-    /// Escape while the page has focus: close the controller text keyboard if
-    /// it is open. Home/PS is the only Browser close path.
+    /// Escape no longer closes the Browser; Home/PS is the only close path.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
-        if self.browser.panel.osk.open {
-            self.browser.panel.osk.close();
-        }
         Task::none()
     }
 

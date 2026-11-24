@@ -21,7 +21,7 @@ use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
 use crate::persist::prefs::{
-    HomeAutoOpen, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
+    HomeAutoOpen, LauncherSelectionMode, NavbarVisibility, OskMode, ReducedMotion,
     clamp_launcher_idle_timeouts, clamp_launcher_inactive_dim_percent, renderer_restart_needed,
 };
 use crate::platform::app_log;
@@ -519,8 +519,6 @@ impl App {
             None
         };
         self.browser.panel.scroll_y = 0.0;
-        self.browser.panel.osk.close_auto();
-        self.browser.panel.page_user_input_at = None;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree. Recenter the existing cursor so the live
         // viewport bounds (not the 800x600 defaults) survive navigation.
@@ -913,7 +911,7 @@ impl App {
     /// skippable. Buttons use trusted input unless the Diagnostics JS-click
     /// toggle is on.
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
-        let (x, y, target, trusted) = {
+        let (x, y, target, trusted, text_field) = {
             let panel = &self.browser.panel;
             let targets = &panel.focusables;
             let (x, y) = panel.cursor.click_point(targets);
@@ -924,6 +922,7 @@ impl App {
             // Diagnostics JS-click A/B toggle.
             let mut target = None;
             let mut trusted = false;
+            let mut text_field = false;
             if let Some(id) = panel.cursor.attached
                 && let Some(item) = panel.focusables.iter().find(|o| o.id == id)
             {
@@ -935,13 +934,15 @@ impl App {
                     crate::browser::cursor::FocusKind::Button if panel.js_click => {
                         target = Some(id);
                     }
+                    crate::browser::cursor::FocusKind::Field => {
+                        text_field = true;
+                    }
                     _ => {}
                 }
             }
-            (x, y, target, trusted)
+            (x, y, target, trusted, text_field)
         };
         self.browser.panel.last_click = Some(((x, y), Instant::now()));
-        self.browser.panel.page_user_input_at = Some(Instant::now());
         let trace =
             crate::platform::trace::action(crate::platform::trace::Lane::Browser, "browser.click")
                 .app("browser")
@@ -979,6 +980,11 @@ impl App {
                 &self.browser.panel,
             ))
             .emit();
+        if text_field {
+            // Cross on a page text field is the only OSK opener. The click
+            // above focuses the field; the system keyboard now owns the pad.
+            return self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage);
+        }
         Task::none()
     }
 
@@ -1392,7 +1398,12 @@ impl App {
                 }
             }
             EngineEvent::EditableFocusChanged { tab: _, editable } => {
-                self.on_browser_editable_focus(editable);
+                // The page text session ended: close the system keyboard. A
+                // focus/autofocus event never opens it (Cross is the only
+                // opener).
+                if !editable {
+                    self.close_osk_if_target(crate::ui::osk::OskTarget::BrowserPage, "page_blur");
+                }
             }
             EngineEvent::LoadFinished {
                 tab,
@@ -2291,6 +2302,12 @@ impl App {
             }
             self.home_face_latch_until = None;
         }
+        // System keyboard owns the pad above the active app; PS/Home is still
+        // handled inside the OSK session (it closes the keyboard and opens
+        // Home).
+        if self.osk.state.open {
+            return self.on_osk_pad(&readings, tap_actions);
+        }
         if self.browser_visible {
             return self.on_browser_pad(&readings, tap_actions);
         }
@@ -3020,6 +3037,15 @@ impl App {
         };
         let effects = self.session.reevaluate_start_presence(ctx);
         self.apply_session_effects(effects)
+    }
+
+    pub(crate) fn apply_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
+        if self.session.prefs.osk_mode == mode {
+            return Task::none();
+        }
+        self.session.prefs.osk_mode = mode;
+        self.save_prefs();
+        self.set_osk_mode(mode)
     }
 
     /// Game-axis selection persistence master switch (drawer toggle +

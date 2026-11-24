@@ -20,8 +20,9 @@ use crate::persist::analytics::{
 };
 use crate::persist::prefs::{
     AUTO_OPEN_MODES, HomeAutoOpen, IMMERSIVE_LAYOUT_MODES, ImmersiveLayout,
-    LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility,
-    REDUCED_MOTION_MODES, ReducedMotion, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN, ToastPosition,
+    LOW_BATTERY_PERCENT_MAX, LOW_BATTERY_PERCENT_MIN, NAVBAR_MODES, NavbarVisibility, OSK_MODES,
+    OskMode, REDUCED_MOTION_MODES, ReducedMotion, TOAST_OPACITY_MAX, TOAST_OPACITY_MIN,
+    ToastPosition,
 };
 use crate::platform::app_meta::{DISPLAY_NAME, PKG_VERSION};
 use crate::platform::updater::UpdateStatus;
@@ -207,6 +208,8 @@ pub struct ConfigureSettings {
     pub lightbar_enabled: bool,
     pub home_enabled: bool,
     pub home_auto_open: HomeAutoOpen,
+    /// Settings → System → Controller keyboard layout.
+    pub osk_mode: OskMode,
     pub launcher_immersive_layout: ImmersiveLayout,
     pub launcher_clock_enabled: bool,
     pub launcher_navbar: NavbarVisibility,
@@ -389,6 +392,7 @@ pub enum ConfigureMessage {
     SetLightbarEnabled(bool),
     SetHomeEnabled(bool),
     SetHomeAutoOpen(HomeAutoOpen),
+    SetOskMode(OskMode),
     SetImmersiveLayout(ImmersiveLayout),
     SetStartScreenClock(bool),
     SetNavbarVisibility(NavbarVisibility),
@@ -1505,10 +1509,41 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         )],
     );
 
+    let input = group(
+        Some("Input".to_string()),
+        vec![
+            row![
+                column![
+                    text("Controller keyboard")
+                        .size(theme::type_scale::BODY)
+                        .color(theme::INK),
+                    text("On-screen keyboard layout for text fields")
+                        .size(12.0)
+                        .color(theme::DIM),
+                ]
+                .spacing(2)
+                .width(Fill),
+                pick_list(
+                    OSK_MODES,
+                    Some(settings.osk_mode),
+                    ConfigureMessage::SetOskMode
+                )
+                .text_size(13.0)
+                .padding([7, 10])
+                .width(Length::Fixed(200.0))
+                .style(theme::pick_list)
+                .menu_style(theme::pick_list_menu),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into(),
+        ],
+    );
+
     let version = version_group(settings);
 
     if startup.is_empty() {
-        column![version, window, data]
+        column![version, input, window, data]
             .spacing(18)
             .width(Fill)
             .into()
@@ -1516,6 +1551,7 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
         column![
             version,
             group(Some("Startup".to_string()), startup),
+            input,
             window,
             data
         ]
@@ -3056,6 +3092,7 @@ mod tests {
             lightbar_enabled: true,
             home_enabled: false,
             home_auto_open: HomeAutoOpen::Any,
+            osk_mode: OskMode::Quadrant,
             launcher_immersive_layout: ImmersiveLayout::Vertical,
             launcher_clock_enabled: true,
             launcher_navbar: NavbarVisibility::WhenNavigating,

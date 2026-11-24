@@ -6,12 +6,10 @@
 //! browser-facing message vocabulary.
 
 use crate::browser::engine::BrowserCursor;
-use crate::ui::browser::state::{BrowserPanel, OskKey};
+use crate::ui::browser::state::BrowserPanel;
 use crate::ui::theme;
 use iced::widget::text::Wrapping;
-use iced::widget::{
-    Column, Row, button, column, container, mouse_area, row, scrollable, space, stack, text,
-};
+use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, text};
 use iced::{Element, Fill, Length};
 
 /// Everything the standalone Browser window can ask the shell/engine to do.
@@ -39,8 +37,6 @@ pub enum BrowserMessage {
         dx: i32,
         dy: i32,
     },
-    /// On-screen keyboard key selected with the pad.
-    OskKey(OskKey),
     Scrolled(f32),
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
@@ -59,8 +55,7 @@ impl BrowserMessage {
             | Self::PagePress
             | Self::PageRelease
             | Self::PagePointerLeft
-            | Self::PageWheel { .. }
-            | Self::OskKey(_) => None,
+            | Self::PageWheel { .. } => None,
             Self::Scrolled(_) => None,
             #[cfg(debug_assertions)]
             Self::Shot(_) => None,
@@ -77,9 +72,9 @@ pub fn browser_scroll_id() -> iced::widget::Id {
 pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
 /// Whether the pad cursor should be drawn at all. A physical pointer owns the
-/// surface, and the OSK owns the pad while open.
+/// surface.
 fn cursor_draws(panel: &BrowserPanel) -> bool {
-    !panel.page_mouse_active && !panel.osk.open
+    !panel.page_mouse_active
 }
 
 /// Map a page cursor point to card pixels. The surface is 1:1: the engine
@@ -272,47 +267,6 @@ pub fn browser_page_view(
     .into()
 }
 
-/// Controller on-screen keyboard overlay. Focus is driven by the pad; keys
-/// are not mouse-clickable.
-fn browser_osk(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
-    if !panel.osk.open {
-        return space().height(Length::Fixed(0.0)).into();
-    }
-    let mut rows: Vec<Element<'_, BrowserMessage>> = Vec::new();
-    let mut flat = 0;
-    for key_row in panel.osk.rows() {
-        let mut keys: Vec<Element<'_, BrowserMessage>> = Vec::new();
-        for key in *key_row {
-            let focused = flat == panel.osk.focus;
-            keys.push(
-                button(text(key.label(panel.osk.layer)).size(15))
-                    .on_press(BrowserMessage::OskKey(*key))
-                    .style(theme::chip(focused))
-                    .width(Fill)
-                    .height(Length::Fixed(38.0))
-                    .into(),
-            );
-            flat += 1;
-        }
-        rows.push(Row::with_children(keys).spacing(4).into());
-    }
-    let hint = text("D-pad move · Cross type · Square symbols · Triangle backspace · Circle close")
-        .size(12)
-        .color(theme::MUTED);
-    let keys = container(Column::with_children(rows).spacing(4))
-        .width(Length::Fixed(680.0))
-        .padding(4);
-    let card = container(column![hint, keys].spacing(8))
-        .padding(12)
-        .style(theme::menu_panel);
-    container(card)
-        .center_x(Fill)
-        .center_y(Fill)
-        .width(Fill)
-        .height(Fill)
-        .into()
-}
-
 /// Browser surface: one 1:1 page card. The caller sizes the page to 16:9;
 /// the engine viewport is resized to the same numbers, so cursor coordinates
 /// are card pixels.
@@ -325,7 +279,6 @@ pub fn browser_view<'a>(
     stack![
         browser_page_view(panel, engine_available, page_w, page_h),
         browser_cursor_overlay(panel, page_w, page_h),
-        browser_osk(panel),
     ]
     .width(Length::Fixed(page_w))
     .height(Length::Fixed(page_h))
@@ -499,17 +452,9 @@ mod tests {
         panel.page_mouse_active = true;
         assert!(!cursor_draws(&panel), "physical mouse hides the pad ring");
         panel.page_mouse_active = false;
-        panel.osk.open = true;
-        assert!(!cursor_draws(&panel), "OSK owns the pad");
+        assert!(cursor_draws(&panel));
         assert_eq!(cursor_card_point(400.0, 0.0), (400.0, 0.0));
         assert_eq!(cursor_card_point(400.0, 600.0), (400.0, 600.0));
         assert_eq!(BROWSER_SCROLL_STEP, 240.0);
-    }
-
-    #[test]
-    fn osk_overlay_composes_when_open() {
-        let mut panel = BrowserPanel::default();
-        panel.osk.open = true;
-        let _ = browser_view(&panel, true, 900.0, 600.0);
     }
 }

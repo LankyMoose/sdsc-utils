@@ -154,6 +154,17 @@ pub fn open_visible() -> bool {
     !crate::platform::debug_quiet::enabled()
 }
 
+/// Show a system overlay without activating it. Debug quiet mode relocates it
+/// to the secondary monitor (same as the Browser/app it overlays) and shows it
+/// without activation; normal sessions keep the computed primary placement.
+pub fn show_overlay_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    if crate::platform::debug_quiet::enabled() {
+        return quiet_show(id, true);
+    }
+    show_toast_without_activate(id)
+}
+
 /// Re-assert toast topmost (e.g. after Settings / Home / popup open or close).
 pub fn set_toast_topmost<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]

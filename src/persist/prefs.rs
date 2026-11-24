@@ -120,6 +120,48 @@ pub const AUTO_OPEN_MODES: [HomeAutoOpen; 3] = [
     HomeAutoOpen::Any,
 ];
 
+/// System controller-keyboard layout. Quadrant is the default split-stick
+/// keyboard; Grid is the D-pad fallback/accessibility mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OskMode {
+    #[default]
+    Quadrant,
+    Grid,
+}
+
+impl OskMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quadrant => "Quadrant",
+            Self::Grid => "Grid",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Quadrant => Self::Grid,
+            Self::Grid => Self::Quadrant,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "quadrant" => Some(Self::Quadrant),
+            "grid" => Some(Self::Grid),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OskMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+pub const OSK_MODES: [OskMode; 2] = [OskMode::Quadrant, OskMode::Grid];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImmersiveLayout {
@@ -301,6 +343,9 @@ pub struct Prefs {
     /// controller (default).
     #[serde(default)]
     pub home_auto_open: HomeAutoOpen,
+    /// Controller keyboard layout (default Quadrant; Grid is the fallback).
+    #[serde(default)]
+    pub osk_mode: OskMode,
     /// Show the clock widget at the top while the launcher is visible (default on).
     #[serde(default = "default_true")]
     pub launcher_clock_enabled: bool,
@@ -583,6 +628,7 @@ impl Default for Prefs {
             lightbar_enabled: true,
             home_enabled: true,
             home_auto_open: HomeAutoOpen::Any,
+            osk_mode: OskMode::Quadrant,
             launcher_clock_enabled: true,
             launcher_inactive_secs: default_launcher_inactive_secs(),
             launcher_sleep_secs: default_launcher_sleep_secs(),
@@ -978,6 +1024,23 @@ mod tests {
         // Serializes as a plain string (single key, no legacy bool cruft).
         let value = serde_json::to_value(Prefs::default()).unwrap();
         assert_eq!(value["home_auto_open"], "any");
+    }
+
+    #[test]
+    fn osk_mode_defaults_to_quadrant_and_round_trips() {
+        let prefs = prefs_from_json("{}");
+        assert_eq!(prefs.osk_mode, OskMode::Quadrant);
+        assert_eq!(Prefs::default().osk_mode, OskMode::Quadrant);
+        let value = serde_json::to_value(Prefs::default()).unwrap();
+        assert_eq!(value["osk_mode"], "quadrant");
+        for (raw, mode) in [("quadrant", OskMode::Quadrant), ("grid", OskMode::Grid)] {
+            let prefs = prefs_from_json(&format!(r#"{{"osk_mode":{raw:?}}}"#));
+            assert_eq!(prefs.osk_mode, mode);
+            assert_eq!(OskMode::parse(raw), Some(mode));
+        }
+        assert_eq!(OskMode::parse("bogus"), None);
+        assert_eq!(OskMode::Quadrant.next(), OskMode::Grid);
+        assert_eq!(OskMode::Grid.next(), OskMode::Quadrant);
     }
 
     #[test]
