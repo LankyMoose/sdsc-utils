@@ -22,18 +22,45 @@ use std::process::Command;
 const DISPLAY_NAME: &str = "SDSC Utils";
 const TRAY_SIZE: u32 = 32;
 
-fn main() {
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+fn git_output(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+}
+
+/// Watch the current branch ref, not just `.git/HEAD`. Commits update the
+/// ref file but leave HEAD unchanged, so watching only HEAD left
+/// `SDSC_GIT_COMMIT` stale (seen in trace session manifests).
+fn watch_git_head() {
+    let mut paths = vec![".git/HEAD".to_string()];
+    if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git_output(&["rev-parse", "--git-path", &reference])
+    {
+        paths.push(path);
+    }
+    if let Some(path) = git_output(&["rev-parse", "--git-path", "HEAD"]) {
+        paths.push(path);
+    }
+    if let Some(path) = git_output(&["rev-parse", "--git-path", "packed-refs"]) {
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+fn main() {
+    let commit =
+        git_output(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=SDSC_GIT_COMMIT={commit}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    watch_git_head();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let connected = svg_icon::render_dualsense_connected_rgba(TRAY_SIZE)
