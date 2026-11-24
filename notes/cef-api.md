@@ -70,9 +70,9 @@ Status legend:
 
 | Capability | CEF API | Handler | Status | Our code |
 |---|---|---|---|---|
-| Session history | `BrowserHost::GetNavigationEntries`, `GetVisibleNavigationEntry`, `NavigationEntry`, `NavigationEntryVisitor` | visitor callback | **wrapper only** | `src/browser/cef_backend.rs`, `src/browser/mod.rs` |
-| Back/forward | `Browser::CanGoBack/GoBack/CanGoForward/GoForward`; `LoadHandler::OnLoadingStateChange` flags | load | **wired** (local stack gates it) | `src/app/launcher.rs`, `src/browser/mod.rs` |
-| Reload / stop | `Browser::Reload`, `ReloadIgnoreCache`, `StopLoad` | none | **unhandled** (reload re-navigates) | `src/app/launcher.rs:on_browser_reload` |
+| Session history | `BrowserHost::GetNavigationEntries`, `GetVisibleNavigationEntry`, `NavigationEntry`, `NavigationEntryVisitor` | visitor callback | **wired** (snapshot is authoritative; UI projects it) | `src/browser/cef_backend.rs`, `src/browser/mod.rs` |
+| Back/forward | `Browser::CanGoBack/GoBack/CanGoForward/GoForward`; `LoadHandler::OnLoadingStateChange` flags | load | **wired** (CEF flags gate; one step per snapshot) | `src/app/browser.rs`, `src/app/launcher.rs` |
+| Reload / stop | `Browser::Reload`, `ReloadIgnoreCache`, `StopLoad` | none | **reload wired**; stop wrapper only | `src/app/launcher.rs:on_browser_reload` |
 | URL / title / favicon | `DisplayHandler::OnAddressChange/OnTitleChange/OnFaviconURLChange` | display | **wired** | `src/browser/cef_backend.rs` |
 | Page favicon image | `BrowserHost::DownloadImage`, `DownloadImageCallback`, `Image::GetAsBitmap/GetAsPNG` | callback | **wired** (CEF primary; local decoder fallback) | `src/browser/cef_backend.rs`, `src/browser/favicon.rs` |
 | Tabs | no CEF tab strip; one `Browser` per tab | — | **custom** | `src/ui/browser/state.rs`, `src/browser/engine.rs` |
@@ -102,6 +102,12 @@ Status legend:
 
 CEF exposes the per-browser session history directly. Use it; do not infer
 history from address-change events.
+
+Current wiring: `src/browser/cef_backend.rs` polls `GetNavigationEntries` and
+emits `EngineEvent::HistoryChanged`; `BrowserSession::apply_engine_history`
+projects it for the selector; `App::start_history_travel` /
+`advance_history_travel` move one CEF step per canonical snapshot. Address
+changes only update the live URL and autocomplete MRU.
 
 ### Read
 

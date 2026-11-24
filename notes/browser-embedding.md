@@ -37,8 +37,10 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   `FrameSlot`. Covers navigate/tabs/resize/visibility/suspend/back/forward/
   reload/mouse/key/wheel/click-at/DOM reseed. `--type=` helpers re-exec the
   exe and run `CefExecuteProcess` before argument parsing. Popups are denied
-  until engine-created tab adoption lands; canonical `HistoryChanged` is not
-  emitted yet. Favicons come from `DisplayHandler::on_favicon_urlchange` and
+  until engine-created tab adoption lands. Canonical history comes from
+  `CefBrowserHost::GetNavigationEntries` and is projected into the UI stack;
+  reload uses `CefBrowser::Reload`. Favicons come from
+  `DisplayHandler::on_favicon_urlchange` and
   CEF `BrowserHost::DownloadImage`; bookmarks with no page visit yet prefetch
   the site's conventional `/favicon.ico` through the same path.
 - `src/browser/dom.rs` — DOM target query JS. CEF polls it from the page's
@@ -174,11 +176,12 @@ CEF toolchain needs the pinned compiler.
   place).
 - **Popups denied**: `window.open`/`target=_blank` are canceled until the UI
   adopts engine-created tabs.
-- **Canonical history events**: tab titles and URLs work; exact back/forward
-  stacks come later. Favicons use CEF `DownloadImage` for HTTP(S) (Chromium
-  cache/network stack; `is_favicon` disables cookies), with the local
-  `favicon.rs` decoder as the `data:`/failure fallback and `/favicon.ico`
-  fallback.
+- **History is canonical**: `GetNavigationEntries` snapshots replace the
+  URL-change inference; the UI stack is a projection. Multi-step selector
+  jumps advance one CEF step per canonical snapshot. Favicons use CEF
+  `DownloadImage` for HTTP(S) (Chromium cache/network stack; `is_favicon`
+  disables cookies), with the local `favicon.rs` decoder as the
+  `data:`/failure fallback and `/favicon.ico` fallback.
 - **Accelerated OSR not wired**: L1 CPU `OnPaint` only; `OnAcceleratedPaint`
   shared-texture import is the L2 performance step.
 - **macOS/Linux untested** for the CEF backend.

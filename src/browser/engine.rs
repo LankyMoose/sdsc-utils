@@ -122,12 +122,20 @@ pub enum EngineCommand {
     },
     GoBack {
         tab: TabId,
-        /// Entries to traverse at once (history selector jumps).
-        steps: usize,
     },
     GoForward {
         tab: TabId,
-        steps: usize,
+    },
+    /// Ask the engine for a fresh canonical history snapshot.
+    QueryHistory {
+        tab: TabId,
+    },
+    /// CEF-native reload. The generation is echoed on `LoadFinished` so a
+    /// stale completion cannot settle a newer navigation.
+    Reload {
+        tab: TabId,
+        generation: u64,
+        ignore_cache: bool,
     },
     /// Create a tab loading `url` from birth (builder URL, like the boot
     /// tab). A separate post-build `Navigate` loses to the blank's initial
@@ -188,8 +196,10 @@ impl EngineCommand {
             | Self::ReseedDom { tab, .. }
             | Self::ClickAt { tab, .. }
             | Self::ProbeEventLoop { tab, .. }
-            | Self::GoBack { tab, .. }
-            | Self::GoForward { tab, .. }
+            | Self::GoBack { tab }
+            | Self::GoForward { tab }
+            | Self::QueryHistory { tab }
+            | Self::Reload { tab, .. }
             | Self::OpenTab { tab, .. }
             | Self::CloseTab { tab }
             | Self::SetActiveTab { tab } => Some(*tab),
@@ -278,7 +288,7 @@ pub enum EngineEvent {
     /// stack so the hold-bumper selector shows exact back/forward targets.
     HistoryChanged {
         tab: TabId,
-        entries: Vec<String>,
+        entries: Vec<EngineHistoryEntry>,
         current: usize,
     },
     /// CEF's own back/forward capability at the last loading-state change.
@@ -336,6 +346,17 @@ impl EngineEvent {
             Self::TabOpened { .. } | Self::TabClosed { .. } => None,
         }
     }
+}
+
+/// One canonical CEF session-history entry. The UI keeps a projection for
+/// rendering; this type is the engine's authoritative snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineHistoryEntry {
+    pub url: String,
+    pub display_url: String,
+    pub original_url: String,
+    pub title: Option<String>,
+    pub has_post_data: bool,
 }
 
 /// One rendered page frame: owning tab plus RGBA pixels for an iced image

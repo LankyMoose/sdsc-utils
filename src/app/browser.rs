@@ -73,6 +73,15 @@ pub(crate) struct PendingBrowserTrace {
     pub generation: Option<u64>,
 }
 
+/// A history jump that needs one CEF step per canonical snapshot. CEF has no
+/// goto-index, and `GoBack`/`GoForward` are asynchronous one-entry moves.
+pub(crate) struct PendingHistoryTravel {
+    pub tab: crate::browser::engine::TabId,
+    pub target_index: usize,
+    pub target_url: Option<String>,
+    pub attempts: u8,
+}
+
 #[derive(Default)]
 pub struct BrowserAppState {
     /// Tabs, chrome targets, cursor, bookmarks, and per-tab page state.
@@ -170,6 +179,9 @@ impl super::App {
                 open,
                 Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
             ]);
+        }
+        if self.pending_history_travel.is_some() || self.pending_browser_trace.is_some() {
+            return Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep);
         }
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
             self.replay = None;
@@ -302,6 +314,8 @@ impl super::App {
         requested_index: Option<usize>,
         requested_url: Option<String>,
     ) -> Option<crate::platform::trace::FlowId> {
+        // A new navigation/history intent supersedes any in-flight jump.
+        self.pending_history_travel = None;
         if !crate::platform::trace::actions_enabled() {
             return None;
         }
@@ -356,35 +370,176 @@ impl super::App {
         Some(flow)
     }
 
-    /// Settle a pending history action once the engine reports the resulting
-    /// URL. A stale URL from the previous navigation keeps the flow open so
-    /// the trace cannot claim a landing that has not happened yet.
-    pub(crate) fn settle_browser_history_trace_for_url(
+    /// Begin a history action and send its first one-step traversal. CEF's
+    /// canonical snapshot advances the rest of a multi-step jump.
+    pub(crate) fn start_history_travel(
         &mut self,
-        url: &str,
-        outcome: &'static str,
+        action: &'static str,
+        source: &'static str,
+        target_index: usize,
+        target_url: Option<String>,
     ) {
-        let Some(pending) = self.pending_browser_trace.as_ref() else {
+        self.begin_browser_action_trace(action, source, Some(target_index), target_url.clone());
+        let tab = self.browser.panel.active_tab;
+        self.pending_history_travel = Some(crate::app::browser::PendingHistoryTravel {
+            tab,
+            target_index,
+            target_url,
+            attempts: 0,
+        });
+        self.send_history_step(tab, target_index);
+    }
+
+    /// Advance an in-flight history jump after a canonical snapshot. One CEF
+    /// step per snapshot avoids the N-synchronous-GoBack race.
+    pub(crate) fn advance_history_travel(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index, target_url, attempts)) =
+            self.pending_history_travel.as_ref().map(|pending| {
+                (
+                    pending.tab,
+                    pending.target_index,
+                    pending.target_url.clone(),
+                    pending.attempts,
+                )
+            })
+        else {
             return;
         };
-        if pending.kind != BrowserTraceKind::History {
+        if pending_tab != tab {
             return;
         }
-        let matches = pending
-            .requested_url
-            .as_deref()
-            .is_none_or(|want| want == url);
-        if matches {
-            self.settle_browser_action_trace(outcome);
-        } else {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "history.url_mismatch",
-            )
-            .flow(pending.action.flow())
-            .field("requested", pending.requested_url.as_deref())
-            .field("actual", url)
-            .emit();
+        if self.browser.panel.session.nav_current() == Some(target_index) {
+            // The snapshot can move the index before OnAddressChange updates
+            // the live URL. Wait for the matching URL so the trace does not
+            // settle on the previous page.
+            let expected = target_url.or_else(|| {
+                self.browser
+                    .panel
+                    .page
+                    .last_engine_history
+                    .as_ref()
+                    .and_then(|history| history.entries.get(target_index))
+                    .map(|entry| entry.url.clone())
+            });
+            if let Some(expected) = expected
+                && self.browser.panel.session.url() != expected
+            {
+                return;
+            }
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("settled");
+            return;
+        }
+        if attempts >= 64 {
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("stalled");
+            return;
+        }
+        if let Some(pending) = self.pending_history_travel.as_mut() {
+            pending.attempts = pending.attempts.saturating_add(1);
+        }
+        self.send_history_step(tab, target_index);
+    }
+
+    /// Close a history travel when the address change confirms the target.
+    /// CEF can report the new history index before `OnAddressChange`; settling
+    /// on the index alone leaves the trace on the previous page's URL.
+    pub(crate) fn settle_history_travel_on_url(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index, target_url)) =
+            self.pending_history_travel.as_ref().map(|pending| {
+                (
+                    pending.tab,
+                    pending.target_index,
+                    pending.target_url.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if pending_tab != tab || self.browser.panel.session.nav_current() != Some(target_index) {
+            return;
+        }
+        if let Some(expected) = target_url
+            && self.browser.panel.session.url() != expected
+        {
+            return;
+        }
+        self.pending_history_travel = None;
+        self.settle_browser_action_trace("settled");
+    }
+
+    /// Redirected history entries can land on a URL different from the
+    /// recorded entry; load completion is the final authority once the index
+    /// already matches.
+    pub(crate) fn settle_history_travel_on_load(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index)) = self
+            .pending_history_travel
+            .as_ref()
+            .map(|pending| (pending.tab, pending.target_index))
+        else {
+            return;
+        };
+        if pending_tab != tab || self.browser.panel.session.nav_current() != Some(target_index) {
+            return;
+        }
+        self.pending_history_travel = None;
+        self.settle_browser_action_trace("settled");
+    }
+
+    /// Send one CEF history step toward `target_index`. The next canonical
+    /// snapshot calls `advance_history_travel` again.
+    pub(crate) fn send_history_step(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        target_index: usize,
+    ) {
+        let Some(current) = self.browser.panel.session.nav_current() else {
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("history_missing");
+            return;
+        };
+        if current == target_index {
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("settled");
+            return;
+        }
+        let back = current > target_index;
+        let flow = self
+            .pending_browser_trace
+            .as_ref()
+            .map(|pending| pending.action.flow());
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", if back { "GoBack" } else { "GoForward" })
+                .field("tab", tab.0)
+                .field("steps", 1)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            if back {
+                EngineCommand::GoBack { tab }
+            } else {
+                EngineCommand::GoForward { tab }
+            },
+        );
+    }
+
+    /// Cancel a multi-step jump. The trace is closed as abandoned so the
+    /// timeline never shows a step that was not performed.
+    pub(crate) fn cancel_history_travel(&mut self, outcome: &'static str) {
+        if self.pending_history_travel.take().is_none() {
+            return;
+        }
+        if let Some(pending) = self.pending_browser_trace.take()
+            && pending.kind == BrowserTraceKind::History
+        {
+            pending
+                .action
+                .abandon(outcome)
+                .post(trace_browser_state(&self.browser.panel))
+                .emit();
         }
     }
 
@@ -448,7 +603,10 @@ impl super::App {
             .as_ref()
             .is_some_and(|history| {
                 Some(history.current) == actual_index
-                    && history.entries.get(history.current).map(String::as_str)
+                    && history
+                        .entries
+                        .get(history.current)
+                        .map(|entry| entry.url.as_str())
                         == Some(actual_url.as_str())
             });
         let matched_by =
@@ -1641,10 +1799,12 @@ pub(crate) fn trace_browser_state(
         let rows: Vec<serde_json::Value> = history.entries[start..end]
             .iter()
             .enumerate()
-            .map(|(offset, url)| {
+            .map(|(offset, entry)| {
                 json!({
                     "index": start + offset,
-                    "url": url,
+                    "url": &entry.url,
+                    "original_url": &entry.original_url,
+                    "title": &entry.title,
                 })
             })
             .collect();
@@ -1667,7 +1827,6 @@ pub(crate) fn trace_browser_state(
             "engine_activity": page.engine_activity.label(),
             "url_editing": panel.url_editing,
             "bookmark_bubble": panel.bookmark_bubble,
-            "travel_to": session.travel_target(),
             "nav": nav_window(session.nav_entries(), session.nav_current()),
             "selector": selector,
         },
@@ -1704,8 +1863,26 @@ mod tests {
     fn trace_state_exposes_nav_and_selector_entries() {
         let mut panel = crate::ui::browser::state::BrowserPanel::default();
         panel.session.open_surface();
-        panel.session.begin_load("https://a.test/".to_string());
         panel.session.begin_load("https://b.test/".to_string());
+        panel.session.apply_engine_history(
+            &[
+                crate::browser::engine::EngineHistoryEntry {
+                    url: "https://a.test/".to_string(),
+                    display_url: "https://a.test/".to_string(),
+                    original_url: "https://a.test/".to_string(),
+                    title: Some("A".to_string()),
+                    has_post_data: false,
+                },
+                crate::browser::engine::EngineHistoryEntry {
+                    url: "https://b.test/".to_string(),
+                    display_url: "https://b.test/".to_string(),
+                    original_url: "https://b.test/".to_string(),
+                    title: Some("B".to_string()),
+                    has_post_data: false,
+                },
+            ],
+            1,
+        );
         panel.page.history_selector = Some(crate::ui::browser::HistorySelector {
             back: true,
             highlight: 0,

@@ -170,8 +170,10 @@ Rules:
 
 ## Current gaps
 
-- CEF does not emit canonical `HistoryChanged` yet; the trace deliberately
-  records that absence (`engine.history: null`) instead of hiding it.
+- CEF has no history-change callback; the engine polls
+  `GetNavigationEntries` after address/title/load transitions and emits
+  `HistoryChanged`. Traces should show a real `engine.history` snapshot and a
+  passing `ui_engine_agree`.
 - Home/Launcher/app actions are top-level `app.input` records until their
   surface-specific semantic actions are instrumented.
 - Replay currently covers browser navigation/history. Add adapters per app;

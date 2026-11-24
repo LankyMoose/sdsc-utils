@@ -421,7 +421,7 @@ fn chrome_row_view<'a>(
                 let b = button(text("←").size(14.0)).padding([8, 12]);
                 if panel.chrome_attached() == Some(ChromeTarget::Back) {
                     b.on_press(BrowserMessage::Back).style(theme::chip(true))
-                } else if session.can_go_back() {
+                } else if panel.can_go_back() {
                     b.on_press(BrowserMessage::Back).style(theme::ghost)
                 } else {
                     b.style(theme::ghost)
@@ -432,7 +432,7 @@ fn chrome_row_view<'a>(
                 let b = button(text("→").size(14.0)).padding([8, 12]);
                 if panel.chrome_attached() == Some(ChromeTarget::Forward) {
                     b.on_press(BrowserMessage::Forward).style(theme::chip(true))
-                } else if session.can_go_forward() {
+                } else if panel.can_go_forward() {
                     b.on_press(BrowserMessage::Forward).style(theme::ghost)
                 } else {
                     b.style(theme::ghost)

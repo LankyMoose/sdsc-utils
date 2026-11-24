@@ -474,6 +474,7 @@ impl App {
     }
 
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
+        self.cancel_history_travel("surface_closed");
         let _ = self.home_apps.close(crate::app::home::AppId::Browser);
         self.browser.panel.close_surface();
         // A held D-pad must not jump the cursor of the next opened page.
@@ -501,6 +502,7 @@ impl App {
     }
 
     pub(crate) fn on_browser_navigate(&mut self) -> Task<Message> {
+        self.cancel_history_travel("navigate");
         let draft = self.browser.panel.draft.clone();
         let current = self.browser.panel.session.url().to_string();
         let raw = if draft.trim().is_empty() {
@@ -681,13 +683,13 @@ impl App {
             return Err("no_stack");
         };
         if back {
-            if !session.can_go_back() {
+            if !self.browser.panel.can_go_back() {
                 return Err("no_back_entry");
             }
-            let target = current - 1;
+            let target = current.saturating_sub(1);
             Ok((target, session.nav_entry(target).map(|e| e.url.clone())))
         } else {
-            if !session.can_go_forward() {
+            if !self.browser.panel.can_go_forward() {
                 return Err("no_forward_entry");
             }
             let target = current + 1;
@@ -703,23 +705,7 @@ impl App {
                 return Task::none();
             }
         };
-        let flow = self.begin_browser_action_trace(
-            "browser.history.back",
-            "pad",
-            Some(target),
-            target_url,
-        );
-        self.browser.panel.session.begin_history_travel(target);
-        let tab = self.browser_tab();
-        if let Some(flow) = flow {
-            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
-                .flow(flow)
-                .field("command", "GoBack")
-                .field("tab", tab.0)
-                .field("steps", 1)
-                .emit();
-        }
-        self.send_engine_traced(flow, EngineCommand::GoBack { tab, steps: 1 });
+        self.start_history_travel("browser.history.back", "pad", target, target_url);
         Task::none()
     }
 
@@ -731,23 +717,7 @@ impl App {
                 return Task::none();
             }
         };
-        let flow = self.begin_browser_action_trace(
-            "browser.history.forward",
-            "pad",
-            Some(target),
-            target_url,
-        );
-        self.browser.panel.session.begin_history_travel(target);
-        let tab = self.browser_tab();
-        if let Some(flow) = flow {
-            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
-                .flow(flow)
-                .field("command", "GoForward")
-                .field("tab", tab.0)
-                .field("steps", 1)
-                .emit();
-        }
-        self.send_engine_traced(flow, EngineCommand::GoForward { tab, steps: 1 });
+        self.start_history_travel("browser.history.forward", "pad", target, target_url);
         Task::none()
     }
 
@@ -766,9 +736,9 @@ impl App {
             return Task::none();
         }
         let has = if back {
-            self.browser.panel.session.can_go_back()
+            self.browser.panel.can_go_back()
         } else {
-            self.browser.panel.session.can_go_forward()
+            self.browser.panel.can_go_forward()
         };
         if !has {
             self.trace_browser_noop(
@@ -869,36 +839,11 @@ impl App {
             .emit();
             return Task::none();
         }
-        let back = index < current;
-        let steps = index.abs_diff(current);
-        let flow = self.begin_browser_action_trace(
-            "browser.history.pick",
-            "pad",
-            Some(index),
-            Some(url.clone()),
-        );
         self.browser.panel.history_selector = None;
-        self.browser.panel.draft = url;
-        self.browser.panel.session.begin_history_travel(index);
+        self.browser.panel.draft = url.clone();
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
-        let tab = self.browser_tab();
-        if let Some(flow) = flow {
-            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
-                .flow(flow)
-                .field("command", if back { "GoBack" } else { "GoForward" })
-                .field("tab", tab.0)
-                .field("steps", steps)
-                .emit();
-        }
-        self.send_engine_traced(
-            flow,
-            if back {
-                EngineCommand::GoBack { tab, steps }
-            } else {
-                EngineCommand::GoForward { tab, steps }
-            },
-        );
+        self.start_history_travel("browser.history.pick", "pad", index, Some(url));
         Task::none()
     }
 
@@ -1105,11 +1050,46 @@ impl App {
     }
 
     pub(crate) fn on_browser_reload(&mut self) -> Task<Message> {
+        if self.browser.engine.is_none() {
+            return self.on_browser_navigate();
+        }
         if self.browser.panel.session.url().is_empty() {
             return self.on_browser_navigate();
         }
-        self.browser.panel.draft = self.browser.panel.session.url().to_string();
-        self.on_browser_navigate()
+        let url = self.browser.panel.session.url().to_string();
+        let source = if crate::platform::trace::replay::replaying() {
+            "replay"
+        } else {
+            "ui"
+        };
+        let flow =
+            self.begin_browser_action_trace("browser.reload", source, None, Some(url.clone()));
+        let generation = self.browser.panel.session.begin_reload();
+        if let Some(pending) = self.pending_browser_trace.as_mut() {
+            pending.generation = Some(generation);
+        }
+        self.browser.panel.draft = url;
+        self.browser.panel.history_selector = None;
+        self.note_launcher_activity();
+        self.play_ui_cue(UiSoundKind::Action);
+        let tab = self.browser_tab();
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", "Reload")
+                .field("tab", tab.0)
+                .field("generation", generation)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            EngineCommand::Reload {
+                tab,
+                generation,
+                ignore_cache: false,
+            },
+        );
+        Task::none()
     }
 
     /// Escape hatch for pages the reader backend cannot render.
@@ -1808,6 +1788,7 @@ impl App {
                 });
             }
             engine.send(EngineCommand::SetActiveTab { tab });
+            engine.send(EngineCommand::QueryHistory { tab });
         }
         self.sync_live_mouse();
         self.sync_browser_theme();
@@ -1832,6 +1813,7 @@ impl App {
         if tab == self.browser.panel.active_tab {
             return Task::none();
         }
+        self.cancel_history_travel("tab_switch");
         let old = self.browser.panel.active_tab;
         let needs_open = self
             .browser
@@ -1911,6 +1893,7 @@ impl App {
             }
             return Task::none();
         }
+        self.cancel_history_travel("tab_close");
         // Active tab: survivors live in `stored`.
         if self.browser.panel.stored.is_empty() {
             return self.on_browser_go_default();
@@ -2027,7 +2010,7 @@ impl App {
                     self.browser.panel.save_tabs();
                 }
             }
-            EngineEvent::UrlChanged { tab: _, url } => {
+            EngineEvent::UrlChanged { tab, url } => {
                 let flow = self
                     .pending_browser_trace
                     .as_ref()
@@ -2045,8 +2028,7 @@ impl App {
                 // A new document underneath invalidates the selector's
                 // snapshot (link click, redirect, history travel).
                 self.browser.panel.history_selector = None;
-                let actual_url = self.browser.panel.session.url().to_string();
-                self.settle_browser_history_trace_for_url(&actual_url, "url_changed");
+                self.settle_history_travel_on_url(tab);
             }
             EngineEvent::FaviconChanged {
                 tab: _,
@@ -2112,7 +2094,7 @@ impl App {
                 self.browser.panel.page.last_engine_can = Some((can_back, can_forward));
             }
             EngineEvent::HistoryChanged {
-                tab: _,
+                tab,
                 entries,
                 current,
             } => {
@@ -2124,8 +2106,8 @@ impl App {
                 self.browser
                     .panel
                     .session
-                    .note_session_history(entries, current);
-                self.settle_browser_action_trace("settled");
+                    .apply_engine_history(&entries, current);
+                self.advance_history_travel(tab);
                 // The stack moved under an open selector: clamp the highlight,
                 // close if the direction ran dry.
                 let dir_is_back = self
@@ -2166,17 +2148,16 @@ impl App {
                 }
             }
             EngineEvent::LoadFinished {
-                tab: _,
+                tab,
                 generation,
                 result,
             } => {
-                match result {
-                    Ok(()) => {
-                        self.browser.panel.session.mark_loaded(generation);
-                    }
-                    Err(err) => {
-                        self.browser.panel.session.apply_failed(generation, err);
-                    }
+                let loaded = match result {
+                    Ok(()) => self.browser.panel.session.mark_loaded(generation),
+                    Err(err) => self.browser.panel.session.apply_failed(generation, err),
+                };
+                if loaded {
+                    self.settle_history_travel_on_load(tab);
                 }
                 let settle = self.pending_browser_trace.as_ref().is_some_and(|pending| {
                     pending.kind == crate::app::browser::BrowserTraceKind::Navigate
@@ -2264,7 +2245,7 @@ impl App {
                             current,
                             entries: entries.clone(),
                         });
-                    stored.page.session.note_session_history(entries, current);
+                    stored.page.session.apply_engine_history(&entries, current);
                 }
                 EngineEvent::FocusChanged { id, .. } => {
                     // Docked when foregrounded (if still live then).

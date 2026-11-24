@@ -336,6 +336,9 @@ struct TabContext {
     favicon_key: Arc<Mutex<String>>,
     /// Invalidates in-flight favicon callbacks after navigation/closure.
     favicon_request: Arc<AtomicU64>,
+    /// Last canonical history snapshot hash, so address/title/load callbacks
+    /// do not emit duplicate HistoryChanged events.
+    last_history_hash: Arc<Mutex<u64>>,
     /// Causal flow of the last traced navigation/history command. CEF
     /// callbacks join engine log lines to the UI action that caused them.
     trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
@@ -357,6 +360,116 @@ fn trace_engine(ctx: &TabContext, event: &'static str) -> crate::platform::trace
         builder = builder.flow(flow);
     }
     builder
+}
+
+cef::wrap_navigation_entry_visitor! {
+    struct SdscNavigationVisitor {
+        entries: Arc<Mutex<Vec<crate::browser::engine::EngineHistoryEntry>>>,
+        current: Arc<AtomicU64>,
+    }
+    impl NavigationEntryVisitor {
+        fn visit(
+            &self,
+            entry: Option<&mut NavigationEntry>,
+            current: std::os::raw::c_int,
+            index: std::os::raw::c_int,
+            _total: std::os::raw::c_int,
+        ) -> std::os::raw::c_int {
+            let Some(entry) = entry else { return 1 };
+            if entry.is_valid() == 0 || index < 0 {
+                return 1;
+            }
+            let url = CefString::from(&entry.url()).to_string();
+            if url.is_empty() {
+                return 1;
+            }
+            let title = CefString::from(&entry.title()).to_string();
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(crate::browser::engine::EngineHistoryEntry {
+                    display_url: CefString::from(&entry.display_url()).to_string(),
+                    original_url: CefString::from(&entry.original_url()).to_string(),
+                    title: (!title.is_empty()).then_some(title),
+                    has_post_data: entry.has_post_data() != 0,
+                    url,
+                });
+            if current != 0 {
+                self.current.store(index as u64, Ordering::Release);
+            }
+            1
+        }
+    }
+}
+
+/// Query CEF's canonical navigation entries and publish a snapshot if it
+/// changed. There is no CEF "history changed" callback; call this after
+/// address/title/load transitions and on explicit `QueryHistory`.
+fn emit_history(ctx: &TabContext) {
+    let Some(browser) = ctx.browser.get() else {
+        return;
+    };
+    if browser.is_valid() == 0 {
+        return;
+    }
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let current = Arc::new(AtomicU64::new(0));
+    let mut visitor = SdscNavigationVisitor::new(entries.clone(), current.clone());
+    host.navigation_entries(Some(&mut visitor), 0);
+    let entries = entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if entries.is_empty() {
+        return;
+    }
+    let current = current.load(Ordering::Acquire) as usize;
+    let key = format!(
+        "{current}\n{}",
+        entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    entry.url,
+                    entry.original_url,
+                    entry.title.as_deref().unwrap_or(""),
+                    u8::from(entry.has_post_data)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let hash = fnv1a(key.as_bytes());
+    {
+        let mut last = ctx
+            .last_history_hash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last == hash {
+            return;
+        }
+        *last = hash;
+    }
+    trace_engine(ctx, "history.snapshot")
+        .field("current", current)
+        .field("len", entries.len())
+        .field(
+            "urls",
+            entries
+                .iter()
+                .map(|entry| entry.url.clone())
+                .collect::<Vec<_>>(),
+        )
+        .emit();
+    ctx.handle.emit(EngineEvent::HistoryChanged {
+        tab: ctx.tab,
+        entries,
+        current,
+    });
 }
 
 /// `cef::Browser` is a ref-counted raw pointer without Rust `Send`; CEF's
@@ -666,6 +779,9 @@ cef::wrap_load_handler! {
                 .field("can_back", can_go_back != 0)
                 .field("can_forward", can_go_forward != 0)
                 .emit();
+            if is_loading == 0 {
+                emit_history(&self.ctx);
+            }
         }
 
         fn on_load_end(
@@ -687,6 +803,7 @@ cef::wrap_load_handler! {
                 generation,
                 result: Ok(()),
             });
+            emit_history(&self.ctx);
         }
 
         fn on_load_error(
@@ -740,6 +857,7 @@ cef::wrap_display_handler! {
                 tab: self.ctx.tab,
                 url,
             });
+            emit_history(&self.ctx);
         }
 
         fn on_title_change(
@@ -754,6 +872,7 @@ cef::wrap_display_handler! {
                 tab: self.ctx.tab,
                 title,
             });
+            emit_history(&self.ctx);
         }
 
         fn on_favicon_urlchange(
@@ -1312,6 +1431,7 @@ impl Worker {
             extent: Arc::new(Mutex::new((0.0, 0.0))),
             favicon_key: Arc::new(Mutex::new(String::new())),
             favicon_request: Arc::new(AtomicU64::new(0)),
+            last_history_hash: Arc::new(Mutex::new(0)),
             trace_flow: Arc::new(Mutex::new(None)),
         };
         let mut client = SdscClient::new(
@@ -1409,6 +1529,27 @@ impl Worker {
                     }
                 } else {
                     self.create_tab(tab, &url, Arc::new(FrameSlot::default()), generation);
+                }
+            }
+            EngineCommand::Reload {
+                tab,
+                generation,
+                ignore_cache,
+            } => {
+                if let Some(entry) = self.tab_mut(tab) {
+                    entry.generation = generation;
+                    *entry
+                        .ctx
+                        .generation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = generation;
+                    if let Some(browser) = entry.ctx.browser.get() {
+                        if ignore_cache {
+                            browser.reload_ignore_cache();
+                        } else {
+                            browser.reload();
+                        }
+                    }
                 }
             }
             EngineCommand::ScrollBy { tab, dx, dy, x, y } => {
@@ -1519,22 +1660,23 @@ impl Worker {
                     frame.execute_java_script(Some(&code), Some(&url), 0);
                 }
             }
-            EngineCommand::GoBack { tab, steps } => {
+            EngineCommand::GoBack { tab } => {
                 if let Some(entry) = self.tab(tab)
                     && let Some(browser) = entry.ctx.browser.get()
                 {
-                    for _ in 0..steps.max(1) {
-                        browser.go_back();
-                    }
+                    browser.go_back();
                 }
             }
-            EngineCommand::GoForward { tab, steps } => {
+            EngineCommand::GoForward { tab } => {
                 if let Some(entry) = self.tab(tab)
                     && let Some(browser) = entry.ctx.browser.get()
                 {
-                    for _ in 0..steps.max(1) {
-                        browser.go_forward();
-                    }
+                    browser.go_forward();
+                }
+            }
+            EngineCommand::QueryHistory { tab } => {
+                if let Some(entry) = self.tab(tab) {
+                    emit_history(&entry.ctx);
                 }
             }
             EngineCommand::OpenTab {

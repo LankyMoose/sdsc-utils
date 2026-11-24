@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// Last canonical history snapshot reported by the engine, kept alongside the
-/// UI's own merged stack so traces can expose disagreement.
+/// UI's projection so traces can expose disagreement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineHistorySnapshot {
     pub current: usize,
-    pub entries: Vec<String>,
+    pub entries: Vec<crate::browser::engine::EngineHistoryEntry>,
 }
 
 /// Hold-bumper history selector (B2.4): directional dropdown over the
@@ -252,6 +252,23 @@ impl Default for BrowserPanel {
 }
 
 impl BrowserPanel {
+    /// CEF's own back/forward capability wins over the projected stack:
+    /// redirects and same-document entries can move CEF without the UI's
+    /// local snapshot settling first.
+    pub fn can_go_back(&self) -> bool {
+        self.page
+            .last_engine_can
+            .map(|(back, _)| back)
+            .unwrap_or_else(|| self.page.session.can_go_back())
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.page
+            .last_engine_can
+            .map(|(_, forward)| forward)
+            .unwrap_or_else(|| self.page.session.can_go_forward())
+    }
+
     /// Match the surface to the live card page size. Returns true when the
     /// size changed (the engine must be resized to the same numbers).
     pub fn set_viewport(&mut self, w: f32, h: f32) -> bool {

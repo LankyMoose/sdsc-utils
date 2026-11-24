@@ -796,6 +796,8 @@ pub struct App {
     pending_pad_actions: VecDeque<PadAction>,
     /// Browser history/nav action waiting for the engine to settle.
     pending_browser_trace: Option<crate::app::browser::PendingBrowserTrace>,
+    /// Multi-step history jump, advanced one CEF step per canonical snapshot.
+    pending_history_travel: Option<crate::app::browser::PendingHistoryTravel>,
     /// In-process replay plan when launched with `--trace-replay`.
     replay: Option<crate::platform::trace::replay::ReplayPlan>,
     /// Surface receiving source-side tap actions.
@@ -1184,6 +1186,7 @@ impl App {
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
             pending_browser_trace: None,
+            pending_history_travel: None,
             replay,
             pad_input_owner: PadInputOwner::None,
             haptic_pad_serial: None,
