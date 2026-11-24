@@ -58,9 +58,9 @@ pub fn pad_key(key: keyboard_types::NamedKey) -> [keyboard_types::KeyboardEvent;
     [base, released]
 }
 
-/// Synthetic key events for replay/QA. They enter the same shell handler as
-/// hardware keys but never touch the OS keyboard, cursor, or focus.
-#[cfg(debug_assertions)]
+/// Synthetic key events for replay/QA and the on-screen keyboard. They enter
+/// the same shell handler as hardware keys but never touch the OS keyboard,
+/// cursor, or focus.
 fn synthetic_raw(key: keyboard::Key, modifiers: keyboard::Modifiers, pressed: bool) -> RawKey {
     RawKey {
         key,
@@ -73,7 +73,6 @@ fn synthetic_raw(key: keyboard::Key, modifiers: keyboard::Modifiers, pressed: bo
 }
 
 /// Text plus newline/tab controls as press+release pairs. No OS input.
-#[cfg(debug_assertions)]
 pub fn synthetic_text(text: &str, modifiers: keyboard::Modifiers) -> Vec<RawKey> {
     let mut events = Vec::new();
     for ch in text.chars() {
@@ -89,8 +88,7 @@ pub fn synthetic_text(text: &str, modifiers: keyboard::Modifiers) -> Vec<RawKey>
     events
 }
 
-/// One named key tap (press+release) for replay/QA.
-#[cfg(debug_assertions)]
+/// One named key tap (press+release) for replay/QA and the OSK.
 pub fn synthetic_named(name: &str, modifiers: keyboard::Modifiers) -> Option<[RawKey; 2]> {
     use keyboard::key::Named;
     let named = match name {

@@ -228,6 +228,11 @@ pub enum Message {
         id: window::Id,
         key: RawKey,
     },
+    /// Platform IME preedit/commit for the Browser page.
+    BrowserIme {
+        id: window::Id,
+        event: iced::advanced::input_method::Event,
+    },
     /// Debug-only standalone ambient preview window opened.
     #[cfg(debug_assertions)]
     AmbientPreviewOpened(window::Id),
@@ -432,6 +437,7 @@ impl Message {
                 trace
             }),
             Message::BrowserRawKey { .. } => Some(input_trace("ui.key", "browser")),
+            Message::BrowserIme { .. } => None,
             Message::Home(message) => {
                 let mut trace = input_trace(message.trace_label(), "home");
                 if let crate::ui::home::HomeMessage::AppsMenuOpen(index) = message {
@@ -540,6 +546,7 @@ impl Message {
             | Message::Browser(_)
             | Message::Launcher(_)
             | Message::BrowserRawKey { .. }
+            | Message::BrowserIme { .. }
             | Message::LauncherCursorActivity(_)
             | Message::PadInput(_) => true,
             Message::LauncherKey { .. } => true,
@@ -1463,7 +1470,10 @@ impl App {
                 if crate::platform::debug_quiet::input_dropped()
                     && matches!(
                         event,
-                        iced::Event::Keyboard(_) | iced::Event::Mouse(_) | iced::Event::Touch(_)
+                        iced::Event::Keyboard(_)
+                            | iced::Event::Mouse(_)
+                            | iced::Event::Touch(_)
+                            | iced::Event::InputMethod(_)
                     )
                 {
                     return None;
@@ -1524,6 +1534,7 @@ impl App {
                         | mouse::Event::ButtonReleased(_)
                         | mouse::Event::WheelScrolled { .. },
                     ) => Some(Message::LauncherCursorActivity(id)),
+                    iced::Event::InputMethod(event) => Some(Message::BrowserIme { id, event }),
                     _ => None,
                 }
             }),
@@ -2152,6 +2163,13 @@ impl App {
                     Task::none()
                 } else {
                     self.on_browser_raw_key(id, key)
+                }
+            }
+            Message::BrowserIme { id, event } => {
+                if crate::platform::debug_quiet::input_dropped() {
+                    Task::none()
+                } else {
+                    self.on_browser_ime(id, event)
                 }
             }
             Message::PadInput(edge) => {

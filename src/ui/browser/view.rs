@@ -7,13 +7,14 @@
 use crate::browser::engine::BrowserCursor;
 use crate::ui::browser::state::{
     BrowserPanel, CHROME_BOOKMARK_H, CHROME_BOOKMARKS_Y, CHROME_HEADER_H, CHROME_ROW_GAP,
-    CHROME_ROW_H, CHROME_STRIP_Y, CHROME_TOOLBAR_Y, ChromeTarget, cursor_targets,
+    CHROME_ROW_H, CHROME_STRIP_Y, CHROME_TOOLBAR_Y, ChromeTarget, OskKey, cursor_targets,
 };
 use crate::ui::text_fit;
 use crate::ui::theme;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, image, mouse_area, row, scrollable, space, stack, text, text_input,
+    Column, Row, button, column, container, image, mouse_area, row, scrollable, space, stack, text,
+    text_input,
 };
 use iced::{Alignment, Element, Fill, Length};
 
@@ -60,6 +61,8 @@ pub enum BrowserMessage {
         dx: i32,
         dy: i32,
     },
+    /// On-screen keyboard key selected with Cross or the mouse.
+    OskKey(OskKey),
     Scrolled(f32),
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
@@ -94,7 +97,8 @@ impl BrowserMessage {
             | Self::PagePress
             | Self::PageRelease
             | Self::PagePointerLeft
-            | Self::PageWheel { .. } => None,
+            | Self::PageWheel { .. }
+            | Self::OskKey(_) => None,
             Self::Scrolled(_) => None,
             #[cfg(debug_assertions)]
             Self::Shot(_) => None,
@@ -147,7 +151,10 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 /// keyboard, and a chrome dock is carried by the control chip; free roam
 /// and flights draw everywhere on the surface, header included.
 fn cursor_draws(panel: &BrowserPanel) -> bool {
-    !panel.url_editing && !panel.page_mouse_active && panel.chrome_attached().is_none()
+    !panel.url_editing
+        && !panel.page_mouse_active
+        && !panel.osk.open
+        && panel.chrome_attached().is_none()
 }
 
 /// Map a unified cursor point (page px; header negative) to card pixels.
@@ -787,6 +794,47 @@ fn browser_status_overlay(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
     column![space().height(Fill), bar].into()
 }
 
+/// Controller on-screen keyboard overlay. Focus is driven by the pad; keys are
+/// also mouse-clickable for convenience.
+fn browser_osk(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
+    if !panel.osk.open {
+        return space().height(Length::Fixed(0.0)).into();
+    }
+    let mut rows: Vec<Element<'_, BrowserMessage>> = Vec::new();
+    let mut flat = 0;
+    for key_row in panel.osk.rows() {
+        let mut keys: Vec<Element<'_, BrowserMessage>> = Vec::new();
+        for key in *key_row {
+            let focused = flat == panel.osk.focus;
+            keys.push(
+                button(text(key.label(panel.osk.layer)).size(15))
+                    .on_press(BrowserMessage::OskKey(*key))
+                    .style(theme::chip(focused))
+                    .width(Fill)
+                    .height(Length::Fixed(38.0))
+                    .into(),
+            );
+            flat += 1;
+        }
+        rows.push(Row::with_children(keys).spacing(4).into());
+    }
+    let hint = text("D-pad move · Cross type · Square symbols · Triangle backspace · Circle close")
+        .size(12)
+        .color(theme::MUTED);
+    let keys = container(Column::with_children(rows).spacing(4))
+        .width(Length::Fixed(680.0))
+        .padding(4);
+    let card = container(column![hint, keys].spacing(8))
+        .padding(12)
+        .style(theme::menu_panel);
+    container(card)
+        .center_x(Fill)
+        .center_y(Fill)
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
 /// Browser surface: one 1:1 card containing the fixed header and
 /// the page area. The caller sizes the page to 16:9; the engine viewport is
 /// resized to the same numbers, so cursor coordinates are card pixels.
@@ -817,11 +865,15 @@ pub fn browser_view<'a>(
             browser_status_overlay(panel),
         ],
     ];
-    stack![base, browser_cursor_overlay(panel, page_w, page_h)]
-        .width(Length::Fixed(page_w))
-        .height(Length::Fixed(CHROME_HEADER_H + page_h))
-        .clip(true)
-        .into()
+    stack![
+        base,
+        browser_cursor_overlay(panel, page_w, page_h),
+        browser_osk(panel)
+    ]
+    .width(Length::Fixed(page_w))
+    .height(Length::Fixed(CHROME_HEADER_H + page_h))
+    .clip(true)
+    .into()
 }
 
 /// Standalone Browser card geometry: 16:9, height-driven, with a 50px
@@ -869,11 +921,25 @@ pub fn root_view(
     // Controller mode owns the sole pointer (pad ring); a real mouse shows the
     // OS cursor with CEF's hover shape instead. Automated sessions never hide
     // the host cursor.
-    crate::ui::launcher::cursor_hide::force_cursor(
+    let surface: Element<'_, BrowserMessage> = crate::ui::launcher::cursor_hide::force_cursor(
         root,
         !panel.page_mouse_active && !crate::platform::debug_quiet::input_dropped(),
     )
-    .into()
+    .into();
+    let card_x = (stage_w - layout.card_w) * 0.5;
+    let card_y = (stage_h - layout.card_h) * 0.5;
+    let (mouse_x, mouse_y) = panel.page_mouse;
+    let cursor = iced::Rectangle::new(
+        iced::Point::new(
+            card_x + crate::ui::browser::state::BROWSER_CARD_PAD + mouse_x,
+            card_y + crate::ui::browser::state::BROWSER_CARD_PAD + CHROME_HEADER_H + mouse_y,
+        ),
+        iced::Size::new(1.0, 1.0),
+    );
+    let ime_enabled = !panel.url_editing
+        && !crate::platform::debug_quiet::input_dropped()
+        && panel.session.has_frame();
+    crate::ui::input_method::ime_bridge(surface, ime_enabled, cursor)
 }
 
 #[cfg(test)]
@@ -1602,5 +1668,12 @@ mod tests {
             cursor_interaction(BrowserCursor::ResizeNeSw),
             Interaction::ResizingDiagonallyUp
         );
+    }
+
+    #[test]
+    fn osk_overlay_composes_when_open() {
+        let mut panel = BrowserPanel::default();
+        panel.osk.open = true;
+        let _ = browser_view(&panel, true, 900.0, 600.0);
     }
 }

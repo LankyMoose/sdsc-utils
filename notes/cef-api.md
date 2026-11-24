@@ -76,7 +76,7 @@ Status legend:
 | URL / title / favicon | `DisplayHandler::OnAddressChange/OnTitleChange/OnFaviconURLChange` | display | **wired** | `src/browser/cef_backend.rs` |
 | Page favicon image | `BrowserHost::DownloadImage`, `DownloadImageCallback`, `Image::GetAsBitmap/GetAsPNG` | callback | **wired** (CEF primary; local decoder fallback) | `src/browser/cef_backend.rs`, `src/browser/favicon.rs` |
 | Tabs | no CEF tab strip; one `Browser` per tab | — | **custom** | `src/ui/browser/state.rs`, `src/browser/engine.rs` |
-| Popups / new windows | `LifeSpanHandler::OnBeforePopup`, `RequestHandler::OnOpenURLFromTab` | life-span/request | **unhandled** (all popups denied) | `src/browser/cef_backend.rs:on_before_popup` |
+| Popups / new windows | `LifeSpanHandler::OnBeforePopup`, `RequestHandler::OnOpenURLFromTab` | life-span/request | **wired as tabs**: native popup canceled, URL opens a normal foreground tab; opener/POST semantics limited | `src/browser/cef_backend.rs:on_before_popup` |
 | Find in page | `BrowserHost::Find`, `StopFinding`; `FindHandler::OnFindResult` | find | **wrapper only** | — |
 | Zoom | `BrowserHost::CanZoom`, `Zoom`, `GetZoomLevel`, `SetZoomLevel` | none | **wrapper only** | — |
 | Fullscreen | `DisplayHandler::OnFullscreenModeChange`; `BrowserHost::IsFullscreen`, `ExitFullscreen` | display | **unhandled** | — |
@@ -92,7 +92,7 @@ Status legend:
 | DevTools | `BrowserHost::ShowDevTools`, `ExecuteDevToolsMethod`, `DevToolsMessageObserver` | none | **wrapper only** | — |
 | Accessibility | `AccessibilityHandler::OnAccessibilityTreeChange`; `BrowserHost::SetAccessibilityState` | accessibility | **custom** (DOM query) | `src/browser/dom.rs` |
 | Keyboard / mouse / wheel | `BrowserHost::SendKeyEvent`, `SendMouseClickEvent`, `SendMouseMoveEvent`, `SendMouseWheelEvent`; `DisplayHandler::OnCursorChange` | none | **partial**: keyboard text (`RAWKEYDOWN`+`CHAR`+`KEYUP`), pad trusted clicks, hardware left click/drag/double/triple, wheel, cursor shapes; no right/middle or context menu | `src/browser/cef_backend.rs` |
-| IME | `BrowserHost::ImeSetComposition`, `ImeCommitText`, `ImeFinishComposingText`, `ImeCancelComposition` | none | **unhandled** | `notes/browser-osk.md` |
+| IME | `BrowserHost::ImeSetComposition`, `ImeCommitText`, `ImeFinishComposingText`, `ImeCancelComposition` | none | **wired** page composition via `ime_bridge`; commit uses composition+finish | `notes/browser-osk.md` |
 | OSR paint | `RenderHandler::OnPaint`; `OnAcceleratedPaint` | render | **wired** (CPU L1; accelerated not wired) | `src/browser/cef_backend.rs` |
 | Cookies / cache / profile | `CookieManager`, `RequestContext`, `Settings.root_cache_path` | settings | **wired** (CEF defaults) | `src/browser/cef_backend.rs:initialize_cef` |
 | Preferences | `PreferenceManager`, `PreferenceObserver`, `PreferenceRegistrar` | preferences | **wrapper only** | — |
@@ -222,6 +222,14 @@ Implementation notes (`src/browser/cef_backend.rs`):
   wheel events keep Chromium's nested-scroller handling. Click counts 2/3
   select words/paragraphs. `DisplayHandler::OnCursorChange` carries the hover
   shape (hand, I-beam, resize) to the UI.
+- `OnBeforePopup` returns cancel and emits `PopupRequested`; the shell opens
+  the URL as a normal foreground tab so target=_blank/window.open do not
+  create an untracked native popup. Opener/POST popup semantics are limited.
+- IME uses `ImeSetComposition` with a single full-text underline and an
+  invalid replacement range (`u32::MAX..u32::MAX`, meaning current
+  selection). `ImeCommitText` did not insert text in the pinned 156 runtime;
+  commit stages the text as a composition and calls
+  `ImeFinishComposingText`.
 - Automated sessions never receive real iced key/mouse events. Replay calls
   the same app handlers with explicit coordinates (`text`, `key`,
   `mouse.click`, `mouse.wheel`) and `SDSC_DEBUG_INPUT=0` locks the widget

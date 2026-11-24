@@ -114,6 +114,24 @@ pub enum EngineCommand {
     MouseLeave {
         tab: TabId,
     },
+    /// Windowless IME composition update for a page text field.
+    ImeSetComposition {
+        tab: TabId,
+        text: String,
+    },
+    /// Commit the current IME composition into the focused page field.
+    ImeCommitText {
+        tab: TabId,
+        text: String,
+    },
+    /// Complete composition with the current node contents.
+    ImeFinishComposition {
+        tab: TabId,
+    },
+    /// Discard the current composition.
+    ImeCancelComposition {
+        tab: TabId,
+    },
     /// The UI cursor jumped: force a fresh DOM target cull around the
     /// current mouse position (the live set is culled around its pull
     /// center, so a jump can land where no snap target was collected yet).
@@ -234,6 +252,10 @@ impl EngineCommand {
             | Self::MouseMove { tab, .. }
             | Self::MouseButton { tab, .. }
             | Self::MouseLeave { tab }
+            | Self::ImeSetComposition { tab, .. }
+            | Self::ImeCommitText { tab, .. }
+            | Self::ImeFinishComposition { tab }
+            | Self::ImeCancelComposition { tab }
             | Self::ReseedDom { tab, .. }
             | Self::ClickAt { tab, .. }
             | Self::ProbeEventLoop { tab, .. }
@@ -359,6 +381,12 @@ pub enum EngineEvent {
         generation: u64,
         result: Result<(), String>,
     },
+    /// A page requested `window.open` / `target=_blank`. The engine cancels
+    /// the native popup; the shell opens the URL in a normal Browser tab.
+    PopupRequested {
+        source: TabId,
+        url: String,
+    },
     /// Engine-created tab (popup `request_create_new`: `window.open()`,
     /// `target=_blank`). Already foregrounded backend-side; the UI adopts
     /// it (stash live, reset, set active).
@@ -401,7 +429,7 @@ impl EngineEvent {
             | Self::CursorChanged { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),
             Self::A11yTree { tab, .. } => Some(*tab),
-            Self::TabOpened { .. } | Self::TabClosed { .. } => None,
+            Self::PopupRequested { .. } | Self::TabOpened { .. } | Self::TabClosed { .. } => None,
         }
     }
 }

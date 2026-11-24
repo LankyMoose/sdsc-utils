@@ -18,6 +18,7 @@
 | Replay a browser flow in a sandbox | `sdsc-utils --trace-replay <session> --flow <flow-id>` |
 | Install/update QA console | `python scripts/install_qa_web.py --open` (see `notes/install-qa.md`) |
 | Browser input QA (synthetic, no OS input) | `python scripts/qa_browser_input.py` |
+| Browser popup QA (synthetic, no OS input) | `python scripts/qa_browser_popup.py` |
 
 ## Project structure
 

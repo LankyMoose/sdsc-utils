@@ -377,6 +377,47 @@ impl super::App {
                 Task::none()
             }
             #[cfg(debug_assertions)]
+            "osk.toggle" => {
+                self.toggle_browser_osk();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "osk.key" => {
+                if let Some(ch) = step
+                    .params
+                    .get("char")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| text.chars().next())
+                {
+                    let _ = self.osk_activate_key(crate::ui::browser::OskKey::Char(ch));
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "ime.preedit" => {
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(id) = self.browser_window
+                {
+                    let _ = self.on_browser_ime(
+                        id,
+                        iced::advanced::input_method::Event::Preedit(text.to_string(), None),
+                    );
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "ime.commit" => {
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(id) = self.browser_window
+                {
+                    let _ = self.on_browser_ime(
+                        id,
+                        iced::advanced::input_method::Event::Commit(text.to_string()),
+                    );
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
             "mouse.click" => {
                 if let Some((x, y)) = replay_point(&step.params) {
                     let count = step
@@ -579,6 +620,33 @@ impl super::App {
             started: Instant::now(),
         });
         self.send_history_command(flow, tab, back);
+    }
+
+    /// OSK owns the pad while open: D-pad moves key focus, Cross types,
+    /// Triangle backspaces, Square changes layer, Circle closes.
+    fn tick_browser_osk(
+        &mut self,
+        readings: &[crate::ui::launcher::input::NavReading],
+        action: Option<NavAction>,
+        now: std::time::Instant,
+    ) -> Task<Message> {
+        if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
+            self.browser.panel.osk.move_focus(jump);
+            self.play_ui_cue(UiSoundKind::Nav);
+        }
+        match action {
+            Some(NavAction::Confirm) => {
+                let key = self.browser.panel.osk.focus_key();
+                return self.osk_activate_key(key);
+            }
+            Some(NavAction::Cancel) => {
+                self.browser.panel.osk.open = false;
+            }
+            Some(NavAction::Triangle) => return self.osk_backspace(),
+            Some(NavAction::CycleSort) => self.browser.panel.osk.toggle_layer(),
+            _ => {}
+        }
+        Task::none()
     }
 
     /// Advance an in-flight history action after a canonical snapshot.
@@ -984,6 +1052,7 @@ impl super::App {
             BrowserMessage::PageRelease => self.on_browser_page_release(),
             BrowserMessage::PagePointerLeft => self.on_browser_page_pointer_left(),
             BrowserMessage::PageWheel { dx, dy } => self.on_browser_page_wheel(dx, dy),
+            BrowserMessage::OskKey(key) => self.osk_activate_key(key),
             BrowserMessage::Scrolled(y) => {
                 self.browser.panel.note_scrolled(y);
                 Task::none()
@@ -1034,6 +1103,78 @@ impl super::App {
         let (x, y) = self.browser.panel.page_mouse;
         self.inject_browser_wheel(x, y, dx, dy, "mouse");
         Task::none()
+    }
+
+    /// Toggle the controller on-screen keyboard. Square opens it; while open
+    /// its keys are driven by D-pad + Cross.
+    pub(crate) fn toggle_browser_osk(&mut self) {
+        let open = !self.browser.panel.osk.open;
+        self.browser.panel.osk.open = open;
+        if open {
+            self.browser.panel.history_selector = None;
+            self.browser.panel.bookmark_bubble = false;
+            self.note_launcher_activity();
+            self.play_ui_cue(UiSoundKind::Action);
+        }
+    }
+
+    /// Activate one OSK key. Character/space keys commit text; Enter/Backspace
+    /// target the URL draft while editing, otherwise the focused page field.
+    pub(crate) fn osk_activate_key(&mut self, key: crate::ui::browser::OskKey) -> Task<Message> {
+        use crate::ui::browser::OskKey;
+        match key {
+            OskKey::Char(ch) => self.osk_type(&ch.to_string()),
+            OskKey::Space => self.osk_type(" "),
+            OskKey::Backspace => self.osk_backspace(),
+            OskKey::Enter => {
+                if self.browser.panel.url_editing {
+                    self.browser.panel.osk.open = false;
+                    self.on_browser_navigate()
+                } else {
+                    self.osk_named("Enter");
+                    Task::none()
+                }
+            }
+            OskKey::Layer => {
+                self.browser.panel.osk.toggle_layer();
+                Task::none()
+            }
+            OskKey::Close => {
+                self.browser.panel.osk.open = false;
+                Task::none()
+            }
+        }
+    }
+
+    fn osk_type(&mut self, text: &str) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            self.browser.panel.draft.push_str(text);
+            return Task::none();
+        }
+        let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
+        for raw in events {
+            let _ = self.on_browser_key(raw);
+        }
+        Task::none()
+    }
+
+    fn osk_backspace(&mut self) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            self.browser.panel.draft.pop();
+            return Task::none();
+        }
+        self.osk_named("Backspace");
+        Task::none()
+    }
+
+    fn osk_named(&mut self, name: &str) {
+        if let Some(events) =
+            crate::browser::keys::synthetic_named(name, iced::keyboard::Modifiers::empty())
+        {
+            for raw in events {
+                let _ = self.on_browser_key(raw);
+            }
+        }
     }
 
     /// Shared page-pointer move path for hardware and replay injection.
@@ -1529,6 +1670,13 @@ impl super::App {
         if history_open {
             return self.tick_browser_history_selector(readings, tick.action);
         }
+        if self.browser.panel.osk.open {
+            return self.tick_browser_osk(readings, tick.action, now);
+        }
+        if tick.action == Some(NavAction::CycleSort) {
+            self.toggle_browser_osk();
+            return Task::none();
+        }
         if engine_mode {
             self.tick_browser_cursor(readings, now);
             if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
@@ -1655,6 +1803,10 @@ impl super::App {
     /// Circle/Esc at the root unwinds the browser's own modal layers before
     /// closing the window.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
+        if self.browser.panel.osk.open {
+            self.browser.panel.osk.open = false;
+            return Task::none();
+        }
         if self.browser.panel.bookmark_bubble {
             self.browser.panel.bookmark_bubble = false;
             return Task::none();
@@ -1666,6 +1818,62 @@ impl super::App {
             return self.on_browser_message(crate::ui::browser::BrowserMessage::HistoryCancel);
         }
         self.close_browser_window()
+    }
+
+    /// Platform IME events for the page. The URL text field owns IME natively
+    /// while editing; in page mode these become CEF composition/commit calls.
+    pub(crate) fn on_browser_ime(
+        &mut self,
+        id: iced::window::Id,
+        event: iced::advanced::input_method::Event,
+    ) -> Task<Message> {
+        use iced::advanced::input_method::Event;
+        if Some(id) != self.browser_window
+            || !self.browser_visible
+            || self.browser.panel.url_editing
+        {
+            return Task::none();
+        }
+        let tab = self.browser_tab();
+        let Some(engine) = &self.browser.engine else {
+            return Task::none();
+        };
+        match event {
+            Event::Opened => {}
+            Event::Closed => {
+                engine.send(EngineCommand::ImeCancelComposition { tab });
+            }
+            Event::Preedit(text, _) => {
+                crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.ime")
+                    .field("kind", "preedit")
+                    .field("len", text.chars().count())
+                    .emit();
+                if text.is_empty() {
+                    engine.send(EngineCommand::ImeCancelComposition { tab });
+                } else {
+                    engine.send(EngineCommand::ImeSetComposition { tab, text });
+                }
+            }
+            Event::Commit(text) => {
+                crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.ime")
+                    .field("kind", "commit")
+                    .field("len", text.chars().count())
+                    .emit();
+                if text.is_empty() {
+                    engine.send(EngineCommand::ImeFinishComposition { tab });
+                } else {
+                    // CEF's windowless commit path is unreliable on Windows;
+                    // stage the committed text as a composition and finish it,
+                    // which inserts the same text through the stable path.
+                    engine.send(EngineCommand::ImeSetComposition {
+                        tab,
+                        text: text.clone(),
+                    });
+                    engine.send(EngineCommand::ImeFinishComposition { tab });
+                }
+            }
+        }
+        Task::none()
     }
 
     /// Keyboard while the standalone Browser window has focus.
@@ -1680,6 +1888,10 @@ impl super::App {
                 return Task::none();
             }
             return self.browser_cancel();
+        }
+        if raw.pressed && matches!(raw.key, Key::Named(Named::F6)) {
+            self.toggle_browser_osk();
+            return Task::none();
         }
         // The address field owns printable input natively while editing.
         if self.browser.panel.url_editing {

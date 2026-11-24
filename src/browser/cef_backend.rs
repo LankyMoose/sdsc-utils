@@ -927,7 +927,7 @@ cef::wrap_life_span_handler! {
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             _popup_id: std::os::raw::c_int,
-            _target_url: Option<&CefString>,
+            target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
             _user_gesture: std::os::raw::c_int,
@@ -938,9 +938,27 @@ cef::wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut std::os::raw::c_int>,
         ) -> std::os::raw::c_int {
-            // Engine-created tabs (window.open / target=_blank) need their own
-            // UI-side tab adoption; deny until that lands rather than leaking
-            // an untracked browser.
+            // Cancel the native popup browser: OSR popups would need a second
+            // client/context and their own worker plumbing. The shell opens
+            // the URL in a normal Browser tab instead.
+            let url = target_url
+                .map(|url| url.to_string())
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| "about:blank".to_string());
+            // A trusted link click stays pending until a navigation starts;
+            // a popup opens elsewhere, so the JS fallback must not fire too.
+            *self
+                .ctx
+                .pending_click
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            trace_engine(&self.ctx, "popup.request")
+                .field("url", &url)
+                .emit();
+            self.ctx.handle.emit(EngineEvent::PopupRequested {
+                source: self.ctx.tab,
+                url,
+            });
             1
         }
 
@@ -1984,6 +2002,66 @@ impl Worker {
                         dx,
                         dy,
                     );
+                }
+            }
+            EngineCommand::ImeSetComposition { tab, text } => {
+                if let Some(entry) = self.tab(tab)
+                    && let Some(browser) = entry.ctx.browser.get()
+                    && let Some(host) = browser.host()
+                {
+                    let text: CefString = text.as_str().into();
+                    let len = text.to_string().encode_utf16().count() as u32;
+                    let underlines = [CompositionUnderline {
+                        range: Range { from: 0, to: len },
+                        color: 0xFF00_0000,
+                        background_color: 0,
+                        thick: 0,
+                        ..CompositionUnderline::default()
+                    }];
+                    let selection = Range { from: len, to: len };
+                    let replacement = Range {
+                        from: u32::MAX,
+                        to: u32::MAX,
+                    };
+                    trace_engine(&entry.ctx, "ime")
+                        .field("kind", "set")
+                        .field("len", len)
+                        .emit();
+                    host.ime_set_composition(
+                        Some(&text),
+                        Some(&underlines),
+                        Some(&replacement),
+                        Some(&selection),
+                    );
+                }
+            }
+            EngineCommand::ImeCommitText { tab, text } => {
+                if let Some(entry) = self.tab(tab)
+                    && let Some(browser) = entry.ctx.browser.get()
+                    && let Some(host) = browser.host()
+                {
+                    let text: CefString = text.as_str().into();
+                    trace_engine(&entry.ctx, "ime")
+                        .field("kind", "commit")
+                        .field("len", text.to_string().encode_utf16().count())
+                        .emit();
+                    host.ime_commit_text(Some(&text), None, 0);
+                }
+            }
+            EngineCommand::ImeFinishComposition { tab } => {
+                if let Some(entry) = self.tab(tab)
+                    && let Some(browser) = entry.ctx.browser.get()
+                    && let Some(host) = browser.host()
+                {
+                    host.ime_finish_composing_text(0);
+                }
+            }
+            EngineCommand::ImeCancelComposition { tab } => {
+                if let Some(entry) = self.tab(tab)
+                    && let Some(browser) = entry.ctx.browser.get()
+                    && let Some(host) = browser.host()
+                {
+                    host.ime_cancel_composition();
                 }
             }
             EngineCommand::ReseedDom { tab } => {

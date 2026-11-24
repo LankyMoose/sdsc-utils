@@ -1,59 +1,54 @@
-# On-screen keyboard (plan, not built)
+# On-screen keyboard and page IME (built)
 
-**Status:** design only. **When to read:** adding controller text entry to
-the browser (or anywhere else). After Home pivot
-([browser-home-pivot.md](browser-home-pivot.md)) the OSK belongs to the Browser
-app's own window, not Launcher.
+**Status:** functional, intentionally plain. **When to read:** changing text
+entry in the Browser (page fields or URL bar).
 
-## Goal
+## What exists
 
-Controller-only text entry, URL bar first. Physical keyboards keep working
-unchanged (the address field is a real `text_input`); the OSK is a parallel
-commit path, not a replacement.
+- **On-screen keyboard overlay** (`ui::browser::OskState` + `browser_osk`
+  in `ui/browser/view.rs`). Square toggles it from the Browser surface
+  (F6 on a hardware keyboard). While open:
+  - D-pad moves the key focus (the existing D-pad purchase stepper),
+  - Cross activates the focused key,
+  - Triangle backspaces,
+  - Square switches Alpha/Symbol,
+  - Circle/Esc closes.
+- Keys are ordinary iced buttons, so the mouse can click them too.
+- Character and Space keys append to the URL draft while URL editing, else
+  they synthesize page key events through the same `on_browser_key` path as
+  hardware input.
+- Enter navigates the URL draft or sends Enter to the page; Backspace edits
+  the draft or sends Backspace.
+- The overlay is modal for pad input and hides the virtual ring. Physical
+  keyboard input keeps working while it is open.
 
-## Why a surface, not a widget trick
+## Page IME
 
-Launcher already composites modal surfaces over the stage with one owner at a
-time (`HintPressOwner`, overlay priority in `notes/launcher-immersive.md`).
-After the pivot the Browser app owns its own window and the same modal-surface
-pattern; the OSK becomes one more Browser surface (`OskPanel` next to the
-browser panel), so pad ownership, Cancel-unwind, and idle-dim keep working
-unchanged.
+- `ui::input_method::ime_bridge` wraps the Browser root and asks iced/winit to
+  enable the platform IME while the page owns input (not URL editing and not
+  an automated session).
+- `iced::Event::InputMethod` events are routed to `on_browser_ime`:
+  - preedit → `EngineCommand::ImeSetComposition`,
+  - empty preedit/closed → `ImeCancelComposition`,
+  - commit → stage the text as a composition and finish it.
+- CEF's windowless `ImeCommitText` path did not insert text in the observed
+  156 runtime, so commit uses `ImeSetComposition` + `ImeFinishComposition`
+  with an invalid replacement range (`u32::MAX..u32::MAX`) meaning "current
+  selection". That inserts at the caret instead of position 0.
+- Composition underlines are a single full-text span; visual polish and
+  candidate-window placement are intentionally minimal.
 
-## Proposed shape (URL bar, phase 1)
+## Automation
 
-- Grid QWERTY (3 rows + space row), one symbols layer toggled in place.
-  Wheel layouts (retsurf-style) are nicer on sticks but cost a custom
-  canvas; grid reuses buttons and the existing focus-chase patterns.
-- State: `open: bool`, `focus: (row, col)`, `layer: Alpha | Symbol`.
-  Lives in the Browser app's panel while URL-only; promotes to its own
-  `State` field if page-field IME ever needs it.
-- Pad while open (owns input like the browser surface does):
-  D-pad moves cell focus (wrap), Cross commits the char into the URL draft
-  (`BrowserUrlChanged`), Square toggles Alpha/Symbol, Triangle backspaces,
-  Circle closes (draft kept). Cross on `Go`/`space` wide keys behaves the
-  same as a commit.
-- Rendering: centered card above the browser wash (same `overlay` builder),
-  below the settings drawer. Hint row shows the OSK bindings via a new
-  `HintPressOwner::Osk` so the browser hints go idle underneath.
-- Coexistence with physical typing: commits go through `BrowserUrlChanged`,
-  the same message the hardware path uses — both can interleave and the
-  last writer wins per keystroke, exactly like pad-vs-mouse today.
+- `SDSC_DEBUG_INPUT=0` locks real IME/keyboard/mouse input through
+  `ui::input_lock`.
+- Replay steps `ime.preedit`, `ime.commit`, `osk.toggle`, and `osk.key` call
+  the same handlers with synthetic events. `scripts/qa_browser_input.py`
+  verifies typed text (`hello`), IME commit (`é`), OSK commit (`!`), wheel
+  scroll, drag/double-click selection, and cursor-shape tracing without using
+  the OS keyboard/mouse.
 
-## Explicitly deferred
+## Deferred
 
-- Page-field IME (`InputEvent::InputMethod` / `notify_input_method`): needs
-  engine focus tracking (`notify_focus_changed` → which element) plus an
-  OSK mode that commits into the page instead of the draft. URL-first keeps
-  the engine side to key events only.
-- Character layouts beyond QWERTY + symbols (retsurf ships ЙЦУКЕН too):
-  add when a second handheld locale asks for it, not before.
-- Predictive text / clipboard: out of scope for a URL bar.
-
-## Build order (when approved)
-
-1. `OskPanel` + messages (`ToggleOsk`, `OskCommit(char)`, focus moves as
-   plain pad nav inside the surface, no `NavAction` changes).
-2. `osk_view` card + overlay layer + `HintPressOwner::Osk`.
-3. Wire Triangle (browser surface) / long-press? to open; Circle closes.
-4. Tests: focus wrap, layer toggle, commit appends, close keeps draft.
+- Predictive text, clipboard history, alternate layouts beyond QWERTY +
+  symbols, pretty key art, and native OSK-touch-keyboard integration.

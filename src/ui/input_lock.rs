@@ -30,7 +30,7 @@ where
 fn is_input_event(event: &Event) -> bool {
     matches!(
         event,
-        Event::Mouse(_) | Event::Touch(_) | Event::Keyboard(_)
+        Event::Mouse(_) | Event::Touch(_) | Event::Keyboard(_) | Event::InputMethod(_)
     )
 }
 
@@ -209,6 +209,9 @@ mod tests {
                 text: None,
                 repeat: false,
             }
+        )));
+        assert!(is_input_event(&Event::InputMethod(
+            iced::advanced::input_method::Event::Commit("x".to_string())
         )));
         assert!(!is_input_event(&Event::Window(
             iced::window::Event::Unfocused

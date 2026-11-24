@@ -11,6 +11,7 @@ pub mod face;
 pub mod home;
 pub mod icon;
 pub mod input_lock;
+pub mod input_method;
 pub mod launcher;
 pub mod layout;
 pub mod motion;

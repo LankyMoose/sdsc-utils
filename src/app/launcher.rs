@@ -1757,7 +1757,32 @@ impl App {
         if self.browser.engine.is_none() {
             return self.on_browser_go_default();
         }
-        let url = crate::browser::BROWSER_DEFAULT_URL.to_string();
+        self.open_browser_tab(crate::browser::BROWSER_DEFAULT_URL.to_string())
+    }
+
+    /// `window.open` / `target=_blank` from the page: open the requested URL
+    /// in a normal foreground tab. The native popup browser is canceled in the
+    /// CEF life-span handler.
+    pub(crate) fn on_browser_open_url_in_new_tab(&mut self, url: String) -> Task<Message> {
+        if !self.browser_visible {
+            return Task::none();
+        }
+        let url = if url.trim().is_empty() {
+            "about:blank".to_string()
+        } else {
+            url
+        };
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.popup_open")
+            .field("url", &url)
+            .emit();
+        if self.browser.engine.is_none() {
+            self.browser.panel.draft = url;
+            return self.on_browser_navigate();
+        }
+        self.open_browser_tab(url)
+    }
+
+    fn open_browser_tab(&mut self, url: String) -> Task<Message> {
         let (tab, generation, frame) = {
             let panel = &mut self.browser.panel;
             panel.stash_live();
@@ -1768,6 +1793,10 @@ impl App {
             panel.active_tab = tab;
             panel.order.push(tab);
             panel.draft = url.clone();
+            panel.history_selector = None;
+            panel.bookmark_bubble = false;
+            panel.url_editing = false;
+            panel.osk.open = false;
             let generation = panel.page.session.begin_load(url.clone());
             panel.rebuild_chrome();
             panel.save_tabs();
@@ -1997,6 +2026,9 @@ impl App {
             EngineEvent::TabOpened { tab, slot } => return self.on_tab_opened(tab, slot),
             EngineEvent::FrameSlot { tab, slot } => return self.on_frame_slot(tab, slot),
             EngineEvent::TabClosed { tab } => return self.on_tab_closed(tab),
+            EngineEvent::PopupRequested { url, .. } => {
+                return self.on_browser_open_url_in_new_tab(url);
+            }
             _ => {}
         }
         let tab = event.tab().expect("tab-carrying event checked above");
@@ -2007,7 +2039,8 @@ impl App {
         match event {
             EngineEvent::FrameSlot { .. }
             | EngineEvent::TabOpened { .. }
-            | EngineEvent::TabClosed { .. } => {}
+            | EngineEvent::TabClosed { .. }
+            | EngineEvent::PopupRequested { .. } => {}
             EngineEvent::Frame(frame) => {
                 if !self.browser.panel.session.is_open() {
                     return Task::none();
@@ -2293,6 +2326,7 @@ impl App {
                 | EngineEvent::FrameSlot { .. }
                 | EngineEvent::TabOpened { .. }
                 | EngineEvent::TabClosed { .. }
+                | EngineEvent::PopupRequested { .. }
                 | EngineEvent::HistoryJumpFailed { .. }
                 | EngineEvent::CursorChanged { .. } => {}
             }

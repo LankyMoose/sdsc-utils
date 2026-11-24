@@ -122,6 +122,9 @@ synthetic input steps for automation:
   selection.
 - `mouse.wheel` — `{"x": 300, "y": 400, "dy": -240}` wheels at page-local
   coordinates.
+- `ime.preedit` / `ime.commit` — `{"text": "é"}` drive the page IME path.
+- `osk.toggle` / `osk.key` — `{"char": "!"}` open/close and commit through
+  the on-screen keyboard.
 
 Input steps call the real browser handlers with explicit page coordinates;
 they never use the OS keyboard, mouse, cursor position, or window focus. The
@@ -138,6 +141,8 @@ Home.
 `python scripts/qa_browser_input.py` is the checked-in smoke test: it builds a
 local page, runs these synthetic steps, asserts typed text / wheel scroll /
 drag selection / cursor-shape trace, and kills the process immediately.
+`python scripts/qa_browser_popup.py` does the same for target=_blank popups
+becoming a second Browser tab.
 
 ## Adding instrumentation
 
@@ -195,6 +200,9 @@ Rules:
   (named key only); typed characters are never logged.
 - `engine.cursor` records CEF page cursor-shape changes (link hand, text
   I-beam, resize, etc.).
+- `engine.popup.request` records a canceled native popup and the URL the shell
+  opens as a tab; `browser.popup_open` marks the tab creation. `engine.ime`
+  and `browser.ime` record composition text length (never the text).
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).

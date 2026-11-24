@@ -130,6 +130,199 @@ pub struct StoredTab {
     pub loaded: bool,
 }
 
+/// One on-screen keyboard key. Character keys commit text; the rest are
+/// editing/control actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OskKey {
+    Char(char),
+    Space,
+    Backspace,
+    Enter,
+    Layer,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OskLayer {
+    #[default]
+    Alpha,
+    Symbol,
+}
+
+const OSK_ALPHA: &[&[OskKey]] = &[
+    &[
+        OskKey::Char('q'),
+        OskKey::Char('w'),
+        OskKey::Char('e'),
+        OskKey::Char('r'),
+        OskKey::Char('t'),
+        OskKey::Char('y'),
+        OskKey::Char('u'),
+        OskKey::Char('i'),
+        OskKey::Char('o'),
+        OskKey::Char('p'),
+    ],
+    &[
+        OskKey::Char('a'),
+        OskKey::Char('s'),
+        OskKey::Char('d'),
+        OskKey::Char('f'),
+        OskKey::Char('g'),
+        OskKey::Char('h'),
+        OskKey::Char('j'),
+        OskKey::Char('k'),
+        OskKey::Char('l'),
+    ],
+    &[
+        OskKey::Char('z'),
+        OskKey::Char('x'),
+        OskKey::Char('c'),
+        OskKey::Char('v'),
+        OskKey::Char('b'),
+        OskKey::Char('n'),
+        OskKey::Char('m'),
+    ],
+    &[
+        OskKey::Layer,
+        OskKey::Space,
+        OskKey::Backspace,
+        OskKey::Enter,
+        OskKey::Close,
+    ],
+];
+
+const OSK_SYMBOL: &[&[OskKey]] = &[
+    &[
+        OskKey::Char('1'),
+        OskKey::Char('2'),
+        OskKey::Char('3'),
+        OskKey::Char('4'),
+        OskKey::Char('5'),
+        OskKey::Char('6'),
+        OskKey::Char('7'),
+        OskKey::Char('8'),
+        OskKey::Char('9'),
+        OskKey::Char('0'),
+    ],
+    &[
+        OskKey::Char('-'),
+        OskKey::Char('/'),
+        OskKey::Char(':'),
+        OskKey::Char(';'),
+        OskKey::Char('('),
+        OskKey::Char(')'),
+        OskKey::Char('$'),
+        OskKey::Char('&'),
+        OskKey::Char('@'),
+        OskKey::Char('"'),
+    ],
+    &[
+        OskKey::Char('.'),
+        OskKey::Char(','),
+        OskKey::Char('?'),
+        OskKey::Char('!'),
+        OskKey::Char('\''),
+        OskKey::Char('#'),
+        OskKey::Char('%'),
+        OskKey::Char('+'),
+        OskKey::Char('='),
+    ],
+    &[
+        OskKey::Layer,
+        OskKey::Space,
+        OskKey::Backspace,
+        OskKey::Enter,
+        OskKey::Close,
+    ],
+];
+
+/// Controller-driven on-screen keyboard for page/URL text entry.
+#[derive(Debug, Clone, Default)]
+pub struct OskState {
+    pub open: bool,
+    pub focus: usize,
+    pub layer: OskLayer,
+}
+
+impl OskState {
+    pub fn rows(&self) -> &'static [&'static [OskKey]] {
+        match self.layer {
+            OskLayer::Alpha => OSK_ALPHA,
+            OskLayer::Symbol => OSK_SYMBOL,
+        }
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.rows().iter().map(|row| row.len()).sum()
+    }
+
+    pub fn focus_key(&self) -> OskKey {
+        self.rows()
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .nth(self.focus)
+            .unwrap_or(OskKey::Close)
+    }
+
+    pub fn move_focus(&mut self, direction: crate::browser::cursor::JumpDir) {
+        use crate::browser::cursor::JumpDir;
+        let rows = self.rows();
+        let mut start = 0;
+        let mut position = (0usize, 0usize);
+        for (r, row) in rows.iter().enumerate() {
+            if self.focus < start + row.len() {
+                position = (r, self.focus - start);
+                break;
+            }
+            start += row.len();
+        }
+        let (mut row, mut col) = position;
+        match direction {
+            JumpDir::Left => {
+                let len = rows[row].len();
+                col = if col == 0 { len - 1 } else { col - 1 };
+            }
+            JumpDir::Right => {
+                let len = rows[row].len();
+                col = (col + 1) % len;
+            }
+            JumpDir::Up => {
+                row = row.saturating_sub(1);
+                col = col.min(rows[row].len() - 1);
+            }
+            JumpDir::Down => {
+                row = (row + 1).min(rows.len() - 1);
+                col = col.min(rows[row].len() - 1);
+            }
+        }
+        self.focus = rows.iter().take(row).map(|r| r.len()).sum::<usize>() + col;
+    }
+
+    pub fn toggle_layer(&mut self) {
+        self.layer = match self.layer {
+            OskLayer::Alpha => OskLayer::Symbol,
+            OskLayer::Symbol => OskLayer::Alpha,
+        };
+        self.focus = self.focus.min(self.key_count().saturating_sub(1));
+    }
+}
+
+impl OskKey {
+    pub fn label(self, layer: OskLayer) -> String {
+        match self {
+            OskKey::Char(ch) => ch.to_string(),
+            OskKey::Space => "Space".to_string(),
+            OskKey::Backspace => "Bksp".to_string(),
+            OskKey::Enter => "Enter".to_string(),
+            OskKey::Layer => match layer {
+                OskLayer::Alpha => "123".to_string(),
+                OskLayer::Symbol => "abc".to_string(),
+            },
+            OskKey::Close => "Close".to_string(),
+        }
+    }
+}
+
 /// Browser app panel. The URL draft and body scroll offset live
 /// here; load lifecycle (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
@@ -173,6 +366,8 @@ pub struct BrowserPanel {
     pub page_cursor: crate::browser::engine::BrowserCursor,
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
+    /// On-screen keyboard overlay (controller text entry).
+    pub osk: OskState,
     /// Last dock transition (None→Some) wall-clock, for settled dock shots.
     /// Dock-triggered shots wait ~300ms so the morph completes first —
     /// shooting on the dock tick only ever captures a half-morphed wrap
@@ -255,6 +450,7 @@ impl Default for BrowserPanel {
             page_click_count: 1,
             page_cursor: crate::browser::engine::BrowserCursor::Default,
             last_shot: None,
+            osk: OskState::default(),
             last_dock_change: None,
             js_click: false,
             r3_latched: false,
@@ -1227,5 +1423,26 @@ mod tests {
         let (dx, dy) = step(&mut panel, 0.2, -0.9, false, at);
         assert_eq!((dx, dy), (0.0, 0.0));
         assert_eq!(panel.scroll_axis, None);
+    }
+
+    #[test]
+    fn osk_focus_wraps_and_layers_keep_the_cursor_in_range() {
+        use crate::browser::cursor::JumpDir;
+        let mut osk = OskState::default();
+        assert_eq!(osk.focus_key(), OskKey::Char('q'));
+        osk.move_focus(JumpDir::Left);
+        assert_eq!(osk.focus_key(), OskKey::Char('p'));
+        osk.move_focus(JumpDir::Down);
+        assert_eq!(osk.focus_key(), OskKey::Char('l'));
+        osk.move_focus(JumpDir::Down);
+        assert_eq!(osk.focus_key(), OskKey::Char('m'));
+        osk.move_focus(JumpDir::Down);
+        assert_eq!(osk.focus_key(), OskKey::Close);
+        osk.move_focus(JumpDir::Up);
+        assert_eq!(osk.focus_key(), OskKey::Char('b'));
+        osk.toggle_layer();
+        assert_eq!(osk.layer, OskLayer::Symbol);
+        assert!(osk.focus < osk.key_count());
+        assert_eq!(OskKey::Layer.label(osk.layer), "abc");
     }
 }

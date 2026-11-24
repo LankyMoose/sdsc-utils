@@ -134,12 +134,19 @@ meters still use the legacy per-surface bank.
   selection, drag selection, and native CEF wheel (lines × 120); CEF cursor
   shapes drive the OS cursor over the page. Right/middle click and a custom
   context menu are still unwired.
+- Page `window.open` / `target=_blank` is canceled as a native popup and
+  opened as a normal foreground tab instead. The source tab is preserved.
+- The on-screen keyboard (Square, or F6 on a hardware keyboard) types into
+  the focused page field or the URL draft; page IME flows through
+  `ime_bridge` and CEF composition calls. See
+  [browser-osk.md](browser-osk.md).
 - Automated sessions set `SDSC_DEBUG_INPUT=0`, which locks real pad,
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also
   suppress the startup toast and controller auto-open Home. Replay drives the
   same handlers through synthetic `text`, `key`, `mouse.click`, `mouse.drag`,
-  and `mouse.wheel` steps and closes the Browser window at `replay.done`;
-  never use OS input injection for QA and do not leave test windows on screen.
+  `mouse.wheel`, `ime.*`, and `osk.*` steps and closes the Browser window at
+  `replay.done`; never use OS input injection for QA and do not leave test
+  windows on screen.
 - Tabs: favicon (CEF icon URLs, 64px cache keyed by origin) + minimum-width
   title + close, active highlighted; crowded strips switch to an overflow
   chip instead of collapsing titles. Background tabs suspend, strip
@@ -191,8 +198,6 @@ CEF toolchain needs the pinned compiler.
 - **Sandbox off**: `CefSettings.no_sandbox = 1` in the dev backend; enabling
   it needs the Windows bootstrap/helper path and the static CRT (already in
   place).
-- **Popups denied**: `window.open`/`target=_blank` are canceled until the UI
-  adopts engine-created tabs.
 - **History is canonical**: `GetNavigationEntries` snapshots replace the
   URL-change inference; the UI stack is a projection. Selector jumps resolve
   the CDP entry id and call `Page.navigateToHistoryEntry` (exact index,
@@ -204,6 +209,5 @@ CEF toolchain needs the pinned compiler.
 - **Accelerated OSR not wired**: L1 CPU `OnPaint` only; `OnAcceleratedPaint`
   shared-texture import is the L2 performance step.
 - **macOS/Linux untested** for the CEF backend.
-- Page-field IME/OSK still unbuilt ([browser-osk.md](browser-osk.md)).
 - `notes/wgpu-image-atlas-crash.md` Crash D (display sleep → surface loss →
   PS button → atlas panic) remains a separate recovery gap.
