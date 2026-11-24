@@ -510,8 +510,19 @@ impl App {
         };
         let url = crate::browser::nav::resolve_navigate_target(&raw);
         if url.is_empty() {
+            self.trace_browser_noop("browser.navigate", "ui", "empty_url");
             return Task::none();
         }
+        let source = if crate::platform::trace::replay::replaying() {
+            "replay"
+        } else {
+            "ui"
+        };
+        let flow = if self.browser.engine.is_some() {
+            self.begin_browser_action_trace("browser.navigate", source, None, Some(url.clone()))
+        } else {
+            None
+        };
         self.browser.panel.draft = url.clone();
         self.browser.panel.scroll_y = 0.0;
         self.browser.panel.url_editing = false;
@@ -523,24 +534,55 @@ impl App {
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.focusables.clear();
         let generation = self.browser.panel.session.begin_load(url.clone());
+        if let Some(pending) = self.pending_browser_trace.as_mut() {
+            pending.generation = Some(generation);
+        }
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
-        crate::controller::hid::diag::diag_info("ui-diag: browser navigate");
-        let Some(engine) = &self.browser.engine else {
+        if self.browser.engine.is_none() {
             // The engine is mandatory in phase 4; Home tile handles the
             // missing-engine install flow before a window ever opens.
             self.browser
                 .panel
                 .session
                 .apply_failed(generation, "Browser engine not installed".to_string());
+            crate::platform::trace::action(
+                crate::platform::trace::Lane::Browser,
+                "browser.navigate",
+            )
+            .app("browser")
+            .source("ui")
+            .field("url", &url)
+            .pre(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .begin()
+            .finish("failed")
+            .field("reason", "engine_unavailable")
+            .post(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .emit();
             return Task::none();
-        };
+        }
         let tab = self.browser_tab();
-        engine.send(EngineCommand::Navigate {
-            tab,
-            url,
-            generation,
-        });
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", "Navigate")
+                .field("tab", tab.0)
+                .field("generation", generation)
+                .field("url", &url)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            EngineCommand::Navigate {
+                tab,
+                url,
+                generation,
+            },
+        );
         self.sync_browser_theme();
         Task::none()
     }
@@ -629,37 +671,83 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
-        let session = &self.browser.panel.session;
-        let (Some(current), true) = (session.nav_current(), session.can_go_back()) else {
-            return Task::none();
-        };
+    /// Resolve the adjacent history target without mutating state.
+    fn browser_adjacent_target(&self, back: bool) -> Result<(usize, Option<String>), &'static str> {
         if self.browser.engine.is_none() {
-            return Task::none();
+            return Err("engine_unavailable");
         }
-        let target = current - 1;
+        let session = &self.browser.panel.session;
+        let Some(current) = session.nav_current() else {
+            return Err("no_stack");
+        };
+        if back {
+            if !session.can_go_back() {
+                return Err("no_back_entry");
+            }
+            let target = current - 1;
+            Ok((target, session.nav_entry(target).map(|e| e.url.clone())))
+        } else {
+            if !session.can_go_forward() {
+                return Err("no_forward_entry");
+            }
+            let target = current + 1;
+            Ok((target, session.nav_entry(target).map(|e| e.url.clone())))
+        }
+    }
+
+    pub(crate) fn on_browser_go_back(&mut self) -> Task<Message> {
+        let (target, target_url) = match self.browser_adjacent_target(true) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.trace_browser_noop("browser.history.back", "pad", reason);
+                return Task::none();
+            }
+        };
+        let flow = self.begin_browser_action_trace(
+            "browser.history.back",
+            "pad",
+            Some(target),
+            target_url,
+        );
         self.browser.panel.session.begin_history_travel(target);
-        if let Some(engine) = &self.browser.engine {
-            let tab = self.browser_tab();
-            engine.send(EngineCommand::GoBack { tab, steps: 1 });
+        let tab = self.browser_tab();
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", "GoBack")
+                .field("tab", tab.0)
+                .field("steps", 1)
+                .emit();
         }
+        self.send_engine_traced(flow, EngineCommand::GoBack { tab, steps: 1 });
         Task::none()
     }
 
     pub(crate) fn on_browser_go_forward(&mut self) -> Task<Message> {
-        let session = &self.browser.panel.session;
-        let (Some(current), true) = (session.nav_current(), session.can_go_forward()) else {
-            return Task::none();
+        let (target, target_url) = match self.browser_adjacent_target(false) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.trace_browser_noop("browser.history.forward", "pad", reason);
+                return Task::none();
+            }
         };
-        if self.browser.engine.is_none() {
-            return Task::none();
-        }
-        let target = current + 1;
+        let flow = self.begin_browser_action_trace(
+            "browser.history.forward",
+            "pad",
+            Some(target),
+            target_url,
+        );
         self.browser.panel.session.begin_history_travel(target);
-        if let Some(engine) = &self.browser.engine {
-            let tab = self.browser_tab();
-            engine.send(EngineCommand::GoForward { tab, steps: 1 });
+        let tab = self.browser_tab();
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", "GoForward")
+                .field("tab", tab.0)
+                .field("steps", 1)
+                .emit();
         }
+        self.send_engine_traced(flow, EngineCommand::GoForward { tab, steps: 1 });
         Task::none()
     }
 
@@ -670,9 +758,11 @@ impl App {
     /// closest entry — the quick-press target.
     pub(crate) fn on_browser_history_open(&mut self, back: bool) -> Task<Message> {
         if !self.browser.panel.session.is_open() {
+            self.trace_browser_noop("browser.history.open", "pad", "surface_closed");
             return Task::none();
         }
         if self.browser.panel.history_selector.is_some() {
+            self.trace_browser_noop("browser.history.open", "pad", "already_open");
             return Task::none();
         }
         let has = if back {
@@ -681,16 +771,52 @@ impl App {
             self.browser.panel.session.can_go_forward()
         };
         if !has {
+            self.trace_browser_noop(
+                "browser.history.open",
+                "pad",
+                if back {
+                    "no_back_entry"
+                } else {
+                    "no_forward_entry"
+                },
+            );
             return Task::none();
         }
+        let source = if crate::platform::trace::replay::replaying() {
+            "replay"
+        } else {
+            "pad"
+        };
+        let trace = crate::platform::trace::action(
+            crate::platform::trace::Lane::Browser,
+            "browser.history.open",
+        )
+        .app("browser")
+        .source(source)
+        .field("back", back)
+        .pre(crate::app::browser::trace_browser_state(
+            &self.browser.panel,
+        ))
+        .repro(serde_json::json!({
+            "app": "browser",
+            "action": "history.open",
+            "params": { "back": back },
+        }))
+        .begin();
         self.browser.panel.history_selector =
             Some(crate::ui::browser::HistorySelector { back, highlight: 0 });
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
-        crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: browser history selector open {}",
-            if back { "back" } else { "forward" }
-        ));
+        trace
+            .finish("opened")
+            .post(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .check(
+                "selector_open",
+                self.browser.panel.history_selector.is_some(),
+            )
+            .emit();
         Task::none()
     }
 
@@ -701,49 +827,119 @@ impl App {
     /// and swallows an in-flight Cross press so the confirming release
     /// cannot also click the fresh page.
     pub(crate) fn on_browser_history_pick(&mut self, index: usize) -> Task<Message> {
-        let session = &self.browser.panel.session;
-        let Some(current) = session.nav_current() else {
+        let prepared = {
+            let session = &self.browser.panel.session;
+            match (session.nav_current(), session.nav_entry(index)) {
+                (Some(current), Some(entry)) => Some((current, entry.url.clone())),
+                _ => None,
+            }
+        };
+        let Some((current, url)) = prepared else {
+            self.trace_browser_noop("browser.history.pick", "pad", "missing_entry");
             return Task::none();
         };
-        let url = match session.nav_entry(index) {
-            Some(entry) => entry.url.clone(),
-            None => return Task::none(),
-        };
-        self.browser.panel.history_selector = None;
-        self.browser.panel.draft = url;
-        if index == current {
-            return Task::none();
-        }
         if self.browser.engine.is_none() {
+            self.trace_browser_noop("browser.history.pick", "pad", "engine_unavailable");
             // Reader fallback has no session-history traversal; keep the
             // old fetch path (forward tail may prune there).
+            self.browser.panel.history_selector = None;
+            self.browser.panel.draft = url;
             return self.on_browser_navigate();
+        }
+        if index == current {
+            let pre = crate::app::browser::trace_browser_state(&self.browser.panel);
+            self.browser.panel.history_selector = None;
+            self.browser.panel.draft = url;
+            crate::platform::trace::action(
+                crate::platform::trace::Lane::Browser,
+                "browser.history.pick",
+            )
+            .app("browser")
+            .source("pad")
+            .field("requested_index", index)
+            .field("requested_url", self.browser.panel.draft.as_str())
+            .pre(pre)
+            .begin()
+            .finish("noop")
+            .field("reason", "already_current")
+            .post(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .check("already_current", true)
+            .emit();
+            return Task::none();
         }
         let back = index < current;
         let steps = index.abs_diff(current);
+        let flow = self.begin_browser_action_trace(
+            "browser.history.pick",
+            "pad",
+            Some(index),
+            Some(url.clone()),
+        );
+        self.browser.panel.history_selector = None;
+        self.browser.panel.draft = url;
         self.browser.panel.session.begin_history_travel(index);
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
-        if let Some(engine) = &self.browser.engine {
-            let tab = self.browser_tab();
-            engine.send(if back {
+        let tab = self.browser_tab();
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", if back { "GoBack" } else { "GoForward" })
+                .field("tab", tab.0)
+                .field("steps", steps)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            if back {
                 EngineCommand::GoBack { tab, steps }
             } else {
                 EngineCommand::GoForward { tab, steps }
-            });
-        }
+            },
+        );
         Task::none()
     }
 
     /// Browser: dismiss the history selector without navigating.
     pub(crate) fn on_browser_history_cancel(&mut self) -> Task<Message> {
         if self.browser.panel.history_selector.is_none() {
+            self.trace_browser_noop("browser.history.cancel", "pad", "not_open");
             return Task::none();
         }
+        let source = if crate::platform::trace::replay::replaying() {
+            "replay"
+        } else {
+            "pad"
+        };
+        let trace = crate::platform::trace::action(
+            crate::platform::trace::Lane::Browser,
+            "browser.history.cancel",
+        )
+        .app("browser")
+        .source(source)
+        .pre(crate::app::browser::trace_browser_state(
+            &self.browser.panel,
+        ))
+        .repro(serde_json::json!({
+            "app": "browser",
+            "action": "history.cancel",
+        }))
+        .begin();
         self.browser.panel.history_selector = None;
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Action);
-        crate::controller::hid::diag::diag_info("ui-diag: browser history selector cancel");
+        trace
+            .finish("cancelled")
+            .post(crate::app::browser::trace_browser_state(
+                &self.browser.panel,
+            ))
+            .check(
+                "selector_closed",
+                self.browser.panel.history_selector.is_none(),
+            )
+            .emit();
         Task::none()
     }
 
@@ -1404,6 +1600,7 @@ impl App {
         saved: crate::browser::tabs::SavedTabs,
     ) -> Task<Message> {
         use crate::browser::engine::TabId;
+        crate::platform::trace::manifest("browser_tabs", &saved);
         let mut tabs: Vec<crate::browser::tabs::SavedTab> = saved
             .tabs
             .into_iter()
@@ -1839,6 +2036,8 @@ impl App {
                 // A new document underneath invalidates the selector's
                 // snapshot (link click, redirect, history travel).
                 self.browser.panel.history_selector = None;
+                let actual_url = self.browser.panel.session.url().to_string();
+                self.settle_browser_history_trace_for_url(&actual_url, "url_changed");
             }
             EngineEvent::FaviconChanged {
                 tab: _,
@@ -1896,15 +2095,28 @@ impl App {
             EngineEvent::ActivityChanged { tab: _, phase } => {
                 self.browser.panel.engine_activity = phase;
             }
+            EngineEvent::HistoryCapability {
+                tab: _,
+                can_back,
+                can_forward,
+            } => {
+                self.browser.panel.page.last_engine_can = Some((can_back, can_forward));
+            }
             EngineEvent::HistoryChanged {
                 tab: _,
                 entries,
                 current,
             } => {
+                self.browser.panel.page.last_engine_history =
+                    Some(crate::ui::browser::state::EngineHistorySnapshot {
+                        current,
+                        entries: entries.clone(),
+                    });
                 self.browser
                     .panel
                     .session
                     .note_session_history(entries, current);
+                self.settle_browser_action_trace("settled");
                 // The stack moved under an open selector: clamp the highlight,
                 // close if the direction ran dry.
                 let dir_is_back = self
@@ -1948,14 +2160,23 @@ impl App {
                 tab: _,
                 generation,
                 result,
-            } => match result {
-                Ok(()) => {
-                    self.browser.panel.session.mark_loaded(generation);
+            } => {
+                match result {
+                    Ok(()) => {
+                        self.browser.panel.session.mark_loaded(generation);
+                    }
+                    Err(err) => {
+                        self.browser.panel.session.apply_failed(generation, err);
+                    }
                 }
-                Err(err) => {
-                    self.browser.panel.session.apply_failed(generation, err);
+                let settle = self.pending_browser_trace.as_ref().is_some_and(|pending| {
+                    pending.kind == crate::app::browser::BrowserTraceKind::Navigate
+                        && pending.generation == Some(generation)
+                });
+                if settle {
+                    self.settle_browser_action_trace("load_finished");
                 }
-            },
+            }
         }
         Task::none()
     }
@@ -2019,9 +2240,21 @@ impl App {
                 EngineEvent::ActivityChanged { phase, .. } => {
                     stored.page.engine_activity = phase;
                 }
+                EngineEvent::HistoryCapability {
+                    can_back,
+                    can_forward,
+                    ..
+                } => {
+                    stored.page.last_engine_can = Some((can_back, can_forward));
+                }
                 EngineEvent::HistoryChanged {
                     entries, current, ..
                 } => {
+                    stored.page.last_engine_history =
+                        Some(crate::ui::browser::state::EngineHistorySnapshot {
+                            current,
+                            entries: entries.clone(),
+                        });
                     stored.page.session.note_session_history(entries, current);
                 }
                 EngineEvent::FocusChanged { id, .. } => {
@@ -2732,6 +2965,13 @@ impl App {
         let actions =
             self.pad_actions
                 .begin(edge.seq, reset_arming, &edge.readings, &edge.actions)?;
+        if !edge.actions.is_empty() && actions.is_empty() {
+            crate::platform::trace::event(crate::platform::trace::Lane::Input, "pad.gated")
+                .field("owner", format!("{owner:?}"))
+                .field("edge_seq", edge.seq)
+                .field("actions", edge.actions.len())
+                .emit();
+        }
         if owner == PadInputOwner::None {
             self.pending_pad_actions.clear();
         } else {
@@ -2741,6 +2981,31 @@ impl App {
     }
 
     pub(crate) fn on_pad_input(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
+        let trace = if crate::platform::trace::actions_enabled() && !edge.actions.is_empty() {
+            let actions: Vec<String> = edge
+                .actions
+                .iter()
+                .map(|action| format!("{}:{:?}:{:?}", action.pad.0, action.button, action.action))
+                .collect();
+            Some(
+                crate::platform::trace::action(crate::platform::trace::Lane::Input, "pad.action")
+                    .source("pad")
+                    .field("edge_seq", edge.seq)
+                    .field("reason", edge.reason.as_str())
+                    .field("actions", actions)
+                    .begin(),
+            )
+        } else {
+            None
+        };
+        let task = self.on_pad_input_inner(edge);
+        if let Some(trace) = trace {
+            trace.finish("handled").emit();
+        }
+        task
+    }
+
+    fn on_pad_input_inner(&mut self, edge: crate::domain::pad::InputEdge) -> Task<Message> {
         let poll_started = Instant::now();
         let launcher_open = self.launcher_visible;
         // Edge transport is lossy by design (try_send drops when full): log
@@ -2751,13 +3016,12 @@ impl App {
             if let Some(prev) = self.last_edge_seq
                 && edge.seq > prev + 1
             {
-                crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: pad-input edge gap dropped={} expected={} got={} reason={}",
-                    edge.seq - prev - 1,
-                    prev + 1,
-                    edge.seq,
-                    edge.reason.as_str(),
-                ));
+                crate::platform::trace::event(crate::platform::trace::Lane::Input, "pad.gap")
+                    .field("dropped", edge.seq - prev - 1)
+                    .field("expected", prev + 1)
+                    .field("got", edge.seq)
+                    .field("reason", edge.reason.as_str())
+                    .emit();
             }
             self.last_edge_seq = Some(edge.seq);
         } else {
@@ -2772,6 +3036,11 @@ impl App {
         } else {
             PadInputOwner::None
         };
+        crate::platform::trace::event(crate::platform::trace::Lane::Input, "pad.route")
+            .field("owner", format!("{owner:?}"))
+            .field("edge_seq", edge.seq)
+            .field("actions", edge.actions.len())
+            .emit();
         if self.begin_pad_edge(owner, &edge).is_none() {
             return Task::none();
         }

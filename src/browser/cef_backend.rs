@@ -334,6 +334,27 @@ struct TabContext {
     /// Last icon candidate set fetched for this tab (dedupe repeated
     /// `on_favicon_urlchange` notifications).
     favicon_key: Arc<Mutex<String>>,
+    /// Causal flow of the last traced navigation/history command. CEF
+    /// callbacks join engine log lines to the UI action that caused them.
+    trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
+}
+
+impl TabContext {
+    fn trace_flow(&self) -> Option<crate::platform::trace::FlowId> {
+        *self
+            .trace_flow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn trace_engine(ctx: &TabContext, event: &'static str) -> crate::platform::trace::EventBuilder {
+    let mut builder = crate::platform::trace::event(crate::platform::trace::Lane::Engine, event)
+        .field("tab", ctx.tab.0);
+    if let Some(flow) = ctx.trace_flow() {
+        builder = builder.flow(flow);
+    }
+    builder
 }
 
 /// `cef::Browser` is a ref-counted raw pointer without Rust `Send`; CEF's
@@ -615,8 +636,8 @@ cef::wrap_load_handler! {
             &self,
             _browser: Option<&mut Browser>,
             is_loading: std::os::raw::c_int,
-            _can_go_back: std::os::raw::c_int,
-            _can_go_forward: std::os::raw::c_int,
+            can_go_back: std::os::raw::c_int,
+            can_go_forward: std::os::raw::c_int,
         ) {
             let phase = if is_loading != 0 {
                 EngineActivity::Loading
@@ -627,6 +648,16 @@ cef::wrap_load_handler! {
                 tab: self.ctx.tab,
                 phase,
             });
+            self.ctx.handle.emit(EngineEvent::HistoryCapability {
+                tab: self.ctx.tab,
+                can_back: can_go_back != 0,
+                can_forward: can_go_forward != 0,
+            });
+            trace_engine(&self.ctx, "loading")
+                .field("loading", is_loading != 0)
+                .field("can_back", can_go_back != 0)
+                .field("can_forward", can_go_forward != 0)
+                .emit();
         }
 
         fn on_load_end(
@@ -640,6 +671,9 @@ cef::wrap_load_handler! {
                 return;
             }
             let generation = *self.ctx.generation.lock().unwrap_or_else(|e| e.into_inner());
+            trace_engine(&self.ctx, "load.end")
+                .field("generation", generation)
+                .emit();
             self.ctx.handle.emit(EngineEvent::LoadFinished {
                 tab: self.ctx.tab,
                 generation,
@@ -660,12 +694,17 @@ cef::wrap_load_handler! {
                 return;
             }
             let generation = *self.ctx.generation.lock().unwrap_or_else(|e| e.into_inner());
+            let message = error_text
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "load failed".to_string());
+            trace_engine(&self.ctx, "load.error")
+                .field("generation", generation)
+                .field("error", &message)
+                .emit();
             self.ctx.handle.emit(EngineEvent::LoadFinished {
                 tab: self.ctx.tab,
                 generation,
-                result: Err(error_text
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "load failed".to_string())),
+                result: Err(message),
             });
         }
     }
@@ -686,6 +725,9 @@ cef::wrap_display_handler! {
                 return;
             }
             let url = url.map(|u| u.to_string()).unwrap_or_default();
+            trace_engine(&self.ctx, "address")
+                .field("url", &url)
+                .emit();
             self.ctx.handle.emit(EngineEvent::UrlChanged {
                 tab: self.ctx.tab,
                 url,
@@ -1032,6 +1074,7 @@ impl Worker {
             scroll: Arc::new(Mutex::new((0.0, 0.0))),
             extent: Arc::new(Mutex::new((0.0, 0.0))),
             favicon_key: Arc::new(Mutex::new(String::new())),
+            trace_flow: Arc::new(Mutex::new(None)),
         };
         let mut client = SdscClient::new(
             ctx.clone(),
@@ -1090,6 +1133,18 @@ impl Worker {
 
     fn apply(&mut self, command: EngineCommand) -> bool {
         match command {
+            EngineCommand::Traced { flow, command } => {
+                if let Some(tab) = command.tab()
+                    && let Some(entry) = self.tab_mut(tab)
+                {
+                    *entry
+                        .ctx
+                        .trace_flow
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(flow);
+                }
+                return self.apply(*command);
+            }
             EngineCommand::Navigate {
                 tab,
                 url,

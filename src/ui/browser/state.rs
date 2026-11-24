@@ -8,6 +8,14 @@ use crate::ui::text_fit;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Last canonical history snapshot reported by the engine, kept alongside the
+/// UI's own merged stack so traces can expose disagreement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineHistorySnapshot {
+    pub current: usize,
+    pub entries: Vec<String>,
+}
+
 /// Hold-bumper history selector (B2.4): directional dropdown over the
 /// session stack. `back` selects L1/back targets, else R1/forward targets;
 /// `highlight` indexes the displayed directional list (0 = closest =
@@ -102,6 +110,10 @@ pub struct BrowserTabPage {
     /// as such instead of a dropped input. Superseded by Loading…/Error,
     /// expires after a few seconds.
     pub action_hint: Option<(String, Instant)>,
+    /// Last canonical engine history; tracing compares it with the UI stack.
+    pub last_engine_history: Option<EngineHistorySnapshot>,
+    /// Last CEF back/forward capability flag pair.
+    pub last_engine_can: Option<(bool, bool)>,
     /// Hold-bumper history selector overlay (B2.4). `None` = closed.
     pub history_selector: Option<HistorySelector>,
     /// Engine phase for the status strip (navigate → load → DOM boot).

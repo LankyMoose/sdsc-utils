@@ -253,6 +253,26 @@ pub enum HomeMessage {
     Close,
 }
 
+impl HomeMessage {
+    /// Stable semantic action name for the trace timeline.
+    pub fn trace_label(self) -> &'static str {
+        match self {
+            Self::MoveX(_) => "home.move_x",
+            Self::MoveY(_) => "home.move_y",
+            Self::ToggleControllers => "home.controllers.toggle",
+            Self::ToggleShowAll => "home.controllers.show_all",
+            Self::SettingsToggle => "home.settings.toggle",
+            Self::PowerOff => "home.power_off",
+            Self::AppsMenuOpen(_) => "home.menu.open",
+            Self::AppsMenuMove(_) => "home.menu.move",
+            Self::AppsMenuConfirm => "home.menu.confirm",
+            Self::AppsMenuClose => "home.menu.close",
+            Self::Confirm => "home.confirm",
+            Self::Close => "home.close",
+        }
+    }
+}
+
 /// One managed app entry. Launcher is built-in and has no install/update
 /// state, so it deliberately does not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

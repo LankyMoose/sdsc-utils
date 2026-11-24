@@ -280,6 +280,8 @@ pub enum Message {
     /// UI work can be screenshotted without clicking through the tray.
     #[cfg(debug_assertions)]
     DebugOpen(String),
+    /// Internal replay-driver tick (only armed by `--trace-replay`).
+    ReplayStep,
     /// Debug-only: flip the layout-bounding-box overlay (Diagnostics toggle or F9).
     #[cfg(debug_assertions)]
     ToggleDebugLayoutBounds,
@@ -327,7 +329,158 @@ pub enum Message {
     Exit,
 }
 
+fn input_trace(
+    label: &'static str,
+    surface: &'static str,
+) -> crate::platform::trace::ActionBuilder {
+    crate::platform::trace::action(crate::platform::trace::Lane::App, "app.input")
+        .source("ui")
+        .field("message", label)
+        .field("surface", surface)
+}
+
 impl Message {
+    /// Semantic trace entry for user-originated messages. `PadInput` is
+    /// handled at the pad-action boundary; system/background messages return
+    /// `None`. This match is exhaustive on purpose: a new user-facing variant
+    /// must be classified here before it compiles.
+    fn trace_action(&self) -> Option<crate::platform::trace::ActionBuilder> {
+        use crate::platform::trace;
+        if !trace::actions_enabled() {
+            return None;
+        }
+        match self {
+            Message::Tick
+            | Message::PresenceHint
+            | Message::AbsenceRecheck
+            | Message::PollResult(_)
+            | Message::ProcessEnumResult(_)
+            | Message::SteamAppsChanged
+            | Message::RunningBadgeTick
+            | Message::CloseGameDone(_)
+            | Message::WindowClosed(_)
+            | Message::WindowUnfocused(_)
+            | Message::WindowFocused(_)
+            | Message::PopupOpened(_)
+            | Message::PlacePopup { .. }
+            | Message::ConfigureOpened(_)
+            | Message::BrowserOpened(_)
+            | Message::BrowserFrame
+            | Message::EngineInstallDone { .. }
+            | Message::EngineInfoSize { .. }
+            | Message::HomeProgressTick
+            | Message::HomeControllerTick
+            | Message::WindowSized(_, _)
+            | Message::WindowShowNow(_)
+            | Message::ShellFadeTick
+            | Message::HomeOpened(_)
+            | Message::LauncherOpened(_)
+            | Message::FinishStartClose
+            | Message::LauncherFrame
+            | Message::LauncherCursorActivity(_)
+            | Message::LauncherArtEvent(_)
+            | Message::BrowserEngine(_)
+            | Message::SteamScanDone(_)
+            | Message::SteamScanIdleFallback
+            | Message::PlaceToast { .. }
+            | Message::ToastShown { .. }
+            | Message::ToastFrame
+            | Message::IdentifyFrame
+            | Message::RendererReloadTick
+            | Message::RendererReloadDue
+            | Message::UtilityAmbientTick
+            | Message::ToastDismiss(_)
+            | Message::ToastHideDeferred
+            | Message::SpectrumCommit(_)
+            | Message::BootUpdateCheck
+            | Message::UpdateCheckDone(_)
+            | Message::UpdateSpin
+            | Message::UpdateNotifyDone(_)
+            | Message::ReplayStep
+            | Message::Exit
+            | Message::PadInput(_) => None,
+            #[cfg(debug_assertions)]
+            Message::EmulatorCommitTick
+            | Message::AmbientPreviewOpened(_)
+            | Message::AmbientPreviewTick => None,
+            #[cfg(feature = "cef-engine")]
+            Message::EngineInstallProgress { .. }
+            | Message::EngineManifestReady { .. }
+            | Message::EngineUninstallDone { .. } => None,
+            Message::TrayMenu(id) => Some(input_trace("tray.menu", "tray").field("menu", id)),
+            Message::TrayLeftClick(_) => Some(input_trace("tray.click", "tray")),
+            Message::Popup(_) => Some(input_trace("ui.popup", "popup")),
+            Message::Configure(_) => Some(input_trace("ui.settings", "settings")),
+            Message::Browser(message) => message.trace_label().map(|label| {
+                let mut trace = input_trace(label, "browser");
+                match message {
+                    crate::ui::browser::BrowserMessage::HistoryOpen { back } => {
+                        trace = trace.field("back", *back);
+                    }
+                    crate::ui::browser::BrowserMessage::HistoryPick(index) => {
+                        trace = trace.field("index", *index);
+                    }
+                    crate::ui::browser::BrowserMessage::AutocompletePick(url) => {
+                        trace = trace.field("url", url);
+                    }
+                    crate::ui::browser::BrowserMessage::TabSwitch(tab)
+                    | crate::ui::browser::BrowserMessage::TabClose(tab) => {
+                        trace = trace.field("tab", tab.0);
+                    }
+                    _ => {}
+                }
+                trace
+            }),
+            Message::BrowserRawKey { .. } => Some(input_trace("ui.key", "browser")),
+            Message::Home(message) => {
+                let mut trace = input_trace(message.trace_label(), "home");
+                if let crate::ui::home::HomeMessage::AppsMenuOpen(index) = message {
+                    trace = trace.field("index", *index);
+                }
+                Some(trace)
+            }
+            Message::Launcher(message) => message
+                .trace_label()
+                .map(|label| input_trace(label, "launcher")),
+            Message::LauncherKey {
+                action, pressed, ..
+            } => Some(
+                input_trace("ui.key", "launcher")
+                    .field("key_action", format!("{action:?}"))
+                    .field("pressed", *pressed),
+            ),
+            Message::ManualFilePicked(path) => Some(
+                input_trace("dialog.file", "settings")
+                    .field("path", path.as_ref().map(|p| p.display().to_string())),
+            ),
+            Message::ManualIconPicked(path) => Some(
+                input_trace("dialog.icon", "settings")
+                    .field("path", path.as_ref().map(|p| p.display().to_string())),
+            ),
+            Message::SteamPathPicked(path) => Some(
+                input_trace("dialog.steam_path", "settings")
+                    .field("path", path.as_ref().map(|p| p.display().to_string())),
+            ),
+            Message::EngineInstallCancel => Some(input_trace("engine.install.cancel", "home")),
+            #[cfg(debug_assertions)]
+            Message::StressWindows(count) => {
+                Some(input_trace("debug.stress", "debug").field("count", *count))
+            }
+            #[cfg(debug_assertions)]
+            Message::DebugOpen(open) => {
+                Some(input_trace("debug.open", "debug").field("windows", open))
+            }
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugLayoutBounds => Some(input_trace("debug.toggle.layout", "debug")),
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => Some(input_trace("debug.toggle.browser", "debug")),
+            #[cfg(debug_assertions)]
+            Message::PreviewDrag | Message::PreviewClose => {
+                Some(input_trace("debug.preview", "debug"))
+            }
+        }
+    }
+
     /// True for user-originated input: pad, mouse, keyboard, tray, and file
     /// pickers. While a renderer reload is queued, `update()` drops these so
     /// nothing can act in the feedback window before exit.
@@ -340,7 +493,10 @@ impl Message {
     /// work.
     fn is_user_input(&self) -> bool {
         match self {
-            Message::Tick | Message::PresenceHint | Message::AbsenceRecheck => false,
+            Message::Tick
+            | Message::PresenceHint
+            | Message::AbsenceRecheck
+            | Message::ReplayStep => false,
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => false,
             Message::PollResult(_)
@@ -638,6 +794,10 @@ pub struct App {
     /// Edges can conflate during a UI stall; draining one per input frame keeps
     /// every tap without changing the one-action surface contracts.
     pending_pad_actions: VecDeque<PadAction>,
+    /// Browser history/nav action waiting for the engine to settle.
+    pending_browser_trace: Option<crate::app::browser::PendingBrowserTrace>,
+    /// In-process replay plan when launched with `--trace-replay`.
+    replay: Option<crate::platform::trace::replay::ReplayPlan>,
     /// Surface receiving source-side tap actions.
     pad_input_owner: PadInputOwner,
     /// When set, the next start cue may rumble this DualSense serial (pad-originated).
@@ -828,6 +988,10 @@ impl App {
         let games = GamesCatalog::load();
         let spectrum = SpectrumService::new(prefs.spectrum.clone());
 
+        crate::platform::trace::manifest("prefs", &prefs);
+        crate::platform::trace::manifest("games", &games);
+        crate::platform::trace::manifest("known_controllers", known.remembered_disconnected(&[]));
+
         #[cfg(windows)]
         Host::ensure_quiet_entry();
 
@@ -910,6 +1074,8 @@ impl App {
             None
         };
         let install_limit = session.prefs.apps_download_limit_kbps;
+        let replay = crate::platform::trace::replay::request()
+            .and_then(crate::platform::trace::replay::plan);
         let mut app = Self {
             session,
             games,
@@ -1017,6 +1183,8 @@ impl App {
             pad_nav: PadNavBank::default(),
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
+            pending_browser_trace: None,
+            replay,
             pad_input_owner: PadInputOwner::None,
             haptic_pad_serial: None,
             keyboard_cross_hold: CrossHold::default(),
@@ -1166,6 +1334,21 @@ impl App {
                 Task::perform(delay(Duration::from_millis(1500)), move |()| {
                     Message::DebugOpen(spec.clone())
                 }),
+            ]);
+        }
+        if let Some(plan) = &app.replay {
+            let request = crate::platform::trace::replay::request();
+            crate::platform::trace::manifest(
+                "replay.start",
+                serde_json::json!({
+                    "flow": plan.flow(),
+                    "session": request.map(|r| &r.session),
+                    "sandbox": request.map(|r| &r.sandbox),
+                }),
+            );
+            task = Task::batch([
+                task,
+                Task::perform(delay(Duration::from_secs(2)), |()| Message::ReplayStep),
             ]);
         }
         // Adapter logging creates a wgpu Instance; run it after the engine
@@ -1655,6 +1838,25 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.renderer_reload_queued && message.is_user_input() {
+            if let Some(trace) = message.trace_action() {
+                trace
+                    .begin()
+                    .finish("suppressed")
+                    .field("reason", "renderer_reload")
+                    .emit();
+            }
+            return Task::none();
+        }
+        let trace = message.trace_action();
+        let task = self.update_inner(message);
+        if let Some(trace) = trace {
+            trace.begin().finish("dispatched").emit();
+        }
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         // Effective reduce-motion gate (prefs choice vs OS "Show animations"
         // toggle): synced on every update so pad/keyboard/mouse-initiated
         // anims gate instantly, even with an idle Launcher (no LauncherFrame) or
@@ -1673,15 +1875,9 @@ impl App {
         {
             self.launcher_state.ambient_tuning_keepalive = self.debug_tuning_active();
         }
-        // Renderer reload queued: drop all user input (pad / mouse /
-        // keyboard / tray / pickers) so nothing can act in the feedback
-        // window before exit. Window lifecycle and ticks flow untouched;
-        // Tray Quit still exits (and cancels the reload).
-        if self.renderer_reload_queued && message.is_user_input() {
-            return Task::none();
-        }
         match message {
             Message::Tick => self.on_tick(),
+            Message::ReplayStep => self.on_replay_step(),
             Message::PresenceHint => self.on_presence_hint(),
             Message::AbsenceRecheck => self.on_absence_recheck(),
             #[cfg(debug_assertions)]

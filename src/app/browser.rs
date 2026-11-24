@@ -56,6 +56,23 @@ pub struct EngineRateSample {
     pub ewma_bps: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserTraceKind {
+    History,
+    Navigate,
+}
+
+/// In-flight browser navigation/history action whose real outcome is the
+/// settled engine state, not the command send.
+pub(crate) struct PendingBrowserTrace {
+    pub action: crate::platform::trace::PendingAction,
+    pub kind: BrowserTraceKind,
+    pub requested_index: Option<usize>,
+    pub requested_url: Option<String>,
+    /// Load generation for `Navigate`; history traversals have none.
+    pub generation: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct BrowserAppState {
     /// Tabs, chrome targets, cursor, bookmarks, and per-tab page state.
@@ -135,7 +152,332 @@ fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
     })
 }
 
+const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+const REPLAY_STEP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 impl super::App {
+    /// Replay driver tick. Opens the Browser surface first, validates stable
+    /// preconditions, then dispatches the next semantic step through the same
+    /// handlers a real action uses.
+    pub(crate) fn on_replay_step(&mut self) -> Task<Message> {
+        let Some(plan) = &self.replay else {
+            return Task::none();
+        };
+        let flow = plan.flow();
+        if !self.browser_visible {
+            let open = self.open_browser_window();
+            return Task::batch([
+                open,
+                Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
+            ]);
+        }
+        let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
+            self.replay = None;
+            crate::platform::trace::manifest("replay.done", serde_json::json!({ "flow": flow }));
+            return Task::none();
+        };
+        if step.app == "browser" {
+            let state = trace_browser_state(&self.browser.panel);
+            let checks = crate::platform::trace::replay::check_requires(&step.requires, &state);
+            if checks
+                .iter()
+                .any(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+            {
+                // Best-effort replay: the target URL/index resolver below can
+                // still land on the recorded entry when stack positions moved.
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.mismatch",
+                )
+                .field("flow", flow)
+                .field("app", &step.app)
+                .field("action", &step.action)
+                .field("checks", checks)
+                .field("pre", &step.pre)
+                .emit();
+            }
+        }
+        crate::platform::trace::replay::set_replaying(true);
+        let task = self.replay_dispatch(&step);
+        crate::platform::trace::replay::set_replaying(false);
+        Task::batch([
+            task,
+            Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep),
+        ])
+    }
+
+    fn replay_dispatch(
+        &mut self,
+        step: &crate::platform::trace::replay::ReplayStep,
+    ) -> Task<Message> {
+        if step.app != "browser" {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Platform,
+                "replay.unsupported",
+            )
+            .field("app", &step.app)
+            .field("action", &step.action)
+            .emit();
+            return Task::none();
+        }
+        match step.action.as_str() {
+            "navigate" => {
+                let Some(url) = step.params.get("url").and_then(serde_json::Value::as_str) else {
+                    return Task::none();
+                };
+                self.browser.panel.draft = url.to_string();
+                self.on_browser_navigate()
+            }
+            "history.back" | "history.forward" => {
+                let target_url = step.params.get("url").and_then(serde_json::Value::as_str);
+                let resolved = target_url.and_then(|url| {
+                    self.browser
+                        .panel
+                        .session
+                        .nav_entries()
+                        .iter()
+                        .position(|entry| entry.url == url)
+                });
+                if let Some(index) = resolved {
+                    // The recorded position moved; resolve by identity.
+                    self.on_browser_history_pick(index)
+                } else if step.action == "history.back" {
+                    self.on_browser_go_back()
+                } else {
+                    self.on_browser_go_forward()
+                }
+            }
+            "history.open" => {
+                let back = step
+                    .params
+                    .get("back")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                self.on_browser_history_open(back)
+            }
+            "history.pick" => {
+                let requested = step
+                    .params
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|index| index as usize);
+                let target_url = step.params.get("url").and_then(serde_json::Value::as_str);
+                // Resolve by URL first: indices shift when the stack differs.
+                let resolved = target_url
+                    .and_then(|url| {
+                        self.browser
+                            .panel
+                            .session
+                            .nav_entries()
+                            .iter()
+                            .position(|entry| entry.url == url)
+                    })
+                    .or(requested);
+                match resolved {
+                    Some(index) => self.on_browser_history_pick(index),
+                    None => Task::none(),
+                }
+            }
+            "history.cancel" => self.on_browser_history_cancel(),
+            _ => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.unsupported",
+                )
+                .field("app", &step.app)
+                .field("action", &step.action)
+                .emit();
+                Task::none()
+            }
+        }
+    }
+
+    /// Open a browser navigation/history action whose outcome is settled by a
+    /// later engine event. The pre-state is captured now; the pending guard is
+    /// closed by `settle_browser_action_trace` when canonical history lands.
+    pub(crate) fn begin_browser_action_trace(
+        &mut self,
+        action: &'static str,
+        source: &'static str,
+        requested_index: Option<usize>,
+        requested_url: Option<String>,
+    ) -> Option<crate::platform::trace::FlowId> {
+        if !crate::platform::trace::actions_enabled() {
+            return None;
+        }
+        if let Some(old) = self.pending_browser_trace.take() {
+            old.action
+                .abandon("superseded")
+                .post(trace_browser_state(&self.browser.panel))
+                .emit();
+        }
+        let replaying = crate::platform::trace::replay::replaying();
+        let source = if replaying { "replay" } else { source };
+        let source_flow = if replaying {
+            self.replay.as_ref().map(|plan| plan.flow())
+        } else {
+            None
+        };
+        let current = self.browser.panel.session.nav_current();
+        let mut builder =
+            crate::platform::trace::action(crate::platform::trace::Lane::Browser, action)
+                .app("browser")
+                .source(source)
+                .field("replay", replaying)
+                .field("source_flow", source_flow)
+                .field("requested_index", requested_index)
+                .field("requested_url", requested_url.as_deref())
+                .pre(trace_browser_state(&self.browser.panel))
+                .repro(serde_json::json!({
+                    "app": "browser",
+                    "action": action.strip_prefix("browser.").unwrap_or(action),
+                    "params": {
+                        "index": requested_index,
+                        "url": requested_url.as_deref(),
+                    },
+                }));
+        if let Some(current) = current {
+            builder = builder.require("ui.nav.current", current);
+        }
+        let guard = builder.begin();
+        let flow = guard.flow();
+        let kind = if action.starts_with("browser.history.") {
+            BrowserTraceKind::History
+        } else {
+            BrowserTraceKind::Navigate
+        };
+        self.pending_browser_trace = Some(crate::app::browser::PendingBrowserTrace {
+            action: guard.detach(),
+            kind,
+            requested_index,
+            requested_url,
+            generation: None,
+        });
+        Some(flow)
+    }
+
+    /// Settle a pending history action once the engine reports the resulting
+    /// URL. A stale URL from the previous navigation keeps the flow open so
+    /// the trace cannot claim a landing that has not happened yet.
+    pub(crate) fn settle_browser_history_trace_for_url(
+        &mut self,
+        url: &str,
+        outcome: &'static str,
+    ) {
+        let Some(pending) = self.pending_browser_trace.as_ref() else {
+            return;
+        };
+        if pending.kind != BrowserTraceKind::History {
+            return;
+        }
+        let matches = pending
+            .requested_url
+            .as_deref()
+            .is_none_or(|want| want == url);
+        if matches {
+            self.settle_browser_action_trace(outcome);
+        } else {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "history.url_mismatch",
+            )
+            .flow(pending.action.flow())
+            .field("requested", pending.requested_url.as_deref())
+            .field("actual", url)
+            .emit();
+        }
+    }
+
+    /// Send an engine command, preserving the trace flow when present.
+    pub(crate) fn send_engine_traced(
+        &self,
+        flow: Option<crate::platform::trace::FlowId>,
+        command: crate::browser::engine::EngineCommand,
+    ) {
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        if let Some(flow) = flow {
+            engine.send_traced(flow, command);
+        } else {
+            engine.send(command);
+        }
+    }
+
+    /// Record a browser action that ended before reaching the engine.
+    pub(crate) fn trace_browser_noop(
+        &mut self,
+        action: &'static str,
+        source: &'static str,
+        reason: &'static str,
+    ) {
+        if !crate::platform::trace::actions_enabled() {
+            return;
+        }
+        crate::platform::trace::action(crate::platform::trace::Lane::Browser, action)
+            .app("browser")
+            .source(source)
+            .pre(trace_browser_state(&self.browser.panel))
+            .begin()
+            .finish("noop")
+            .field("reason", reason)
+            .post(trace_browser_state(&self.browser.panel))
+            .emit();
+    }
+
+    /// Close the pending browser action with the settled UI/engine state.
+    pub(crate) fn settle_browser_action_trace(&mut self, outcome: &'static str) {
+        let Some(pending) = self.pending_browser_trace.take() else {
+            return;
+        };
+        let session = &self.browser.panel.session;
+        let actual_index = session.nav_current();
+        let actual_url = session.url().to_string();
+        let index_ok = pending
+            .requested_index
+            .is_none_or(|want| actual_index == Some(want));
+        let url_ok = pending
+            .requested_url
+            .as_deref()
+            .is_none_or(|want| actual_url == want);
+        let engine_agree = self
+            .browser
+            .panel
+            .page
+            .last_engine_history
+            .as_ref()
+            .is_some_and(|history| {
+                Some(history.current) == actual_index
+                    && history.entries.get(history.current).map(String::as_str)
+                        == Some(actual_url.as_str())
+            });
+        let matched_by =
+            if pending.requested_index.is_some() && pending.requested_index == actual_index {
+                "index"
+            } else if pending.requested_url.as_deref() == Some(actual_url.as_str()) {
+                "url"
+            } else {
+                "none"
+            };
+        pending
+            .action
+            .settle(outcome)
+            .post(trace_browser_state(&self.browser.panel))
+            .field("actual_index", actual_index)
+            .field("actual_url", &actual_url)
+            .check("requested_index", index_ok)
+            .check("requested_url", url_ok)
+            .check("ui_engine_agree", engine_agree)
+            .resolution(serde_json::json!({
+                "requested_index": pending.requested_index,
+                "actual_index": actual_index,
+                "requested_url": pending.requested_url,
+                "actual_url": actual_url,
+                "matched_by": matched_by,
+            }))
+            .emit();
+    }
+
     /// Browser-window message router. Phase 2 is moving the reducer here; the
     /// methods still live beside the Launcher reducer until the move completes.
     pub(crate) fn on_browser_message(
@@ -1230,6 +1572,113 @@ fn home_install_progress(
     }
 }
 
+/// Bounded browser state for action traces. Includes the UI stack, the last
+/// raw engine history, CEF's back/forward flags, and the selector list so a
+/// picked index can always be resolved back to an actual URL/title.
+pub(crate) fn trace_browser_state(
+    panel: &crate::ui::browser::state::BrowserPanel,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    fn row(index: usize, entry: &crate::browser::HistoryEntry) -> serde_json::Value {
+        json!({
+            "index": index,
+            "url": &entry.url,
+            "title": &entry.title,
+        })
+    }
+
+    fn nav_window(
+        entries: &[crate::browser::HistoryEntry],
+        current: Option<usize>,
+    ) -> serde_json::Value {
+        let center = current.unwrap_or(0).min(entries.len().saturating_sub(1));
+        let start = center.saturating_sub(8);
+        let end = (center + 9).min(entries.len());
+        let rows: Vec<serde_json::Value> = entries[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, entry)| row(start + offset, entry))
+            .collect();
+        json!({
+            "current": current,
+            "len": entries.len(),
+            "from": start,
+            "entries": rows,
+        })
+    }
+
+    let page = &panel.page;
+    let session = &page.session;
+    let selector = page.history_selector.as_ref().map(|sel| {
+        let list = if sel.back {
+            session.back_entries()
+        } else {
+            session.forward_entries()
+        };
+        let rows: Vec<serde_json::Value> = list
+            .iter()
+            .enumerate()
+            .map(|(shown, (index, entry))| {
+                json!({
+                    "shown": shown,
+                    "index": index,
+                    "url": entry.url,
+                    "title": entry.title,
+                })
+            })
+            .collect();
+        json!({
+            "back": sel.back,
+            "highlight": sel.highlight,
+            "entries": rows,
+        })
+    });
+    let engine_history = page.last_engine_history.as_ref().map(|history| {
+        let center = history.current.min(history.entries.len().saturating_sub(1));
+        let start = center.saturating_sub(8);
+        let end = (center + 9).min(history.entries.len());
+        let rows: Vec<serde_json::Value> = history.entries[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, url)| {
+                json!({
+                    "index": start + offset,
+                    "url": url,
+                })
+            })
+            .collect();
+        json!({
+            "current": history.current,
+            "len": history.entries.len(),
+            "from": start,
+            "entries": rows,
+        })
+    });
+
+    json!({
+        "ui": {
+            "tab": panel.active_tab.0,
+            "tabs": panel.order.len(),
+            "url": session.url(),
+            "title": session.title(),
+            "loading": session.loading(),
+            "generation": session.generation(),
+            "engine_activity": page.engine_activity.label(),
+            "url_editing": panel.url_editing,
+            "bookmark_bubble": panel.bookmark_bubble,
+            "travel_to": session.travel_target(),
+            "nav": nav_window(session.nav_entries(), session.nav_current()),
+            "selector": selector,
+        },
+        "engine": {
+            "history": engine_history,
+            "can_back": page.last_engine_can.map(|(back, _)| back),
+            "can_forward": page.last_engine_can.map(|(_, forward)| forward),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,6 +1698,26 @@ mod tests {
             button,
             action: PadButtonAction::Hold,
         }
+    }
+
+    #[test]
+    fn trace_state_exposes_nav_and_selector_entries() {
+        let mut panel = crate::ui::browser::state::BrowserPanel::default();
+        panel.session.open_surface();
+        panel.session.begin_load("https://a.test/".to_string());
+        panel.session.begin_load("https://b.test/".to_string());
+        panel.page.history_selector = Some(crate::ui::browser::HistorySelector {
+            back: true,
+            highlight: 0,
+        });
+        let state = trace_browser_state(&panel);
+        assert_eq!(state["ui"]["nav"]["current"], 1);
+        assert_eq!(state["ui"]["nav"]["entries"][0]["url"], "https://a.test/");
+        assert_eq!(state["ui"]["selector"]["entries"][0]["index"], 0);
+        assert_eq!(
+            state["ui"]["selector"]["entries"][0]["url"],
+            "https://a.test/"
+        );
     }
 
     #[test]

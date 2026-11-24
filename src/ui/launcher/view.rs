@@ -117,6 +117,63 @@ pub enum LauncherMessage {
     ReportInputFailure,
 }
 
+impl LauncherMessage {
+    /// Stable semantic action name for the trace timeline. Text-entry and
+    /// scroll reports are high-frequency detail, not separate user actions.
+    pub fn trace_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Launch(_) => Some("launcher.launch"),
+            Self::SelectGame(_) => Some("launcher.select"),
+            Self::MoveUp | Self::MoveDown => Some("launcher.nav"),
+            Self::Confirm => Some("launcher.confirm"),
+            Self::Close => Some("launcher.close"),
+            Self::Noop
+            | Self::SettingsScrolled(..)
+            | Self::ManualAddTitle(_)
+            | Self::ManualAddArgs(_) => None,
+            Self::DismissEditConfirm => Some("launcher.edit.dismiss"),
+            Self::ToggleEdit => Some("launcher.edit.toggle"),
+            Self::CycleSort => Some("launcher.sort.cycle"),
+            Self::AddShortcut => Some("launcher.manual.add"),
+            Self::EditManual => Some("launcher.manual.edit"),
+            Self::ManualPickIcon => Some("launcher.manual.icon"),
+            Self::ManualClearIcon => Some("launcher.manual.icon_clear"),
+            Self::ToggleSettings
+            | Self::ToggleLayoutMenu
+            | Self::ToggleNavbarMenu
+            | Self::ToggleReducedMotionMenu
+            | Self::ToggleSelectionModeMenu
+            | Self::SetSelectionPersist(_)
+            | Self::SetSelectionMode(_)
+            | Self::SetClock(_)
+            | Self::SetImmersiveLayout(_)
+            | Self::SetNavbarVisibility(_)
+            | Self::SetReducedMotion(_)
+            | Self::SetInactiveSecs(_)
+            | Self::SetSleepSecs(_)
+            | Self::SetInactiveDimPercent(_)
+            | Self::SetSounds(_)
+            | Self::SetSoundVolume(_)
+            | Self::SetHaptics(_)
+            | Self::SetHapticsStrength(_)
+            | Self::SetPerfThrottle(_)
+            | Self::SetPerfAntialiasing(_)
+            | Self::SetPerfVsync(_)
+            | Self::SetShowUninstalledGames(_) => Some("launcher.settings.change"),
+            Self::ReloadUi => Some("launcher.settings.reload"),
+            Self::SyncSteamLibrary => Some("launcher.steam.sync"),
+            #[cfg(debug_assertions)]
+            Self::OpenAmbientTuning
+            | Self::CloseAmbientTuning
+            | Self::SetAmbientTune(..)
+            | Self::ResetAmbientTuning
+            | Self::AmbientTuneScrolled(..)
+            | Self::ReportLightbarFailure
+            | Self::ReportInputFailure => None,
+        }
+    }
+}
+
 /// Runtime-resolved game art (Steam / custom / shell), as a stable iced handle.
 ///
 /// Built once via [`icon_cache`] (downscaled raster or shell extract). Recreating

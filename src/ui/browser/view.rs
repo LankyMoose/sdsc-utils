@@ -48,6 +48,38 @@ pub enum BrowserMessage {
     Shot(iced::window::Screenshot),
 }
 
+impl BrowserMessage {
+    /// Stable semantic action name for the trace timeline. `None` means the
+    /// message is high-frequency detail (typing, scroll, screenshots) and is
+    /// recorded by its owning lane only when needed.
+    pub fn trace_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Close => Some("browser.close"),
+            Self::UrlChanged(_) | Self::BookmarkNameChanged(_) => None,
+            Self::ToggleUrlEntry => Some("browser.url.edit"),
+            Self::Navigate | Self::AutocompletePick(_) => Some("browser.navigate"),
+            Self::Back => Some("browser.history.back"),
+            Self::Forward => Some("browser.history.forward"),
+            Self::HistoryOpen { .. } => Some("browser.history.open"),
+            Self::HistoryPick(_) => Some("browser.history.pick"),
+            Self::HistoryCancel => Some("browser.history.cancel"),
+            Self::OpenExternal => Some("browser.external"),
+            Self::Reload => Some("browser.reload"),
+            Self::DefaultPage => Some("browser.default_page"),
+            Self::TabNew => Some("browser.tab.new"),
+            Self::TabNext => Some("browser.tab.next"),
+            Self::TabSwitch(_) => Some("browser.tab.switch"),
+            Self::TabClose(_) => Some("browser.tab.close"),
+            Self::BookmarkStar => Some("browser.bookmark.star"),
+            Self::BookmarkSave => Some("browser.bookmark.save"),
+            Self::BookmarkRemove => Some("browser.bookmark.remove"),
+            Self::Scrolled(_) => None,
+            #[cfg(debug_assertions)]
+            Self::Shot(_) => None,
+        }
+    }
+}
+
 impl BrowserPanel {
     /// Pad action for a docked chrome target. `None` when the target needs
     /// data that vanished (removed bookmark) — the caller exits to the

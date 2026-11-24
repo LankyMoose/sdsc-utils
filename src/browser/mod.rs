@@ -342,6 +342,17 @@ impl BrowserSession {
         self.nav_stack.len()
     }
 
+    /// Full chronological session stack (oldest first). Tracing reads this
+    /// to record the exact history state a selector index refers to.
+    pub fn nav_entries(&self) -> &[HistoryEntry] {
+        &self.nav_stack
+    }
+
+    /// Pending history traversal target, if any.
+    pub fn travel_target(&self) -> Option<usize> {
+        self.history_travel_to
+    }
+
     pub fn can_go_back(&self) -> bool {
         self.nav_index
             .is_some_and(|i| i > 0 && !self.nav_stack.is_empty())

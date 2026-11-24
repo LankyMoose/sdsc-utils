@@ -62,6 +62,12 @@ impl TabId {
 /// (closed-race) tabs are ignored. Only the active tab receives input.
 #[derive(Debug, Clone)]
 pub enum EngineCommand {
+    /// Trace envelope: carries the causal flow into the engine worker so
+    /// backend log lines can be followed with `--trace-follow`.
+    Traced {
+        flow: crate::platform::trace::FlowId,
+        command: Box<EngineCommand>,
+    },
     Navigate {
         tab: TabId,
         url: String,
@@ -170,6 +176,36 @@ pub enum EngineCommand {
     Wake,
 }
 
+impl EngineCommand {
+    /// Owning tab for trace-envelope propagation. Commands without a tab
+    /// (resize, visibility, shutdown) leave the tab flow untouched.
+    pub fn tab(&self) -> Option<TabId> {
+        match self {
+            Self::Traced { command, .. } => command.tab(),
+            Self::Navigate { tab, .. }
+            | Self::ScrollBy { tab, .. }
+            | Self::MouseMove { tab, .. }
+            | Self::ReseedDom { tab, .. }
+            | Self::ClickAt { tab, .. }
+            | Self::ProbeEventLoop { tab, .. }
+            | Self::GoBack { tab, .. }
+            | Self::GoForward { tab, .. }
+            | Self::OpenTab { tab, .. }
+            | Self::CloseTab { tab }
+            | Self::SetActiveTab { tab } => Some(*tab),
+            Self::Key(key) => Some(key.tab),
+            Self::SetDarkMode { .. }
+            | Self::Resize { .. }
+            | Self::SetVisible { .. }
+            | Self::Suspend
+            | Self::Resume
+            | Self::Shutdown { .. }
+            | Self::PrefetchFavicon { .. }
+            | Self::Wake => None,
+        }
+    }
+}
+
 /// Per-tab key event: the tab rides alongside so the worker routes the page
 /// key to the right view.
 #[derive(Debug, Clone)]
@@ -245,6 +281,13 @@ pub enum EngineEvent {
         entries: Vec<String>,
         current: usize,
     },
+    /// CEF's own back/forward capability at the last loading-state change.
+    /// The UI's local stack can disagree; tracing records both.
+    HistoryCapability {
+        tab: TabId,
+        can_back: bool,
+        can_forward: bool,
+    },
     LoadFinished {
         tab: TabId,
         generation: u64,
@@ -287,6 +330,7 @@ impl EngineEvent {
             | Self::ScrollExtent { tab, .. }
             | Self::FocusChanged { tab, .. }
             | Self::HistoryChanged { tab, .. }
+            | Self::HistoryCapability { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),
             Self::A11yTree { tab, .. } => Some(*tab),
             Self::TabOpened { .. } | Self::TabClosed { .. } => None,
@@ -374,6 +418,15 @@ impl EngineHandle {
     /// Fire-and-forget command (drops when the worker is gone).
     pub fn send(&self, command: EngineCommand) {
         let _ = self.commands.send(command);
+    }
+
+    /// Send a command tagged with a trace flow. The worker stores it on the
+    /// owning tab so address/history/load log lines join the same flow.
+    pub fn send_traced(&self, flow: crate::platform::trace::FlowId, command: EngineCommand) {
+        self.send(EngineCommand::Traced {
+            flow,
+            command: Box::new(command),
+        });
     }
 
     /// Install the iced-side event sinks (subscription start): bounded for
