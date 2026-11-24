@@ -17,11 +17,24 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const DISPLAY_NAME: &str = "SDSC Utils";
 const TRAY_SIZE: u32 = 32;
 
 fn main() {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SDSC_GIT_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let connected = svg_icon::render_dualsense_connected_rgba(TRAY_SIZE)
         .expect("rasterize connected DualSense icon");

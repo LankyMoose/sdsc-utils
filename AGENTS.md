@@ -13,6 +13,9 @@
 | Run (tray + HID + UI, one process) | `cargo run` |
 | UI-only check (no engine) | `cargo check --no-default-features` |
 | List connected controllers | `sdsc-utils --list-controllers` |
+| Latest session action timeline | `sdsc-utils --trace-last` |
+| Follow one causal flow | `sdsc-utils --trace-follow <flow-id>` |
+| Replay a browser flow in a sandbox | `sdsc-utils --trace-replay <session> --flow <flow-id>` |
 | Install/update QA console | `python scripts/install_qa_web.py --open` (see `notes/install-qa.md`) |
 
 ## Project structure

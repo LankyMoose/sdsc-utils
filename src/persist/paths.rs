@@ -8,6 +8,11 @@ use std::process::Command;
 
 /// Directory for prefs, controllers, analytics (and on Windows, the log file).
 pub fn data_dir() -> PathBuf {
+    // Replay/QA sandbox override. Must be checked before platform defaults.
+    if let Some(dir) = std::env::var_os("SDSC_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {

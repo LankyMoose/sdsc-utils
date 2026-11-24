@@ -230,6 +230,7 @@ fn install_panic_hook(crash_armed: &'static CrashArmed) {
         append_panic_line(&line);
         append_panic_line(&crate::platform::wgpu_diag::context_line());
         append_panic_line(&format!("PANIC_BACKTRACE {}", panic_backtrace_capped()));
+        crate::platform::trace::flush_all();
         // Persist abnormal exit independently of the relauncher budget:
         // a manual relaunch after a crash must still boot safe.
         crate::platform::crash_restart::mark_panic();
@@ -278,6 +279,10 @@ pub fn mark_hitch(extra: impl AsRef<str>) {
 }
 
 fn log_file_path(file_name: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os("SDSC_DATA_DIR") {
+        return PathBuf::from(dir).join(file_name);
+    }
+
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {

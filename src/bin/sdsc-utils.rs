@@ -8,6 +8,7 @@ use sdsc_utils::platform::app_meta::{
 };
 use sdsc_utils::platform::autostart;
 use sdsc_utils::platform::crash_restart::{self, CrashArmed};
+use sdsc_utils::platform::trace;
 use sdsc_utils::{AppError, AppResult};
 use sdsc_utils::{app, controller};
 use single_instance::SingleInstance;
@@ -30,6 +31,9 @@ fn main() -> ExitCode {
     // the process lifetime. CLI paths never arm it (see below); only the
     // tray path calls `arm_tray_mode`.
     let crash_armed: &'static CrashArmed = crash_armed();
+    // Replay must select its sandbox before the logger opens app.log/trace.
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let replay = trace::replay::prepare(&raw_args);
     app_log::init(crash_armed);
 
     // CEF re-executes this binary for renderer/GPU/utility processes. This
@@ -43,7 +47,11 @@ fn main() -> ExitCode {
     // touches it; no-op if a default is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = if replay.is_some() {
+        trace::replay::strip_args(&raw_args)
+    } else {
+        raw_args
+    };
 
     if args.iter().any(|a| a == crash_restart::RELAUNCH_FLAG) {
         return crash_restart::run_relauncher();
@@ -69,6 +77,11 @@ fn main() -> ExitCode {
         attach_console_for_cli();
         println!("{PKG_NAME} {PKG_VERSION}");
         return ExitCode::SUCCESS;
+    }
+
+    if args.iter().any(|a| a.starts_with("--trace-")) {
+        attach_console_for_cli();
+        return trace::run_cli(&args);
     }
 
     if args.iter().any(|a| a == "--install-autostart") {
@@ -119,6 +132,18 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if replay.is_some() {
+        // Replay is diagnostic: never terminate a live app just to run it.
+        let free = SingleInstance::new(PKG_NAME)
+            .map(|instance| instance.is_single())
+            .unwrap_or(false);
+        if !free {
+            attach_console_for_cli();
+            eprintln!("error: close the running SDSC Utils instance before replay");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // The guard must be held for the whole process lifetime. A renderer
     // reload (`--replace`) spawns its successor before exiting, so the child
     // waits briefly while the parent exits. A fresh launch instead
@@ -128,9 +153,12 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
 
+    trace::init();
     crash_restart::arm_tray_mode(crash_armed);
 
-    if let Err(err) = app::run() {
+    let result = app::run();
+    trace::shutdown();
+    if let Err(err) = result {
         app_log::error(format!("app exited with error: {err}"));
         ExitCode::FAILURE
     } else {
@@ -198,6 +226,18 @@ fn print_help() {
     println!(
         "      --set-lightbar R G B   Set lightbar RGB (0-255) on all connected pads and exit"
     );
+    println!("      --trace-list           List recorded trace sessions");
+    println!("      --trace-last           Print the latest session action timeline");
+    println!("      --trace-actions        Print the latest session action timeline");
+    println!("      --trace-follow ID      Print every lane record for flow ID");
+    println!("      --trace-repro ID       Print the replay plan for flow ID");
+    println!("      --trace-find TEXT      Find actions by URL/action/param text");
+    println!("      --trace-failures       Show noop/failed/suppressed actions");
+    println!("      --trace-audit          Check action/outcome pairing");
+    println!("      --trace-replay SESSION --flow ID  Replay a recorded browser flow");
+    println!("      --trace-path           Print the latest trace session directory");
+    println!("      --trace-session ID     Select a session for the query");
+    println!("      --app ID               Filter actions by app id");
     println!();
     println!("With no options, starts the app (tray + HID + UI in one process).");
 }
