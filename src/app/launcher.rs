@@ -2028,7 +2028,16 @@ impl App {
                 }
             }
             EngineEvent::UrlChanged { tab: _, url } => {
+                let flow = self
+                    .pending_browser_trace
+                    .as_ref()
+                    .map(|pending| pending.action.flow());
+                let previous = crate::platform::trace::current_flow();
+                if let Some(flow) = flow {
+                    crate::platform::trace::set_current_flow(Some(flow));
+                }
                 self.browser.panel.session.note_url(url.clone());
+                crate::platform::trace::set_current_flow(previous);
                 self.browser.panel.draft = url;
                 if self.browser.tabs_restored {
                     self.browser.panel.save_tabs();

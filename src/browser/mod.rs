@@ -56,6 +56,12 @@ fn is_ignored_url(url: &str) -> bool {
     url.is_empty() || url == BLANK_PAGE_URL
 }
 
+fn trace_nav(route: &'static str, url: &str) -> crate::platform::trace::EventBuilder {
+    crate::platform::trace::event(crate::platform::trace::Lane::Browser, "nav.push")
+        .field("route", route)
+        .field("url", url)
+}
+
 /// Browser surface state. Pure data: the iced view owns the URL
 /// draft and scroll offset, this owns load lifecycle with a generation
 /// counter so late worker results are ignored after suspend/close —
@@ -248,39 +254,60 @@ impl BrowserSession {
     /// forward tail and append a duplicate). Blank/empty URLs never record.
     pub fn push_nav(&mut self, url: String) {
         if is_ignored_url(&url) {
+            trace_nav("ignored", &url).emit();
             return;
         }
         // History traversal (bumper taps or a selector jump): move the index
         // to the target entry. The forward tail stays intact until a normal
         // navigation truncates it.
-        if let Some(target) = self.history_travel_to.take()
-            && let Some(entry) = self.nav_stack.get_mut(target)
-        {
-            entry.url = url;
-            self.nav_index = Some(target);
-            return;
+        if let Some(target) = self.history_travel_to.take() {
+            let len = self.nav_stack.len();
+            if let Some(entry) = self.nav_stack.get_mut(target) {
+                trace_nav("travel", &url)
+                    .field("target", target)
+                    .field("len", len)
+                    .emit();
+                entry.url = url;
+                self.nav_index = Some(target);
+                return;
+            }
         }
         if let Some(i) = self.nav_index
             && let Some(live) = self.nav_stack.get_mut(i)
             && Self::same_doc(&live.url, &url)
         {
+            trace_nav("same_doc", &url).field("index", i).emit();
             live.url = url;
             return;
         }
         if let Some(i) = self.nav_index {
             if i > 0 && self.nav_stack.get(i - 1).is_some_and(|e| e.url == url) {
                 // Back travel (engine `go_back`): step onto the predecessor.
+                trace_nav("back", &url)
+                    .field("from", i)
+                    .field("to", i - 1)
+                    .emit();
                 self.nav_index = Some(i - 1);
                 return;
             }
             if self.nav_stack.get(i + 1).is_some_and(|e| e.url == url) {
                 // Forward travel (engine `go_forward`): step onto the successor.
+                trace_nav("forward", &url)
+                    .field("from", i)
+                    .field("to", i + 1)
+                    .emit();
                 self.nav_index = Some(i + 1);
                 return;
             }
             let keep = (i + 1).min(self.nav_stack.len());
+            let truncated = self.nav_stack.len() - keep;
+            trace_nav("new", &url)
+                .field("from", i)
+                .field("truncated", truncated)
+                .emit();
             self.nav_stack.truncate(keep);
         } else {
+            trace_nav("root", &url).emit();
             self.nav_stack.clear();
         }
         self.nav_stack.push(HistoryEntry { url, title: None });
@@ -295,9 +322,18 @@ impl BrowserSession {
     /// preserved where the URL matches the previous stack; anything new
     /// starts untitled until its `TitleChanged` lands.
     pub fn note_session_history(&mut self, entries: Vec<String>, current: usize) {
+        let before_current = self.nav_index;
         if entries.is_empty() {
             self.nav_stack.clear();
             self.nav_index = None;
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "history.canonical",
+            )
+            .field("requested", "empty")
+            .field("before", before_current)
+            .field("after", self.nav_index)
+            .emit();
             return;
         }
         let current = current.min(entries.len() - 1);
@@ -323,6 +359,12 @@ impl BrowserSession {
         } else {
             self.nav_index = Some(current);
         }
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "history.canonical")
+            .field("requested", current)
+            .field("before", before_current)
+            .field("after", self.nav_index)
+            .field("len", self.nav_stack.len())
+            .emit();
     }
 
     /// Mark the next URL change as history travel to `index`. Cleared by the
