@@ -61,6 +61,27 @@ implement the same message directions.
 6. Packaging (D3): local add-on install landed; MSIX/Store related-set policy
    and data migration remain.
 
+## App lifecycle
+
+`src/app/addons.rs` owns the install/update/uninstall orchestration. Install
+copies the add-on (sidecar or `SDSC_BROWSER_ADDON_SOURCE`) into
+`<data>/browser-addon/`, writes `addon.json`, and chains the CEF engine package
+when it is missing or updatable. Update compares the installed metadata
+(version, size, source mtime) against the source. Home's Browser menu acts on
+this app package, not just the engine.
+
+Traces:
+
+- `actions.jsonl`: `home.app.install`, `home.app.update`,
+  `home.app.uninstall`, `home.app.launch` with `pre`/`post`, `repro`, and checks.
+- `home.jsonl`: `browser.addon.install.phase`, `browser.addon.install.done`,
+  `browser.addon.ready`, `browser.engine.install.*`, uninstall phases.
+- `manifest.jsonl`: `browser_addon` state snapshots and `browser_addon_launch`.
+
+Replay steps for the app flow are `home.open`, `home.app.install`,
+`home.app.update`, `home.app.uninstall`, `home.app.launch`, and
+`home.app.close`; source/version can be supplied in step params.
+
 ## What was removed
 
 The main app no longer creates a Browser window, spawns CEF, owns a

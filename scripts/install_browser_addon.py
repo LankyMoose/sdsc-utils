@@ -30,6 +30,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--version", default=None)
     parser.add_argument("--remove", action="store_true")
     args = parser.parse_args()
     data_dir = args.data_dir or default_data_dir()
@@ -57,11 +58,17 @@ def main() -> int:
         return 2
     target_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
+    version = (
+        args.version
+        or os.environ.get("SDSC_BROWSER_ADDON_VERSION")
+        or "dev"
+    )
     meta = {
-        "name": "sdsc-browser",
-        "version": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": version,
         "source": str(source),
-        "installed_at": time.time(),
+        "installed_at": int(time.time()),
+        "size": target.stat().st_size,
+        "source_modified": int(source.stat().st_mtime),
     }
     (target_dir / "addon.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(f"installed {target}")

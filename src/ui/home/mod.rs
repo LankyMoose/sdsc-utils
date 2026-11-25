@@ -449,8 +449,15 @@ pub struct State {
     /// Whether the Launcher tile is enabled in prefs. Disabled tiles still show
     /// (stable layout) but Confirm is a no-op.
     pub launcher_enabled: bool,
-    /// Engine worker live. Drives the Browser tile state.
+    /// Browser runtime ready (add-on installed and engine available). Drives
+    /// the Browser tile state.
     pub engine_ready: bool,
+    /// Add-on package installed under the data directory.
+    pub app_installed: bool,
+    /// Installed add-on version.
+    pub app_version: Option<String>,
+    /// Add-on or engine update available.
+    pub app_update_ready: bool,
     /// D-pad/stick repeat for Home movement.
     nav: crate::domain::pad::NavStepper,
     /// Current face holds for hint rings and the SELECT/START capsules.
@@ -535,6 +542,9 @@ impl Default for State {
             focus: HomeFocus::Apps,
             launcher_enabled: true,
             engine_ready: false,
+            app_installed: false,
+            app_version: None,
+            app_update_ready: false,
             nav: crate::domain::pad::NavStepper::default(),
             cross_held: false,
             square_held: false,
@@ -893,6 +903,21 @@ impl State {
 
     /// Reset edge latches and movement repeat when Home is opened, so a
     /// held button from the opening gesture cannot fire immediately.
+    /// Refresh the managed Browser app state after `on_open` and after each
+    /// install/update/uninstall transition.
+    pub fn set_app_state(
+        &mut self,
+        installed: bool,
+        ready: bool,
+        version: Option<String>,
+        update_ready: bool,
+    ) {
+        self.app_installed = installed;
+        self.engine_ready = ready;
+        self.app_version = version;
+        self.app_update_ready = update_ready;
+    }
+
     pub fn on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
         self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
@@ -1146,11 +1171,13 @@ impl State {
                     }
                 } else if self.uninstalling || self.engine_managed {
                     vec![AppAction::Info]
-                } else if self.engine_ready {
-                    if self.engine_update_ready {
-                        vec![AppAction::Update, AppAction::Uninstall, AppAction::Info]
-                    } else {
+                } else if self.app_update_ready {
+                    vec![AppAction::Update, AppAction::Uninstall, AppAction::Info]
+                } else if self.app_installed {
+                    if self.engine_ready {
                         vec![AppAction::Uninstall, AppAction::Info]
+                    } else {
+                        vec![AppAction::Install, AppAction::Uninstall, AppAction::Info]
                     }
                 } else {
                     vec![AppAction::Install, AppAction::Info]
@@ -1203,8 +1230,15 @@ impl State {
             }
             ManagedApp::Browser if self.engine_managed => "Managed by Store".to_string(),
             ManagedApp::Browser if self.engine_restart_required => "Restart to finish".to_string(),
-            ManagedApp::Browser if self.engine_update_ready => "Update ready".to_string(),
-            ManagedApp::Browser if self.engine_ready => "Installed".to_string(),
+            ManagedApp::Browser if self.app_installed && self.app_update_ready => {
+                "Update ready".to_string()
+            }
+            ManagedApp::Browser if self.app_installed && !self.engine_ready => {
+                "Engine required".to_string()
+            }
+            ManagedApp::Browser if self.app_installed && self.engine_ready => {
+                "Installed".to_string()
+            }
             ManagedApp::Browser => "Not installed".to_string(),
         }
     }
@@ -2487,6 +2521,13 @@ fn app_info<'a>(state: &'a State, index: usize, fade: f32) -> Element<'a, HomeMe
     let warning = theme::scale_alpha(theme::WARNING, fade);
     let mut details = column![].spacing(6);
 
+    if let Some(version) = &state.app_version {
+        details = details.push(
+            text(format!("Browser add-on {version}"))
+                .size(theme::type_scale::CAPTION)
+                .color(muted),
+        );
+    }
     if let Some(version) = &state.engine_version {
         details = details.push(
             text(format!("Browser engine {version}"))
@@ -2851,9 +2892,14 @@ mod tests {
         state.engine_ready = true;
         assert_eq!(
             state.app_actions(0),
-            vec![AppAction::Uninstall, AppAction::Info]
+            vec![AppAction::Install, AppAction::Info]
         );
         assert!(!state.app_dimmed(ManagedApp::Browser));
+        state.set_app_state(true, true, Some("1.0.0".to_string()), false);
+        assert_eq!(
+            state.app_actions(0),
+            vec![AppAction::Uninstall, AppAction::Info]
+        );
     }
 
     #[test]
@@ -2876,6 +2922,7 @@ mod tests {
         );
         state.install_done(true, None);
         assert!(!state.installing);
+        state.set_app_state(true, true, Some("1.0.0".to_string()), false);
         assert_eq!(state.app_status(ManagedApp::Browser), "Installed");
         state.set_uninstalling();
         assert_eq!(state.app_status(ManagedApp::Browser), "Uninstalling");
@@ -2883,14 +2930,36 @@ mod tests {
         state.advance_progress_anim();
         assert!(state.progress_bar_value() > 0.0);
         state.uninstall_done(None);
+        state.set_app_state(false, false, None, false);
         assert_eq!(state.app_status(ManagedApp::Browser), "Not installed");
         assert!(!state.busy());
+    }
+
+    #[test]
+    fn installed_addon_without_engine_offers_install_and_reports_engine_required() {
+        let mut state = State::default();
+        state.set_app_state(true, false, Some("1.0.0".to_string()), false);
+        assert_eq!(
+            state.app_actions(0),
+            vec![AppAction::Install, AppAction::Uninstall, AppAction::Info]
+        );
+        assert_eq!(state.app_status(ManagedApp::Browser), "Engine required");
+        assert!(state.app_dimmed(ManagedApp::Browser));
+
+        state.set_app_state(true, false, Some("1.0.0".to_string()), true);
+        assert_eq!(
+            state.app_actions(0),
+            vec![AppAction::Update, AppAction::Uninstall, AppAction::Info]
+        );
+        assert_eq!(state.app_status(ManagedApp::Browser), "Update ready");
     }
 
     #[test]
     fn update_ready_offers_update_and_managed_hides_uninstall() {
         let mut state = State {
             engine_ready: true,
+            app_installed: true,
+            app_update_ready: true,
             engine_version: Some("1.0.0".to_string()),
             engine_latest_version: Some("1.0.1".to_string()),
             engine_update_ready: true,

@@ -93,6 +93,32 @@ pub struct BrowserAppState {
     pub remote_error: Option<String>,
     /// Latest state snapshot from the add-on's replay handler.
     pub replay_state: Option<serde_json::Value>,
+    /// The add-on package is installed under `<data>/browser-addon/`.
+    pub addon_installed: bool,
+    /// Installed add-on version.
+    pub addon_version: Option<String>,
+    /// Version offered by the local/feed source.
+    pub addon_latest_version: Option<String>,
+    /// A newer add-on package is available.
+    pub addon_update_ready: bool,
+    /// A source package (sidecar or `SDSC_BROWSER_ADDON_SOURCE`) exists.
+    pub addon_source_available: bool,
+    /// Installed add-on size in bytes.
+    pub addon_size: Option<u64>,
+    /// Guards late install workers after cancel/update.
+    pub addon_install_generation: u64,
+    /// Cooperative cancel for the add-on copy worker.
+    pub addon_install_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A copy worker is live.
+    pub addon_copying: bool,
+    /// The app action should continue into the CEF engine component.
+    pub addon_chain_engine: bool,
+    /// The pending app action is an update rather than a fresh install.
+    pub addon_pending_update: bool,
+    /// Action flow spanning add-on install/update and any chained engine work.
+    pub addon_pending_action: Option<crate::platform::trace::PendingAction>,
+    /// Launch flow stays open until the child sends `Ready`.
+    pub pending_launch_action: Option<crate::platform::trace::PendingAction>,
 }
 
 use iced::Task;
@@ -137,6 +163,9 @@ impl super::App {
                 Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
             ]);
         }
+        if self.home_state.busy() || self.browser.addon_copying {
+            return Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep);
+        }
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
             self.replay = None;
             crate::platform::trace::manifest("replay.done", serde_json::json!({ "flow": flow }));
@@ -144,8 +173,12 @@ impl super::App {
             // the plan finishes. The trace is fully written before close.
             return self.close_browser_window();
         };
-        if step.app == "browser" {
-            let state = self.browser_trace_state();
+        let state = match step.app.as_str() {
+            "browser" => Some(self.browser_trace_state()),
+            "home" => Some(self.trace_home_state()),
+            _ => None,
+        };
+        if let Some(state) = state {
             let checks = crate::platform::trace::replay::check_requires(&step.requires, &state);
             if checks
                 .iter()
@@ -295,6 +328,55 @@ impl super::App {
         }
     }
 
+    #[cfg(debug_assertions)]
+    fn replay_home_action(
+        &mut self,
+        step: &crate::platform::trace::replay::ReplayStep,
+    ) -> Task<Message> {
+        match step.action.as_str() {
+            "open" => {
+                if self.home_visible {
+                    Task::none()
+                } else {
+                    self.open_home()
+                }
+            }
+            "app.install" | "app.update" => {
+                let source = step
+                    .params
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(std::path::PathBuf::from);
+                let version = step
+                    .params
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                self.start_browser_app_install(step.action == "app.update", source, version)
+            }
+            "app.uninstall" => self.start_browser_app_uninstall(),
+            "app.launch" => {
+                let close = if self.home_visible {
+                    self.close_home()
+                } else {
+                    Task::none()
+                };
+                close.chain(self.open_browser_window())
+            }
+            "app.close" => self.close_browser_window(),
+            _ => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.unsupported",
+                )
+                .field("app", &step.app)
+                .field("action", &step.action)
+                .emit();
+                Task::none()
+            }
+        }
+    }
+
     fn replay_dispatch(
         &mut self,
         step: &crate::platform::trace::replay::ReplayStep,
@@ -302,6 +384,10 @@ impl super::App {
         #[cfg(debug_assertions)]
         if step.app == "launcher" {
             return self.replay_launcher_action(step);
+        }
+        #[cfg(debug_assertions)]
+        if step.app == "home" {
+            return self.replay_home_action(step);
         }
         if step.app != "browser" {
             crate::platform::trace::event(
@@ -401,7 +487,6 @@ impl super::App {
     /// launch gate additionally requires the add-on executable.
     #[cfg(feature = "cef-engine")]
     pub(crate) fn refresh_engine_status(&mut self) {
-        self.browser.engine_available = crate::app::browser_remote::addon_available();
         self.browser.engine_managed = false;
         self.browser.engine_status = match crate::browser::cef_backend::resolve_engine_dir() {
             Some(path) => {
@@ -415,7 +500,6 @@ impl super::App {
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn refresh_engine_status(&mut self) {
         self.browser.engine_status = EngineStatus::Missing;
-        self.browser.engine_available = false;
         self.browser.engine_managed = false;
     }
 
@@ -448,6 +532,14 @@ impl super::App {
         self.browser.engine_install_previous = Some(self.browser.engine_status.clone());
         self.browser.engine_status = EngineStatus::Installing;
         self.browser.engine_rate = None;
+        if let Some(flow) = self.pending_app_flow() {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Home,
+                "browser.engine.install.start",
+            )
+            .flow(flow)
+            .emit();
+        }
         self.home_state.set_installing(true);
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
@@ -521,12 +613,27 @@ impl super::App {
             );
             return Task::none();
         }
+        let local =
+            crate::browser::engine_install::active_local_dir(&crate::persist::paths::data_dir());
+        if local.as_deref() != Some(path.as_path()) {
+            let message = "Browser engine is supplied by the build or a package".to_string();
+            self.home_state.install_done(false, Some(message));
+            return Task::none();
+        }
         let close_browser = if self.browser_visible {
             self.close_browser_window()
         } else {
             Task::none()
         };
         self.browser.engine_status = EngineStatus::Uninstalling;
+        if let Some(flow) = self.pending_app_flow() {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Home,
+                "browser.engine.uninstall.start",
+            )
+            .flow(flow)
+            .emit();
+        }
         self.home_state.set_uninstalling();
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
@@ -731,6 +838,17 @@ impl super::App {
         let rate = self.note_engine_rate(&progress);
         let mut mapped = home_install_progress(progress);
         mapped.rate_bps = rate;
+        if let Some(flow) = self.pending_app_flow() {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Home,
+                "browser.engine.install.phase",
+            )
+            .flow(flow)
+            .field("phase", mapped.label())
+            .field("bytes_done", mapped.bytes_done)
+            .field("bytes_total", mapped.bytes_total)
+            .emit();
+        }
         self.home_state.set_install_progress(mapped);
         Task::none()
     }
@@ -789,6 +907,11 @@ impl super::App {
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
         self.browser.engine_rate = None;
+        let (success, cancelled, error) = match &outcome {
+            EngineInstallOutcome::Installed(_) => (true, false, None),
+            EngineInstallOutcome::Cancelled => (false, true, None),
+            EngineInstallOutcome::Failed(err) => (false, false, Some(err.clone())),
+        };
         match outcome {
             EngineInstallOutcome::Installed(path) => {
                 self.browser.engine_install_previous = None;
@@ -828,6 +951,19 @@ impl super::App {
             }
         }
         self.sync_home_engine_info();
+        if let Some(flow) = self.pending_app_flow() {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Home,
+                "browser.engine.install.done",
+            )
+            .flow(flow)
+            .field("success", success)
+            .field("cancelled", cancelled)
+            .emit();
+        }
+        if self.browser.addon_pending_action.is_some() {
+            self.finish_app_after_engine_install(success, cancelled, error.as_deref());
+        }
         Task::none()
     }
 
@@ -844,7 +980,7 @@ impl super::App {
         }
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
-        match result {
+        match &result {
             Ok(()) => {
                 self.browser.engine_status = EngineStatus::Missing;
                 self.browser.engine_available = false;
@@ -856,10 +992,26 @@ impl super::App {
             Err(err) => {
                 crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
                 self.browser.engine_status = EngineStatus::Failed(err.clone());
-                self.home_state.uninstall_done(Some(err));
+                self.home_state.uninstall_done(Some(err.clone()));
             }
         }
         self.sync_home_engine_info();
+        if let Some(flow) = self.pending_app_flow() {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Home,
+                "browser.engine.uninstall.done",
+            )
+            .flow(flow)
+            .field("success", result.is_ok())
+            .emit();
+        }
+        if self.browser.addon_pending_action.is_some() {
+            let result = match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(err.clone()),
+            };
+            self.finish_app_after_engine_uninstall(&result);
+        }
         Task::none()
     }
 

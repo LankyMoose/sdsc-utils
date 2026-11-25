@@ -28,22 +28,7 @@ pub(crate) fn addon_available() -> bool {
 }
 
 fn addon_path() -> Option<std::path::PathBuf> {
-    let name = if cfg!(windows) {
-        "sdsc-browser.exe"
-    } else {
-        "sdsc-browser"
-    };
-    // Sidecar next to the main app wins (portable/dev), then the locally
-    // installed add-on under the app data directory.
-    let mut candidates = Vec::new();
-    if let Ok(current) = std::env::current_exe() {
-        candidates.push(current.with_file_name(name));
-    }
-    let installed = crate::persist::paths::data_dir()
-        .join("browser-addon")
-        .join(name);
-    candidates.push(installed);
-    candidates.into_iter().find(|path| path.is_file())
+    crate::browser::addon_install::runtime_path()
 }
 
 pub struct BrowserRemote {
@@ -95,6 +80,10 @@ impl BrowserRemote {
             #[cfg(debug_assertions)]
             replay_seq: 0,
         })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn send(&mut self, message: HostMessage) {
@@ -229,16 +218,36 @@ impl App {
         if self.launcher_visible {
             let _ = self.close_launcher();
         }
+        let replaying = crate::platform::trace::replay::replaying();
+        let source = if replaying { "replay" } else { "home" };
+        let action =
+            crate::platform::trace::action(crate::platform::trace::Lane::Home, "home.app.launch")
+                .app("browser")
+                .source(source)
+                .field("addon_installed", self.browser.addon_installed)
+                .pre(self.trace_home_state())
+                .repro(serde_json::json!({
+                    "app": "home",
+                    "action": "app.launch",
+                    "params": {},
+                }))
+                .begin();
         match BrowserRemote::spawn() {
             Ok(remote) => {
                 self.browser.remote = Some(remote);
                 self.browser_visible = true;
                 let _ = self.home_apps.open(crate::app::home::AppId::Browser);
                 crate::controller::hid::diag::diag_info("ui-diag: browser add-on process open");
+                self.browser.pending_launch_action = Some(action.detach());
                 Task::none()
             }
             Err(err) => {
                 crate::platform::app_log::warn(format!("browser add-on launch failed: {err}"));
+                action
+                    .finish("failed")
+                    .field("error", &err)
+                    .post(self.trace_home_state())
+                    .emit();
                 self.browser.remote_error = Some(err);
                 Task::none()
             }
@@ -246,6 +255,9 @@ impl App {
     }
 
     pub(crate) fn close_remote_browser(&mut self) -> Task<Message> {
+        if let Some(pending) = self.browser.pending_launch_action.take() {
+            pending.abandon("closed_before_ready").emit();
+        }
         if let Some(mut remote) = self.browser.remote.take() {
             remote.shutdown();
             self.browser.remote_spec = None;
@@ -266,6 +278,43 @@ impl App {
             match event {
                 BrowserEvent::Ready(spec) => {
                     crate::platform::app_log::info("browser add-on ready");
+                    let pending = self.browser.pending_launch_action.take();
+                    if let Some(pending) = &pending {
+                        crate::platform::trace::event(
+                            crate::platform::trace::Lane::Home,
+                            "browser.addon.ready",
+                        )
+                        .flow(pending.flow())
+                        .field("version", &spec.manifest.version)
+                        .emit();
+                    } else {
+                        crate::platform::trace::event(
+                            crate::platform::trace::Lane::Home,
+                            "browser.addon.ready",
+                        )
+                        .field("version", &spec.manifest.version)
+                        .emit();
+                    }
+                    let pid = self.browser.remote.as_ref().map(|remote| remote.pid());
+                    if let Some(pending) = pending {
+                        let mut outcome = pending
+                            .settle("launched")
+                            .post(self.trace_home_state())
+                            .check("addon_running", true);
+                        if let Some(pid) = pid {
+                            outcome = outcome.field("pid", pid);
+                        }
+                        outcome.emit();
+                    }
+                    if let Some(pid) = pid {
+                        crate::platform::trace::manifest(
+                            "browser_addon_launch",
+                            serde_json::json!({
+                                "pid": pid,
+                                "installed": self.browser.addon_installed,
+                            }),
+                        );
+                    }
                     self.browser.remote_spec = Some(spec);
                 }
                 BrowserEvent::State {
@@ -307,6 +356,13 @@ impl App {
                 }
                 BrowserEvent::Closed { reason } => {
                     crate::platform::app_log::info(format!("browser add-on closed: {reason}"));
+                    if let Some(pending) = self.browser.pending_launch_action.take() {
+                        pending
+                            .settle("failed")
+                            .field("error", &reason)
+                            .post(self.trace_home_state())
+                            .emit();
+                    }
                     task = task.chain(self.close_remote_browser());
                 }
                 BrowserEvent::Error { message } => {

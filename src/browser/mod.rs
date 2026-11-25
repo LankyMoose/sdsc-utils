@@ -10,6 +10,7 @@
 //! App lifecycle (which app is foreground) lives in [`crate::app::Home`], not
 //! here. This module is engine/runtime plumbing plus pure protocol types.
 
+pub mod addon_install;
 pub mod bookmarks;
 #[cfg(feature = "cef-engine")]
 pub mod cef_backend;

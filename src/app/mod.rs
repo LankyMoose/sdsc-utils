@@ -7,6 +7,7 @@
 //! open — Launcher uses a normal OS window open).
 
 pub(crate) mod actions;
+mod addons;
 mod browser;
 mod browser_remote;
 
@@ -186,6 +187,21 @@ pub enum Message {
     OskOpened(window::Id),
     /// System OSK overlay message (no interactive keys; reserved).
     Osk(crate::ui::osk::OskMessage),
+    /// Browser add-on install/update finished or was cancelled.
+    AddonInstallDone {
+        generation: u64,
+        outcome: crate::browser::addon_install::AddonInstallOutcome,
+    },
+    /// Live add-on copy progress.
+    AddonInstallProgress {
+        generation: u64,
+        progress: crate::browser::addon_install::AddonProgress,
+    },
+    /// Browser add-on uninstall finished.
+    AddonUninstallDone {
+        generation: u64,
+        result: Result<(), String>,
+    },
     /// Optional BrowserEngine install/update finished or was cancelled.
     EngineInstallDone {
         generation: u64,
@@ -364,6 +380,9 @@ impl Message {
             | Message::ShellKey { .. }
             | Message::OskOpened(_)
             | Message::Osk(_)
+            | Message::AddonInstallDone { .. }
+            | Message::AddonInstallProgress { .. }
+            | Message::AddonUninstallDone { .. }
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::HomeProgressTick
@@ -495,6 +514,9 @@ impl Message {
             | Message::ShellKey { .. }
             | Message::OskOpened(_)
             | Message::Osk(_)
+            | Message::AddonInstallDone { .. }
+            | Message::AddonInstallProgress { .. }
+            | Message::AddonUninstallDone { .. }
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
@@ -1190,12 +1212,24 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
         app.seed_steam_library_from_cache();
+        app.refresh_addon_status();
         app.refresh_engine_status();
-        crate::platform::app_log::info(if app.browser.engine_status.is_ready() {
-            "browser: add-on runtime available"
-        } else {
-            "browser: add-on runtime missing"
-        });
+        app.sync_home_app_state();
+        crate::platform::trace::manifest(
+            "browser_addon",
+            serde_json::json!({
+                "state": if app.browser.addon_installed { "installed" } else { "not_installed" },
+                "version": app.browser.addon_version,
+                "source_available": app.browser.addon_source_available,
+                "update_ready": app.browser.addon_update_ready,
+            }),
+        );
+        crate::platform::app_log::info(format!(
+            "browser: add-on installed={} version={} engine_ready={}",
+            app.browser.addon_installed,
+            app.browser.addon_version.as_deref().unwrap_or("-"),
+            app.browser.engine_status.is_ready()
+        ));
 
         // Renderer-pref restart: reopen to the pre-restart UI state.
         // Consumed once; stale (>120s) records are ignored by `take()`.
@@ -1864,6 +1898,17 @@ impl App {
             Message::BrowserFrame => self.poll_remote_browser(),
             Message::OskOpened(id) => self.on_osk_opened(id),
             Message::Osk(_) => Task::none(),
+            Message::AddonInstallDone {
+                generation,
+                outcome,
+            } => self.on_addon_install_done(generation, outcome),
+            Message::AddonInstallProgress {
+                generation,
+                progress,
+            } => self.on_addon_install_progress(generation, progress),
+            Message::AddonUninstallDone { generation, result } => {
+                self.on_addon_uninstall_done(generation, result)
+            }
             Message::EngineInstallDone {
                 generation,
                 outcome,

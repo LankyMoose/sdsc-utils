@@ -23,6 +23,7 @@
 | System OSK QA (Quadrant + Grid) | `python scripts/qa_browser_osk.py` |
 | Launcher Settings OSK proof QA | `python scripts/qa_launcher_osk.py` |
 | Install/remove local Browser add-on | `python scripts/install_browser_addon.py` (`--remove`) |
+| Home Browser install/launch/update/uninstall QA | `python scripts/qa_browser_app.py` |
 | Remote Browser add-on QA (protocol + host launch) | `python scripts/qa_browser_remote.py` |
 | Browser pixel QA (render smoke test) | `python scripts/qa_browser_visual.py` |
 
@@ -100,8 +101,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 | Directory | Typical changes |
 |---|---|
-| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (add-on launch gate, install state, replay driver), `browser_remote.rs` (child supervisor/input bridge), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
-| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture, `server.rs` add-on process; no reader fallback |
+| `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (add-on launch gate/runtime state/replay), `addons.rs` (install/update/uninstall orchestration + traces), `browser_remote.rs` (child supervisor/input bridge), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
+| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture, `server.rs` add-on process, `addon_install.rs` package copy/update metadata; no reader fallback |
 | `src/hosted/` | Re-export of the shared hosted-app contract v0 (manifest/native surface/actions/text session/lifecycle); canonical types live in `crates/browser-protocol/` |
 | `crates/browser-protocol/` | Versioned wire protocol + contract crate: messages, framing, in-process channel, no UI/CEF deps |
 | `src/ui/osk/` | System controller keyboard: Quadrant core/layouts + Grid fallback; no Browser imports |
@@ -131,7 +132,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
 - **Browser v0 is chrome-less, single-tab, and a separate process**: `sdsc-browser` owns its window/CEF/page cursor/text session; the main app owns Home/PS, HID, system OSK, and lifecycle. No address/tabs/bookmarks/history/status UI, popups denied, Home/PS is the only close path. L1/R1/Options are semantic back/forward/reload via `src/app/actions.rs`; tap only. Keep page cursor/D-pad/docking/IME intact.
 - **The OSK is a system service**: `src/ui/osk/` + `src/app/osk.rs`, topmost no-activate overlay; the Browser ships no OSK UI/layout/gesture/mode code. Cross is the only opener (first Cross on a page field); real mouse/keyboard/IME/touch closes it, keyboard keys hand off (Escape consumed). Quadrant is default; Grid fallback; `OskMode` is a system pref (`SDSC_OSK_MODE=quadrant|grid` debug override).
-- **Browser add-on process (default)**: the main app launches `sdsc-browser(.exe)` over stdin/stdout. Lookup is next to the main exe, then `<data>/browser-addon/` (install with `python scripts/install_browser_addon.py`). It streams HID edges/actions, OSK text, and lifecycle; Home/OSK remain in the main app. There is no in-process fallback: `SDSC_BROWSER_REMOTE=0` disables the Browser for automation. Replay is forwarded to the add-on (`HostMessage::Replay`), and `scripts/qa_browser_remote.py` covers protocol, crash recovery, and Home pause.
+- **Browser add-on process (default)**: the main app launches `sdsc-browser(.exe)` over stdin/stdout. Runtime lookup prefers the Home-installed `<data>/browser-addon/` copy, then a development sidecar (or `SDSC_BROWSER_ADDON_SOURCE`). Home owns install/update/uninstall: the add-on is copied from the configured source, its `addon.json` records version/size/source mtime, and updates are detected by version or file change. The engine component is chained when missing/updatable. It streams HID edges/actions, OSK text, and lifecycle; Home/OSK remain in the main app. There is no in-process fallback: `SDSC_BROWSER_REMOTE=0` disables the Browser for automation. Replay is forwarded to the add-on; `scripts/qa_browser_app.py` covers install → launch → update → launch → uninstall, and `scripts/qa_browser_remote.py` covers protocol, crash recovery, and Home pause.
 
 ## Where to find things
 
