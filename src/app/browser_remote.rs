@@ -57,6 +57,7 @@ pub struct BrowserRemote {
     events: Receiver<BrowserEvent>,
     pub last_error: Option<String>,
     seq: u64,
+    replay_seq: u64,
 }
 
 impl BrowserRemote {
@@ -95,11 +96,13 @@ impl BrowserRemote {
             events,
             last_error: None,
             seq: 0,
+            replay_seq: 0,
         })
     }
 
     pub fn send(&mut self, message: HostMessage) {
-        if write_frame(&mut self.stdin, &message).is_err() {
+        if let Err(err) = write_frame(&mut self.stdin, &message) {
+            crate::platform::app_log::warn(format!("browser protocol write failed: {err}"));
             self.last_error = Some("browser protocol write failed".to_string());
         }
     }
@@ -117,6 +120,15 @@ impl BrowserRemote {
             actions: tap_actions.iter().filter_map(to_action).collect(),
         };
         self.send(HostMessage::Input(edge));
+    }
+
+    pub fn send_replay(&mut self, action: &str, params: serde_json::Value) {
+        self.replay_seq = self.replay_seq.wrapping_add(1);
+        self.send(HostMessage::Replay {
+            id: self.replay_seq,
+            action: action.to_string(),
+            params,
+        });
     }
 
     pub fn poll(&mut self) -> Vec<BrowserEvent> {
@@ -257,6 +269,7 @@ impl App {
         for event in events {
             match event {
                 BrowserEvent::Ready(spec) => {
+                    crate::platform::app_log::info("browser add-on ready");
                     self.browser.remote_spec = Some(spec);
                 }
                 BrowserEvent::State {
@@ -268,6 +281,9 @@ impl App {
                         spec.text_session = text_session;
                     }
                 }
+                BrowserEvent::ReplayState { state, .. } => {
+                    self.browser.replay_state = Some(state);
+                }
                 BrowserEvent::RequestTextInput => {
                     if self.browser_visible {
                         task = task
@@ -276,6 +292,19 @@ impl App {
                 }
                 BrowserEvent::RealInput(_) => {
                     task = task.chain(self.close_osk("real_input"));
+                }
+                BrowserEvent::Cursor { cursor } => {
+                    crate::platform::trace::event(crate::platform::trace::Lane::Engine, "cursor")
+                        .field("cursor", cursor)
+                        .emit();
+                }
+                BrowserEvent::PopupDenied { url } => {
+                    crate::platform::trace::event(
+                        crate::platform::trace::Lane::Browser,
+                        "browser.popup_denied",
+                    )
+                    .field("url", url)
+                    .emit();
                 }
                 BrowserEvent::Lifecycle(state) => {
                     crate::platform::app_log::info(format!("browser add-on lifecycle {state:?}"));
@@ -300,8 +329,21 @@ impl App {
     ) -> Task<Message> {
         let semantic = self.hosted_action_for_tap(tap_actions);
         if let Some(invoked) = semantic {
-            if let Some(remote) = &mut self.browser.remote {
-                remote.send(HostMessage::Action(invoked));
+            let enabled = self
+                .browser
+                .remote_spec
+                .as_ref()
+                .is_some_and(|spec| spec.action_enabled(&invoked.action));
+            crate::platform::trace::event(crate::platform::trace::Lane::Platform, "app.action")
+                .field("app", invoked.app.as_str())
+                .field("action", &invoked.action)
+                .field("known_app", true)
+                .field("enabled", enabled)
+                .emit();
+            if enabled {
+                if let Some(remote) = &mut self.browser.remote {
+                    remote.send(HostMessage::Action(invoked));
+                }
             }
             return Task::none();
         }

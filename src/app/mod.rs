@@ -9,6 +9,8 @@
 pub(crate) mod actions;
 mod browser;
 mod browser_remote;
+
+pub(crate) use browser::trace_browser_state;
 mod configure;
 mod feedback;
 mod home;

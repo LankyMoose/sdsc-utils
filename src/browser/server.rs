@@ -18,7 +18,7 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, Theme, stream, window
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static NEXT_LINK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -51,6 +51,8 @@ enum Message {
     Key(RawKey),
     Ime(iced::advanced::input_method::Event),
     Touch,
+    #[cfg(debug_assertions)]
+    Shot(iced::window::Screenshot),
     Tick,
 }
 
@@ -156,6 +158,10 @@ impl BrowserServer {
                     return Task::none();
                 }
                 self.publish(true);
+                if let Some(engine) = &self.engine {
+                    engine.send(EngineCommand::Resume);
+                    engine.send(EngineCommand::SetVisible { visible: true });
+                }
                 crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
             }
             Message::Sized(id, size) => {
@@ -196,6 +202,8 @@ impl BrowserServer {
                 }
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            Message::Shot(shot) => self.save_shot(shot),
             Message::Tick => {
                 let now = Instant::now();
                 self.panel.advance_stick(0.0, 0.0, 0.0, 0.0, false, now);
@@ -306,6 +314,7 @@ impl BrowserServer {
                 self.osk_open = open;
                 Task::none()
             }
+            HostMessage::Replay { id, action, params } => self.on_replay(id, &action, params),
         }
     }
 
@@ -637,7 +646,7 @@ impl BrowserServer {
             }
             BrowserMessage::Scrolled(y) => self.panel.note_scrolled(y),
             #[cfg(debug_assertions)]
-            BrowserMessage::Shot(_) => {}
+            BrowserMessage::Shot(shot) => return self.save_shot(shot),
         }
         Task::none()
     }
@@ -689,9 +698,12 @@ impl BrowserServer {
                     self.panel.session.set_frame_slot(slot);
                 }
             }
+            EngineEvent::PopupRequested { url, .. } => {
+                // v0 denies popups entirely: no new tab and no navigation.
+                self.send(BrowserEvent::PopupDenied { url });
+            }
             EngineEvent::TabOpened { .. }
             | EngineEvent::TabClosed { .. }
-            | EngineEvent::PopupRequested { .. }
             | EngineEvent::HistoryJumpFailed { .. } => {}
             EngineEvent::Frame(frame) => {
                 self.panel
@@ -742,6 +754,9 @@ impl BrowserServer {
                 self.panel.session.apply_engine_history(&entries, current);
             }
             EngineEvent::CursorChanged { cursor, .. } => {
+                self.send(BrowserEvent::Cursor {
+                    cursor: format!("{cursor:?}"),
+                });
                 self.panel.page_cursor = cursor;
             }
             EngineEvent::FocusChanged { id, .. } => {
@@ -766,6 +781,370 @@ impl BrowserServer {
                 }
             },
         }
+        Task::none()
+    }
+
+    fn on_replay(&mut self, id: u64, action: &str, params: serde_json::Value) -> Task<Message> {
+        self.apply_replay(action, &params);
+        self.send(BrowserEvent::ReplayState {
+            id,
+            state: crate::app::trace_browser_state(&self.panel),
+        });
+        #[cfg(debug_assertions)]
+        if action == "screenshot" {
+            return self.shoot();
+        }
+        Task::none()
+    }
+
+    fn apply_replay(&mut self, action: &str, params: &serde_json::Value) {
+        match action {
+            "navigate" => {
+                let Some(url) = params.get("url").and_then(serde_json::Value::as_str) else {
+                    return;
+                };
+                let url = crate::browser::nav::resolve_navigate_target(url);
+                if url.is_empty() {
+                    return;
+                }
+                self.panel.scroll_y = 0.0;
+                self.panel.page.text_session_active = false;
+                self.panel.cursor.reset_for_page();
+                self.panel.focusables.clear();
+                let generation = self.panel.session.begin_load(url.clone());
+                if let Some(engine) = &self.engine {
+                    engine.send(EngineCommand::Navigate {
+                        tab: self.panel.active_tab,
+                        url,
+                        generation,
+                    });
+                }
+            }
+            "click" => {
+                let Some((x, y)) = replay_point(params) else {
+                    return;
+                };
+                if let Some(engine) = &self.engine {
+                    engine.send(EngineCommand::ClickAt {
+                        tab: self.panel.active_tab,
+                        x,
+                        y,
+                        target: None,
+                        trusted: true,
+                    });
+                }
+            }
+            "cursor.dock" => {
+                if let Some((x, y)) = replay_point(params) {
+                    let panel = &mut self.panel;
+                    let id = panel
+                        .focusables
+                        .iter()
+                        .find(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+                        .map(|f| f.id);
+                    panel.cursor.attached = id;
+                    panel.cursor.x = x;
+                    panel.cursor.y = y;
+                    panel.cursor.dock_blend = if id.is_some() { 1.0 } else { 0.0 };
+                    panel.cursor.last_dock = id.and_then(|id| {
+                        panel
+                            .focusables
+                            .iter()
+                            .find(|f| f.id == id)
+                            .map(|f| (f.x, f.y, f.w, f.h))
+                    });
+                }
+            }
+            "pad.tap" => {
+                let button = match params.get("button").and_then(serde_json::Value::as_str) {
+                    Some("cross") => InputButton::Cross,
+                    Some("circle") => InputButton::Circle,
+                    Some("square") => InputButton::Square,
+                    Some("triangle") => InputButton::Triangle,
+                    Some("l3") => InputButton::L3,
+                    Some("r3") => InputButton::R3,
+                    Some("l1") => InputButton::L1,
+                    Some("r1") => InputButton::R1,
+                    Some("options") => InputButton::Options,
+                    _ => return,
+                };
+                self.replay_tap(button);
+            }
+            "pad.dir" => {
+                let dir = match params.get("dir").and_then(serde_json::Value::as_str) {
+                    Some("up") => crate::browser::cursor::JumpDir::Up,
+                    Some("down") => crate::browser::cursor::JumpDir::Down,
+                    Some("left") => crate::browser::cursor::JumpDir::Left,
+                    Some("right") => crate::browser::cursor::JumpDir::Right,
+                    _ => return,
+                };
+                self.panel.jump_cursor(dir);
+            }
+            "history.back" => {
+                let _ = self.browser_go_back();
+            }
+            "history.forward" => {
+                let _ = self.browser_go_forward();
+            }
+            "text" => {
+                if let Some(text) = params.get("text").and_then(serde_json::Value::as_str) {
+                    self.send_text(text);
+                }
+            }
+            "key" => {
+                let Some(key) = params.get("key").and_then(serde_json::Value::as_str) else {
+                    return;
+                };
+                let modifiers = replay_modifiers(params.get("modifiers"));
+                if let Some(events) = synthetic_named(key, modifiers) {
+                    for raw in events {
+                        self.send_key(raw);
+                    }
+                } else if key.chars().count() == 1 {
+                    for raw in synthetic_text(key, modifiers) {
+                        self.send_key(raw);
+                    }
+                }
+            }
+            "ime.preedit" => {
+                if let Some(text) = params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(engine) = &self.engine
+                {
+                    if text.is_empty() {
+                        engine.send(EngineCommand::ImeCancelComposition {
+                            tab: self.panel.active_tab,
+                        });
+                    } else {
+                        engine.send(EngineCommand::ImeSetComposition {
+                            tab: self.panel.active_tab,
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            "ime.commit" => {
+                if let Some(text) = params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(engine) = &self.engine
+                {
+                    if text.is_empty() {
+                        engine.send(EngineCommand::ImeFinishComposition {
+                            tab: self.panel.active_tab,
+                        });
+                    } else {
+                        engine.send(EngineCommand::ImeSetComposition {
+                            tab: self.panel.active_tab,
+                            text: text.to_string(),
+                        });
+                        engine.send(EngineCommand::ImeFinishComposition {
+                            tab: self.panel.active_tab,
+                        });
+                    }
+                }
+            }
+            "screenshot" => {
+                #[cfg(debug_assertions)]
+                {
+                    self.panel.debug_overlay = false;
+                }
+            }
+            "mouse.click" => {
+                if let Some((x, y)) = replay_point(params) {
+                    let count = params
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1)
+                        .clamp(1, 3);
+                    for _ in 0..count {
+                        self.replay_click(x, y);
+                    }
+                }
+            }
+            "mouse.drag" => {
+                let x1 = params.get("x1").and_then(serde_json::Value::as_f64);
+                let y1 = params.get("y1").and_then(serde_json::Value::as_f64);
+                let x2 = params.get("x2").and_then(serde_json::Value::as_f64);
+                let y2 = params.get("y2").and_then(serde_json::Value::as_f64);
+                if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) {
+                    self.replay_drag(x1 as f32, y1 as f32, x2 as f32, y2 as f32);
+                }
+            }
+            "mouse.wheel" => {
+                if let Some((x, y)) = replay_point(params) {
+                    let dx = params
+                        .get("dx")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let dy = params
+                        .get("dy")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    self.replay_wheel(x, y, dx as i32, dy as i32);
+                }
+            }
+            _ => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.unsupported",
+                )
+                .field("action", action)
+                .emit();
+            }
+        }
+        self.sync_mouse();
+    }
+
+    fn replay_tap(&mut self, button: InputButton) {
+        match button {
+            InputButton::Cross => self.click_cursor(),
+            InputButton::L3 => {
+                let cursor = &mut self.panel.cursor;
+                cursor.magnet = !cursor.magnet;
+                if !cursor.magnet {
+                    cursor.attached = None;
+                    cursor.no_dock = None;
+                }
+            }
+            InputButton::L1 => {
+                let _ = self.browser_go_back();
+            }
+            InputButton::R1 => {
+                let _ = self.browser_go_forward();
+            }
+            InputButton::Options => {
+                let _ = self.browser_reload();
+            }
+            _ => {}
+        }
+    }
+
+    fn replay_click(&mut self, x: f32, y: f32) {
+        let count = self.replay_press(x, y);
+        self.replay_release(x, y, count);
+    }
+
+    fn replay_press(&mut self, x: f32, y: f32) -> u8 {
+        let (x, y) = self.clamp_mouse(x, y);
+        let (count, stamp) = next_click_count(self.panel.page_last_click, Instant::now(), x, y);
+        self.panel.page_last_click = stamp;
+        self.panel.page_mouse_active = true;
+        self.panel.page_mouse_down = true;
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.panel.active_tab,
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: true,
+                click_count: count,
+                modifiers: self.panel.page_mouse_modifiers,
+            });
+        }
+        count
+    }
+
+    fn replay_release(&mut self, x: f32, y: f32, count: u8) {
+        let (x, y) = self.clamp_mouse(x, y);
+        self.panel.page_mouse_down = false;
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.panel.active_tab,
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: false,
+                click_count: count,
+                modifiers: self.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    fn replay_move(&mut self, x: f32, y: f32) {
+        let (x, y) = self.clamp_mouse(x, y);
+        self.panel.page_mouse_active = true;
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::MouseMove {
+                tab: self.panel.active_tab,
+                x,
+                y,
+                modifiers: self.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    fn replay_drag(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
+        self.replay_press(x1, y1);
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            self.replay_move(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        }
+        self.replay_release(x2, y2, 1);
+    }
+
+    fn replay_wheel(&mut self, x: f32, y: f32, dx: i32, dy: i32) {
+        let (x, y) = self.clamp_mouse(x, y);
+        self.panel.page_mouse_active = true;
+        if let Some(engine) = &self.engine {
+            engine.send(EngineCommand::MouseWheel {
+                tab: self.panel.active_tab,
+                x,
+                y,
+                dx,
+                dy,
+            });
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn shoot(&mut self) -> Task<Message> {
+        let Some(id) = self.window else {
+            return Task::none();
+        };
+        iced::window::screenshot(id).map(Message::Shot)
+    }
+
+    #[cfg(debug_assertions)]
+    fn save_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
+        let panel = &self.panel;
+        let targets = &panel.focusables;
+        let cursor = (panel.cursor.x, panel.cursor.y);
+        let magnet = panel.cursor.magnet;
+        let dock = panel.cursor.attached;
+        let blend = panel.cursor.dock_blend;
+        let rect = panel
+            .cursor
+            .attached_rect(targets)
+            .map(|(x, y, w, h)| format!("({x:.0},{y:.0}) {w:.0}x{h:.0}"))
+            .unwrap_or_else(|| "-".to_string());
+        let wells = panel.focusables.len();
+        let scroll = panel.scroll_offset;
+        let (w, h) = (shot.size.width, shot.size.height);
+        let scale = shot.scale_factor;
+        let rgba = shot.rgba.to_vec();
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        std::thread::spawn(move || {
+            let dir = crate::persist::paths::data_dir().join("shots");
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                crate::platform::app_log::warn(format!(
+                    "shot skipped: cannot create {dir:?}: {err}"
+                ));
+                return;
+            }
+            let path = dir.join(format!("shot-{ms}.png"));
+            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                Ok(()) => crate::platform::app_log::info(format!(
+                    "shot saved path={} size={w}x{h} scale={scale} cursor=({cx:.0},{cy:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({sx:.0},{sy:.0})",
+                    path.display(),
+                    cx = cursor.0,
+                    cy = cursor.1,
+                    sx = scroll.0,
+                    sy = scroll.1,
+                )),
+                Err(err) => crate::platform::app_log::warn(format!("shot save failed: {err}")),
+            }
+        });
         Task::none()
     }
 
@@ -852,6 +1231,49 @@ impl BrowserServer {
             let _ = writer.flush();
         }
     }
+}
+
+fn replay_point(params: &serde_json::Value) -> Option<(f32, f32)> {
+    let x = params.get("x")?.as_f64()? as f32;
+    let y = params.get("y")?.as_f64()? as f32;
+    Some((x, y))
+}
+
+fn replay_modifiers(value: Option<&serde_json::Value>) -> iced::keyboard::Modifiers {
+    use iced::keyboard::Modifiers;
+    let mut modifiers = Modifiers::empty();
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return modifiers;
+    };
+    for item in items {
+        match item.as_str() {
+            Some("ctrl" | "control") => modifiers |= Modifiers::CTRL,
+            Some("shift") => modifiers |= Modifiers::SHIFT,
+            Some("alt") => modifiers |= Modifiers::ALT,
+            Some("meta" | "logo" | "super") => modifiers |= Modifiers::LOGO,
+            _ => {}
+        }
+    }
+    modifiers
+}
+
+fn next_click_count(
+    last: Option<(Instant, f32, f32, u8)>,
+    now: Instant,
+    x: f32,
+    y: f32,
+) -> (u8, Option<(Instant, f32, f32, u8)>) {
+    let count = match last {
+        Some((at, last_x, last_y, count))
+            if now.saturating_duration_since(at) <= Duration::from_millis(500)
+                && (x - last_x).abs() <= 4.0
+                && (y - last_y).abs() <= 4.0 =>
+        {
+            count.saturating_add(1).min(3)
+        }
+        _ => 1,
+    };
+    (count, Some((now, x, y, count)))
 }
 
 fn to_pad_sample(snapshot: &PadSnapshot) -> PadSample {

@@ -146,6 +146,8 @@ pub struct BrowserAppState {
     pub remote_spec: Option<crate::hosted::AppSpec>,
     /// Last add-on launch/protocol error, for Home/diagnostics.
     pub remote_error: Option<String>,
+    /// Latest state snapshot from the add-on's replay handler.
+    pub replay_state: Option<serde_json::Value>,
 }
 
 use iced::Task;
@@ -183,6 +185,22 @@ const MULTI_CLICK_SLOP: f32 = 4.0;
 
 /// Advance the double/triple-click chain. Returns the count for this press and
 /// the stamp to store for the next one.
+#[cfg(debug_assertions)]
+fn browser_replay_button(name: &str) -> Option<PadButton> {
+    Some(match name {
+        "cross" => PadButton::Cross,
+        "circle" => PadButton::Circle,
+        "square" => PadButton::Square,
+        "triangle" => PadButton::Triangle,
+        "l3" => PadButton::L3,
+        "r3" => PadButton::R3,
+        "l1" => PadButton::L1,
+        "r1" => PadButton::R1,
+        "options" => PadButton::Options,
+        _ => return None,
+    })
+}
+
 fn next_click_count(
     last: Option<(Instant, f32, f32, u8)>,
     now: Instant,
@@ -230,7 +248,7 @@ impl super::App {
             return self.close_browser_window();
         };
         if step.app == "browser" {
-            let state = trace_browser_state(&self.browser.panel);
+            let state = self.browser_trace_state();
             let checks = crate::platform::trace::replay::check_requires(&step.requires, &state);
             if checks
                 .iter()
@@ -259,6 +277,131 @@ impl super::App {
         ])
     }
 
+    pub(crate) fn browser_trace_state(&self) -> serde_json::Value {
+        if self.browser.remote.is_some() {
+            self.browser
+                .replay_state
+                .clone()
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            trace_browser_state(&self.browser.panel)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn remote_replay_step(
+        &mut self,
+        step: &crate::platform::trace::replay::ReplayStep,
+    ) -> Task<Message> {
+        match step.action.as_str() {
+            "osk.stick" => {
+                let x = step
+                    .params
+                    .get("x")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let y = step
+                    .params
+                    .get("y")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let pair = (x, y);
+                match step.params.get("side").and_then(serde_json::Value::as_str) {
+                    Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
+                    _ => self.replay_osk_stick(pair, (0.0, 0.0)),
+                }
+            }
+            "osk.open" => self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage),
+            "osk.close" => self.close_osk("replay"),
+            "key" => {
+                let Some(key) = step.params.get("key").and_then(serde_json::Value::as_str) else {
+                    return Task::none();
+                };
+                let close = self.close_osk("keyboard");
+                if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
+                    return close;
+                }
+                if let Some(remote) = &mut self.browser.remote {
+                    remote.send_replay("key", step.params.clone());
+                }
+                close
+            }
+            "ime.preedit" | "ime.commit" => {
+                let close = self.close_osk("ime");
+                if let Some(remote) = &mut self.browser.remote {
+                    remote.send_replay(&step.action, step.params.clone());
+                }
+                close
+            }
+            "mouse.click" | "mouse.wheel" if self.osk.state.open => self.close_osk("mouse"),
+            "pad.tap" => {
+                let button = step
+                    .params
+                    .get("button")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(browser_replay_button);
+                if let Some(button) = button
+                    && self.osk.state.open
+                {
+                    return self.replay_pad_tap(button);
+                }
+                if button.is_some() {
+                    crate::platform::trace::event(
+                        crate::platform::trace::Lane::Platform,
+                        "replay.pad_tap",
+                    )
+                    .field(
+                        "button",
+                        step.params
+                            .get("button")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .emit();
+                }
+                if let Some(button) = button
+                    && let Some(action) = crate::app::actions::browser_action(button)
+                {
+                    let enabled = self
+                        .browser
+                        .remote_spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.action_enabled(action));
+                    crate::platform::trace::event(
+                        crate::platform::trace::Lane::Platform,
+                        "app.action",
+                    )
+                    .field("app", crate::app::actions::BROWSER_APP)
+                    .field("action", action)
+                    .field("known_app", true)
+                    .field("enabled", enabled)
+                    .emit();
+                }
+                if let Some(remote) = &mut self.browser.remote {
+                    remote.send_replay(&step.action, step.params.clone());
+                }
+                Task::none()
+            }
+            "screenshot" | "text" | "navigate" | "click" | "cursor.dock" | "pad.dir"
+            | "history.back" | "history.forward" | "mouse.click" | "mouse.drag" | "mouse.wheel" => {
+                if let Some(remote) = &mut self.browser.remote {
+                    remote.send_replay(&step.action, step.params.clone());
+                }
+                Task::none()
+            }
+            _ => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "replay.unsupported",
+                )
+                .field("app", &step.app)
+                .field("action", &step.action)
+                .emit();
+                Task::none()
+            }
+        }
+    }
+
     fn replay_dispatch(
         &mut self,
         step: &crate::platform::trace::replay::ReplayStep,
@@ -266,6 +409,9 @@ impl super::App {
         #[cfg(debug_assertions)]
         if step.app == "launcher" {
             return self.replay_launcher_action(step);
+        }
+        if step.app == "browser" && self.browser.remote.is_some() {
+            return self.remote_replay_step(step);
         }
         if step.app != "browser" {
             crate::platform::trace::event(

@@ -290,6 +290,13 @@ pub enum HostMessage {
     OskState {
         open: bool,
     },
+    /// Synthetic replay step for QA. The Browser applies it through its real
+    /// input/navigation handlers and answers with `ReplayState` echoing `id`.
+    Replay {
+        id: u64,
+        action: String,
+        params: serde_json::Value,
+    },
 }
 
 /// Browser → Host state messages.
@@ -309,12 +316,26 @@ pub enum BrowserEvent {
     RequestTextInput,
     /// Real mouse/keyboard/IME/touch input. Closes the system OSK.
     RealInput(RealInput),
+    /// CSS cursor shape at the current page pointer (host keeps the engine
+    /// trace lane for QA; the Browser process has no trace controller).
+    Cursor {
+        cursor: String,
+    },
+    /// A page popup request was denied by Browser v0.
+    PopupDenied {
+        url: String,
+    },
     Lifecycle(LifecycleState),
     Closed {
         reason: String,
     },
     Error {
         message: String,
+    },
+    /// State snapshot after a synthetic replay step, keyed by request `id`.
+    ReplayState {
+        id: u64,
+        state: serde_json::Value,
     },
 }
 
@@ -593,6 +614,15 @@ mod tests {
         let frame = encode_frame(&event).unwrap();
         let decoded: BrowserEvent = decode_frame(&frame).unwrap();
         assert_eq!(decoded, event);
+
+        let replay = HostMessage::Replay {
+            id: 9,
+            action: "navigate".to_string(),
+            params: serde_json::json!({ "url": "https://example.test/" }),
+        };
+        let frame = encode_frame(&replay).unwrap();
+        let decoded: HostMessage = decode_frame(&frame).unwrap();
+        assert_eq!(decoded, replay);
     }
 
     #[test]

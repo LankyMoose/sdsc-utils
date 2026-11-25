@@ -81,8 +81,6 @@ def main() -> int:
     env = os.environ.copy()
     env["SDSC_DEBUG_QUIET"] = "1"
     env["SDSC_DEBUG_INPUT"] = "0"
-    # Replay QA still targets the transitional in-process Browser.
-    env["SDSC_BROWSER_REMOTE"] = "0"
     print(f"session={session}")
     proc = subprocess.Popen(
         [str(exe), "--trace-replay", str(session), "--flow", "1"],
@@ -115,10 +113,13 @@ def main() -> int:
         close_deadline = time.time() + 5
         while time.time() < close_deadline:
             app_log = sandbox / "app.log" if sandbox else None
-            if app_log and app_log.is_file() and "browser window close" in app_log.read_text(
-                encoding="utf-8", errors="replace"
-            ):
-                break
+            if app_log and app_log.is_file():
+                text = app_log.read_text(encoding="utf-8", errors="replace")
+                if (
+                    "browser window close" in text
+                    or "browser add-on process close" in text
+                ):
+                    break
             time.sleep(0.2)
 
         tabs_path = sandbox / "tabs.json" if sandbox else None
