@@ -1219,6 +1219,7 @@ impl App {
             "browser_addon",
             serde_json::json!({
                 "state": if app.browser.addon_installed { "installed" } else { "not_installed" },
+                "managed": app.browser.addon_managed,
                 "version": app.browser.addon_version,
                 "source_available": app.browser.addon_source_available,
                 "update_ready": app.browser.addon_update_ready,

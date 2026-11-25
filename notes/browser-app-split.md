@@ -3,13 +3,13 @@
 **Decision:** the Browser becomes a separate optional process/executable
 (`sdsc-browser`), not a DLL/module. Main app remains the OS/shell.
 **Status:** D1 protocol crate (`6e1a201`), D2 add-on process + host supervisor
-(`6e8fbd3`..`cb5b2d4`), D2e remote replay (`fc1a3e3`), and D2f in-process
-removal are landed. `sdsc-browser` owns its window/CEF/cursor/text session;
-the main app owns Home/PS, HID, system OSK, lifecycle, and the engine package.
-The add-on is resolved next to the main exe, then
-`<data>/browser-addon/` (install via `scripts/install_browser_addon.py`).
+(`6e8fbd3`..`cb5b2d4`), D2e remote replay (`fc1a3e3`), D2f in-process
+removal, and the Home-managed local lifecycle (`47b1c2f`..`159cea8`) are
+landed. `sdsc-browser` owns its window/CEF/cursor/text session; the main app
+owns Home/PS, HID, system OSK, lifecycle, and the engine package. Resolution
+order is package-owned sidecar → `<data>/browser-addon/` → development sidecar.
 There is no in-process Browser fallback; `SDSC_BROWSER_REMOTE=0` disables the
-Browser for automation. MSIX/Store packaging remains D3.
+Browser for automation. MSIX/Store submission remains D3.
 
 ## Transport
 
@@ -59,16 +59,36 @@ implement the same message directions.
 5. Replay is forwarded to the add-on (`HostMessage::Replay`) and answered with
    `BrowserEvent::ReplayState`; all browser QA scripts run against the child.
 6. Packaging (D3): local add-on install landed; MSIX/Store related-set policy
-   and data migration remain.
+   remains.
+
+## Data directory
+
+`%APPDATA%\sdsc-utils` (or the platform equivalent from
+`persist::paths::data_dir`) stays canonical. The host sends that path in
+`Hello.data_dir`; `sdsc-browser` pins it before the window, CEF profile, tabs,
+or bookmarks are touched, so a packaged add-on with a different package
+identity still shares the shell's data. The supervisor also exports
+`SDSC_DATA_DIR` to the child because CEF re-executes the binary for
+renderer/GPU subprocesses before any `Hello` frame exists.
+
+`addon.json` carries `protocol`; Home treats an install built for a different
+host protocol as update-required, and the launch preflight refuses to spawn it
+instead of taking a protocol close. There is no data migration step because the
+Browser add-on and engine are unreleased: the shared path is the contract from
+the first shipped build.
+
+Runtime precedence is package-owned sidecar → Home-installed copy →
+development sidecar (`SDSC_BROWSER_ADDON_PACKAGE_DIR` mocks the first for QA).
+A package-owned sidecar always wins; a leftover local copy is simply ignored.
 
 ## App lifecycle
 
 `src/app/addons.rs` owns the install/update/uninstall orchestration. Install
 copies the add-on (sidecar or `SDSC_BROWSER_ADDON_SOURCE`) into
 `<data>/browser-addon/`, writes `addon.json`, and chains the CEF engine package
-when it is missing or updatable. Update compares the installed metadata
-(version, size, source mtime) against the source. Home's Browser menu acts on
-this app package, not just the engine.
+when it is missing or updatable. Update compares the installed protocol plus
+metadata (version, size, source mtime) against the source. Home's Browser menu
+acts on this app package, not just the engine.
 
 Traces:
 

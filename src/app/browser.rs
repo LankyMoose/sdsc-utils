@@ -101,6 +101,8 @@ pub struct BrowserAppState {
     pub addon_latest_version: Option<String>,
     /// A newer add-on package is available.
     pub addon_update_ready: bool,
+    /// A package-owned add-on exists; Home must not install/remove it.
+    pub addon_managed: bool,
     /// A source package (sidecar or `SDSC_BROWSER_ADDON_SOURCE`) exists.
     pub addon_source_available: bool,
     /// Installed add-on size in bytes.
@@ -163,7 +165,13 @@ impl super::App {
                 Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
             ]);
         }
-        if self.home_state.busy() || self.browser.addon_copying {
+        if self.home_state.busy()
+            || self.browser.addon_copying
+            || self.browser.pending_launch_action.is_some()
+        {
+            // Launch settles on the add-on's `Ready` (or `Closed`). Replay must
+            // not advance into navigate/close while the handshake is pending,
+            // or the launch would be recorded as closed-before-ready.
             return Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep);
         }
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {

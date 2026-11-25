@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Install the local Browser add-on next to the app data.
 
-Copies `sdsc-browser` into `<data-dir>/browser-addon/` and writes `addon.json`.
-This is the local-install step before MSIX/Store packaging.
+Copies `sdsc-browser` into `<data-dir>/browser-addon/` and writes `addon.json`
+with the same protocol Home writes. This is the unpackaged/portable install
+path; packaged builds ship the add-on next to the main executable.
+
+Keep `PROTOCOL_VERSION` in sync with `crates/browser-protocol`.
 """
 
 from __future__ import annotations
@@ -10,10 +13,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
+
+PROTOCOL_VERSION = 1
+
+
+def package_version(root: Path) -> str:
+    try:
+        text = (root / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        return "dev"
+    match = re.search(r'(?m)^\[package\].*?^version\s*=\s*"([^"]+)"', text, re.S)
+    return match.group(1) if match else "dev"
 
 
 def default_data_dir() -> Path:
@@ -22,7 +37,12 @@ def default_data_dir() -> Path:
         return Path(override)
     if os.name == "nt" and os.environ.get("APPDATA"):
         return Path(os.environ["APPDATA"]) / "sdsc-utils"
-    return Path.home() / ".local" / "share" / "sdsc-utils"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "sdsc-utils"
+    config = os.environ.get("XDG_CONFIG_HOME")
+    if config:
+        return Path(config) / "sdsc-utils"
+    return Path.home() / ".config" / "sdsc-utils"
 
 
 def main() -> int:
@@ -61,9 +81,10 @@ def main() -> int:
     version = (
         args.version
         or os.environ.get("SDSC_BROWSER_ADDON_VERSION")
-        or "dev"
+        or package_version(root)
     )
     meta = {
+        "protocol": PROTOCOL_VERSION,
         "version": version,
         "source": str(source),
         "installed_at": int(time.time()),

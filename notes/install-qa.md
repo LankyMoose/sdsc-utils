@@ -138,6 +138,9 @@ running CEF stays loaded until restart (`Restart to finish` in Info).
 | `SDSC_CEF_DLC_URL` / `SDSC_CEF_DLC_SHA256` | env-only engine feed (legacy fallback) |
 | `SDSC_CEF_DLC_MANIFEST_URL` | version/changelog/download engine manifest |
 | `SDSC_MSIX_ENGINE_DIR` | resolver mock for the optional BrowserEngine package |
+| `SDSC_BROWSER_ADDON_PACKAGE_DIR` | resolver mock for a package-owned `sdsc-browser` sidecar |
+| `SDSC_BROWSER_ADDON_SOURCE` | local add-on install/update source |
+| `SDSC_DATA_DIR` | shared data dir override (replay/QA sandbox) |
 | `SDSC_CEF_NO_BUILD_FALLBACK` | engine resolver in debug/qa-feed builds |
 | `APPDATA` | app data dir (`%APPDATA%\sdsc-utils`) |
 | `SDSC_DEBUG_OPEN` | debug builds: open `home`/`launcher`/`browser`/etc. after boot |

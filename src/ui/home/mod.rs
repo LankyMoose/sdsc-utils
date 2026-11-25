@@ -458,6 +458,8 @@ pub struct State {
     pub app_version: Option<String>,
     /// Add-on or engine update available.
     pub app_update_ready: bool,
+    /// The add-on ships with the app package (Store-managed).
+    pub app_managed: bool,
     /// D-pad/stick repeat for Home movement.
     nav: crate::domain::pad::NavStepper,
     /// Current face holds for hint rings and the SELECT/START capsules.
@@ -545,6 +547,7 @@ impl Default for State {
             app_installed: false,
             app_version: None,
             app_update_ready: false,
+            app_managed: false,
             nav: crate::domain::pad::NavStepper::default(),
             cross_held: false,
             square_held: false,
@@ -1169,7 +1172,7 @@ impl State {
                     } else {
                         vec![AppAction::Cancel, AppAction::Info]
                     }
-                } else if self.uninstalling || self.engine_managed {
+                } else if self.uninstalling || self.app_managed || self.engine_managed {
                     vec![AppAction::Info]
                 } else if self.app_update_ready {
                     vec![AppAction::Update, AppAction::Uninstall, AppAction::Info]
@@ -1228,7 +1231,9 @@ impl State {
             ManagedApp::Browser if self.installing || self.uninstalling => {
                 self.progress.label().to_string()
             }
-            ManagedApp::Browser if self.engine_managed => "Managed by Store".to_string(),
+            ManagedApp::Browser if self.engine_managed || self.app_managed => {
+                "Managed by Store".to_string()
+            }
             ManagedApp::Browser if self.engine_restart_required => "Restart to finish".to_string(),
             ManagedApp::Browser if self.app_installed && self.app_update_ready => {
                 "Update ready".to_string()
@@ -2971,6 +2976,19 @@ mod tests {
         );
         assert_eq!(state.app_status(ManagedApp::Browser), "Update ready");
         state.engine_managed = true;
+        assert_eq!(state.app_actions(0), vec![AppAction::Info]);
+        assert_eq!(state.app_status(ManagedApp::Browser), "Managed by Store");
+    }
+
+    #[test]
+    fn managed_addon_hides_local_actions() {
+        let state = State {
+            engine_ready: true,
+            app_installed: true,
+            app_update_ready: true,
+            app_managed: true,
+            ..State::default()
+        };
         assert_eq!(state.app_actions(0), vec![AppAction::Info]);
         assert_eq!(state.app_status(ManagedApp::Browser), "Managed by Store");
     }

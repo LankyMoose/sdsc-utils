@@ -1,5 +1,6 @@
 //! Host-side supervisor for the standalone `sdsc-browser` add-on process.
 
+use crate::browser::addon_install::RuntimeKind;
 use crate::domain::pad::{PadAction, PadButton, PadButtonAction};
 use crate::hosted::{
     BrowserEvent, Hello, HostMessage, InputAction, InputActionKind, InputButton, InputEdge,
@@ -28,7 +29,7 @@ pub(crate) fn addon_available() -> bool {
 }
 
 fn addon_path() -> Option<std::path::PathBuf> {
-    crate::browser::addon_install::runtime_path()
+    crate::browser::addon_install::selected_runtime().map(|(path, _)| path)
 }
 
 pub struct BrowserRemote {
@@ -36,6 +37,7 @@ pub struct BrowserRemote {
     stdin: BufWriter<ChildStdin>,
     events: Receiver<BrowserEvent>,
     pub last_error: Option<String>,
+    runtime: RuntimeKind,
     seq: u64,
     #[cfg(debug_assertions)]
     replay_seq: u64,
@@ -43,10 +45,16 @@ pub struct BrowserRemote {
 
 impl BrowserRemote {
     pub fn spawn() -> Result<Self, String> {
-        let exe = addon_path().ok_or_else(|| {
-            "browser add-on executable not found next to the main app".to_string()
-        })?;
+        let (exe, runtime) =
+            crate::browser::addon_install::selected_runtime().ok_or_else(|| {
+                "browser add-on executable not found next to the main app".to_string()
+            })?;
+        let data_dir = crate::persist::paths::data_dir();
         let mut child = Command::new(&exe)
+            // CEF re-executes this binary for renderer/GPU subprocesses before
+            // it can read `Hello`. Inherit the host's data directory so they
+            // resolve the same profile/engine paths.
+            .env("SDSC_DATA_DIR", &data_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -67,7 +75,7 @@ impl BrowserRemote {
             protocol: PROTOCOL_VERSION,
             app: crate::hosted::AppId::new("browser"),
             host_pid: std::process::id(),
-            data_dir: crate::persist::paths::data_dir().display().to_string(),
+            data_dir: data_dir.display().to_string(),
         };
         let mut stdin = BufWriter::new(stdin);
         write_frame(&mut stdin, &HostMessage::Hello(hello)).map_err(|err| err.to_string())?;
@@ -76,6 +84,7 @@ impl BrowserRemote {
             stdin,
             events,
             last_error: None,
+            runtime,
             seq: 0,
             #[cfg(debug_assertions)]
             replay_seq: 0,
@@ -84,6 +93,10 @@ impl BrowserRemote {
 
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    pub fn runtime(&self) -> RuntimeKind {
+        self.runtime
     }
 
     pub fn send(&mut self, message: HostMessage) {
@@ -220,11 +233,16 @@ impl App {
         }
         let replaying = crate::platform::trace::replay::replaying();
         let source = if replaying { "replay" } else { "home" };
+        let runtime = crate::browser::addon_install::selected_runtime().map(|(_, kind)| kind);
         let action =
             crate::platform::trace::action(crate::platform::trace::Lane::Home, "home.app.launch")
                 .app("browser")
                 .source(source)
                 .field("addon_installed", self.browser.addon_installed)
+                .field(
+                    "runtime",
+                    runtime.map(RuntimeKind::as_str).unwrap_or("none"),
+                )
                 .pre(self.trace_home_state())
                 .repro(serde_json::json!({
                     "app": "home",
@@ -232,6 +250,19 @@ impl App {
                     "params": {},
                 }))
                 .begin();
+        if let Some(reason) = crate::browser::addon_install::launch_blocker() {
+            // An add-on built for another host protocol must be updated, not
+            // spawned into a guaranteed protocol close.
+            crate::platform::app_log::warn(format!("browser add-on launch blocked: {reason}"));
+            action
+                .finish("failed")
+                .field("reason", "addon_update_required")
+                .field("error", &reason)
+                .post(self.trace_home_state())
+                .emit();
+            self.browser.remote_error = Some(reason);
+            return Task::none();
+        }
         match BrowserRemote::spawn() {
             Ok(remote) => {
                 self.browser.remote = Some(remote);
@@ -278,6 +309,7 @@ impl App {
             match event {
                 BrowserEvent::Ready(spec) => {
                     crate::platform::app_log::info("browser add-on ready");
+                    let runtime = self.browser.remote.as_ref().map(|remote| remote.runtime());
                     let pending = self.browser.pending_launch_action.take();
                     if let Some(pending) = &pending {
                         crate::platform::trace::event(
@@ -286,6 +318,10 @@ impl App {
                         )
                         .flow(pending.flow())
                         .field("version", &spec.manifest.version)
+                        .field(
+                            "runtime",
+                            runtime.map(RuntimeKind::as_str).unwrap_or("none"),
+                        )
                         .emit();
                     } else {
                         crate::platform::trace::event(
@@ -293,6 +329,10 @@ impl App {
                             "browser.addon.ready",
                         )
                         .field("version", &spec.manifest.version)
+                        .field(
+                            "runtime",
+                            runtime.map(RuntimeKind::as_str).unwrap_or("none"),
+                        )
                         .emit();
                     }
                     let pid = self.browser.remote.as_ref().map(|remote| remote.pid());
@@ -312,6 +352,7 @@ impl App {
                             serde_json::json!({
                                 "pid": pid,
                                 "installed": self.browser.addon_installed,
+                                "runtime": runtime.map(RuntimeKind::as_str),
                             }),
                         );
                     }

@@ -18,15 +18,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 impl App {
     pub(crate) fn refresh_addon_status(&mut self) -> AddonStatus {
         let status = addon_install::status();
-        self.browser.addon_installed = status.installed.is_some();
+        self.browser.addon_installed = status.installed.is_some() || status.managed;
+        self.browser.addon_managed = status.managed;
         self.browser.addon_version = status
             .installed
             .as_ref()
             .map(|meta| meta.version.clone())
-            .filter(|version| !version.is_empty());
+            .filter(|version| !version.is_empty())
+            .or_else(|| {
+                status
+                    .managed
+                    .then(|| crate::platform::app_meta::PKG_VERSION.to_string())
+            });
         self.browser.addon_latest_version =
             status.source.as_ref().map(|source| source.version.clone());
-        self.browser.addon_update_ready = status.update_ready;
+        // A package-owned add-on is updated with the app, never by Home.
+        self.browser.addon_update_ready = status.update_ready && !status.managed;
         self.browser.addon_source_available = status.source.is_some();
         self.browser.addon_size = status.installed.as_ref().map(|meta| meta.size);
         self.browser.engine_available = addon_install::runtime_path().is_some();
@@ -34,6 +41,7 @@ impl App {
     }
 
     pub(crate) fn sync_home_app_state(&mut self) {
+        self.home_state.app_managed = self.browser.addon_managed;
         self.home_state.set_app_state(
             self.browser.addon_installed,
             self.browser.addon_installed && self.browser.engine_status.is_ready(),
@@ -114,6 +122,15 @@ impl App {
                 .emit();
             return Task::none();
         }
+        if status.managed {
+            // Store-owned add-on: updates arrive with the app package.
+            action
+                .finish("managed")
+                .field("reason", "package_owned")
+                .post(self.trace_home_state())
+                .emit();
+            return Task::none();
+        }
 
         // The add-on alone is not enough to launch; chain the engine component
         // whenever it is missing or has a pending update.
@@ -121,7 +138,8 @@ impl App {
             !self.browser.engine_status.is_ready() || self.home_state.engine_update_ready;
         let addon_update_ready = match (&status.installed, &source) {
             (Some(meta), Some(source)) => {
-                meta.version != source.version
+                !meta.protocol_compatible()
+                    || meta.version != source.version
                     || meta.size != source.size
                     || meta.source_modified != source.modified
             }
@@ -362,6 +380,7 @@ impl App {
                     serde_json::json!({
                         "state": "installed",
                         "version": meta.version,
+                        "protocol": meta.protocol,
                         "size": meta.size,
                         "source": meta.source,
                     }),
@@ -488,7 +507,6 @@ impl App {
         false
     }
 
-    #[cfg(feature = "cef-engine")]
     pub(crate) fn pending_app_flow(&self) -> Option<crate::platform::trace::FlowId> {
         self.browser
             .addon_pending_action

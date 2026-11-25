@@ -849,6 +849,7 @@ impl App {
             },
             "addon": {
                 "installed": self.browser.addon_installed,
+                "managed": self.browser.addon_managed,
                 "version": self.browser.addon_version,
                 "latest_version": self.browser.addon_latest_version,
                 "update_ready": self.browser.addon_update_ready,

@@ -55,7 +55,15 @@ def recv_until(proc: subprocess.Popen, kind: str, timeout: float = 10.0) -> dict
 def protocol_check(exe: Path, data_dir: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DATA_DIR"] = str(data_dir)
+    # Prove the Hello.data_dir contract: no process override, and a decoy
+    # platform data dir that must stay empty. A regression would write tabs
+    # and the CEF profile into the decoy instead of the host's directory.
+    env.pop("SDSC_DATA_DIR", None)
+    decoy = data_dir.parent / f"{data_dir.name}-decoy"
+    env["APPDATA"] = str(decoy)
+    env["LOCALAPPDATA"] = str(decoy)
+    env["XDG_CONFIG_HOME"] = str(decoy)
+    env["HOME"] = str(decoy)
     proc = subprocess.Popen(
         [str(exe)],
         stdin=subprocess.PIPE,
@@ -119,6 +127,19 @@ def protocol_check(exe: Path, data_dir: Path) -> tuple[bool, str]:
         tabs = data_dir / "tabs.json"
         if not tabs.is_file() or "remote.html" not in tabs.read_text(encoding="utf-8"):
             return False, "browser did not persist the replayed page"
+        # The add-on's lazy logger may fall back to the platform APPDATA path
+        # before any host frame exists; anything else under the decoy means the
+        # Hello.data_dir contract was ignored.
+        stray = [
+            path
+            for path in decoy.rglob("*")
+            if path.is_file() and path.name not in {"app.log", "hid-trace.log"}
+        ]
+        if stray:
+            return (
+                False,
+                f"browser used the platform data dir instead of Hello.data_dir: {stray[:3]}",
+            )
         return True, "protocol ok"
     finally:
         if proc.poll() is None:

@@ -26,6 +26,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin = std::io::stdin();
     let hello: Hello = read_frame(&mut stdin)?;
     hello.validate()?;
+    // The host is authoritative for shared data. Apply this before the window,
+    // CEF profile, tabs, or bookmarks are touched.
+    if !hello.data_dir.trim().is_empty() {
+        let _ =
+            crate::persist::paths::set_data_dir_override(std::path::PathBuf::from(&hello.data_dir));
+    }
 
     iced::daemon(
         move || BrowserServer::boot(hello.clone()),

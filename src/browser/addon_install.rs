@@ -9,6 +9,7 @@
 //! Copies are staged and renamed into place. A running add-on maps its own
 //! executable on Windows, so callers must close it before installing.
 
+use crate::hosted::PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -19,6 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const ADDON_DIR: &str = "browser-addon";
 pub const SOURCE_ENV: &str = "SDSC_BROWSER_ADDON_SOURCE";
 pub const VERSION_ENV: &str = "SDSC_BROWSER_ADDON_VERSION";
+/// Mock/test path for a package-owned add-on (same resolver slot as an MSIX
+/// sidecar, so managed precedence is testable without packaging).
+pub const PACKAGE_DIR_ENV: &str = "SDSC_BROWSER_ADDON_PACKAGE_DIR";
 const META_FILE: &str = "addon.json";
 const STAGING_DIR: &str = "browser-addon.staging";
 const COPY_BUFFER: usize = 256 * 1024;
@@ -27,6 +31,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Metadata persisted with an installed add-on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddonMeta {
+    /// Host protocol the packaged executable was built for.
+    #[serde(default)]
+    pub protocol: u16,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
@@ -39,6 +46,12 @@ pub struct AddonMeta {
     pub source_modified: u64,
 }
 
+impl AddonMeta {
+    pub fn protocol_compatible(&self) -> bool {
+        self.protocol == PROTOCOL_VERSION
+    }
+}
+
 /// A package available for install/update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddonSource {
@@ -48,6 +61,28 @@ pub struct AddonSource {
     pub modified: u64,
 }
 
+/// Which executable the launch path will use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKind {
+    /// Sidecar shipped inside the app package (MSIX/Store or a packaged
+    /// portable layout). Managed by the package, not by Home.
+    Packaged,
+    /// Copy installed by Home under `<data>/browser-addon/`.
+    Installed,
+    /// Development sidecar next to the current executable.
+    Sidecar,
+}
+
+impl RuntimeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Packaged => "packaged",
+            Self::Installed => "installed",
+            Self::Sidecar => "sidecar",
+        }
+    }
+}
+
 /// Current install/update state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddonStatus {
@@ -55,6 +90,8 @@ pub struct AddonStatus {
     /// Newer/different package next to the app or at `SOURCE_ENV`.
     pub source: Option<AddonSource>,
     pub update_ready: bool,
+    /// A package-owned executable exists; Home must not install/remove it.
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,14 +135,51 @@ pub fn installed_exe(data_dir: &Path) -> PathBuf {
     data_dir.join(ADDON_DIR).join(exe_name())
 }
 
-/// Installed add-on executable, then the development sidecar.
-pub fn runtime_path() -> Option<PathBuf> {
-    let data = crate::persist::paths::data_dir();
-    let installed = installed_exe(&data);
-    if installed.is_file() {
-        return Some(installed);
+/// Package-owned executable, when the app itself ships one.
+///
+/// `PACKAGE_DIR_ENV` mocks a packaged sidecar for QA. Real packaging puts
+/// `sdsc-browser[.exe]` next to the main executable inside the MSIX.
+pub fn packaged_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(PACKAGE_DIR_ENV) {
+        let candidate = PathBuf::from(dir).join(exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
-    sidecar_path().filter(|path| path.is_file())
+    if crate::platform::packaged::is_packaged() {
+        let candidate = std::env::current_exe().ok()?.with_file_name(exe_name());
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolution order: package-owned add-on, Home-installed copy, development
+/// sidecar. A packaged add-on wins so a stale local copy cannot shadow the
+/// Store-managed build.
+pub fn selected_runtime() -> Option<(PathBuf, RuntimeKind)> {
+    selected_runtime_in(&crate::persist::paths::data_dir(), packaged_path())
+}
+
+fn selected_runtime_in(
+    data_dir: &Path,
+    packaged: Option<PathBuf>,
+) -> Option<(PathBuf, RuntimeKind)> {
+    if let Some(path) = packaged.filter(|path| path.is_file()) {
+        return Some((path, RuntimeKind::Packaged));
+    }
+    let installed = installed_exe(data_dir);
+    if installed.is_file() {
+        return Some((installed, RuntimeKind::Installed));
+    }
+    sidecar_path()
+        .filter(|path| path.is_file())
+        .map(|path| (path, RuntimeKind::Sidecar))
+}
+
+pub fn runtime_path() -> Option<PathBuf> {
+    selected_runtime().map(|(path, _)| path)
 }
 
 pub fn is_installed() -> bool {
@@ -113,23 +187,57 @@ pub fn is_installed() -> bool {
 }
 
 pub fn status() -> AddonStatus {
-    status_in(&crate::persist::paths::data_dir(), source())
+    let mut status = status_in(&crate::persist::paths::data_dir(), source());
+    status.managed = packaged_path().is_some();
+    status
 }
 
 pub fn status_in(data_dir: &Path, source: Option<AddonSource>) -> AddonStatus {
-    let installed = read_meta(data_dir).filter(|_| installed_exe(data_dir).is_file());
-    let update_ready = installed.as_ref().is_some_and(|meta| {
-        source.as_ref().is_some_and(|source| {
-            meta.version != source.version
-                || meta.size != source.size
-                || meta.source_modified != source.modified
-        })
-    });
+    // An executable without metadata cannot prove protocol compatibility;
+    // defaulting it keeps the update action visible instead of pretending it
+    // is launchable.
+    let installed = if installed_exe(data_dir).is_file() {
+        Some(read_meta(data_dir).unwrap_or_default())
+    } else {
+        None
+    };
+    let protocol_mismatch = installed
+        .as_ref()
+        .is_some_and(|meta| !meta.protocol_compatible());
+    let update_ready = protocol_mismatch
+        || installed.as_ref().is_some_and(|meta| {
+            source.as_ref().is_some_and(|source| {
+                meta.version != source.version
+                    || meta.size != source.size
+                    || meta.source_modified != source.modified
+            })
+        });
     AddonStatus {
         installed,
         source,
         update_ready,
+        managed: false,
     }
+}
+
+/// Refuse to launch a Home-installed add-on built for another host protocol.
+/// A packaged add-on is trusted (the Store updates it with the app).
+pub fn launch_blocker() -> Option<String> {
+    launch_blocker_in(&crate::persist::paths::data_dir(), packaged_path())
+}
+
+fn launch_blocker_in(data_dir: &Path, packaged: Option<PathBuf>) -> Option<String> {
+    let (_, kind) = selected_runtime_in(data_dir, packaged)?;
+    if kind != RuntimeKind::Installed {
+        return None;
+    }
+    let meta = read_meta(data_dir).unwrap_or_default();
+    (!meta.protocol_compatible()).then(|| {
+        format!(
+            "Browser add-on needs an update (protocol {}/{PROTOCOL_VERSION})",
+            meta.protocol
+        )
+    })
 }
 
 pub fn source() -> Option<AddonSource> {
@@ -252,6 +360,7 @@ fn install_into(
     });
 
     let meta = AddonMeta {
+        protocol: PROTOCOL_VERSION,
         version: source.version.clone(),
         source: source.path.display().to_string(),
         installed_at: epoch_secs(),
@@ -339,6 +448,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let meta = install_in(&source_v1, &data, &mut |p| progress.push(p), &cancel).unwrap();
         assert_eq!(meta.version, "1.0");
+        assert_eq!(meta.protocol, PROTOCOL_VERSION);
+        assert!(meta.protocol_compatible());
         assert!(installed_exe(&data).is_file());
         assert!(
             progress
@@ -402,6 +513,82 @@ mod tests {
         let mut changed = source.clone();
         changed.version = "2.0".to_string();
         assert!(status_in(&data, Some(changed)).update_ready);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn protocol_mismatch_requires_update() {
+        let dir = fixture("protocol");
+        let data = dir.join("data");
+        let installed = data.join(ADDON_DIR);
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join(exe_name()), b"old payload").unwrap();
+
+        // No metadata at all: compatibility is unknown, so update.
+        let status = status_in(&data, None);
+        assert!(!status.installed.as_ref().unwrap().protocol_compatible());
+        assert!(status.update_ready);
+
+        // A different host protocol must not be treated as current.
+        fs::write(
+            installed.join(META_FILE),
+            br#"{"protocol":99,"version":"1.0"}"#,
+        )
+        .unwrap();
+        let status = status_in(&data, None);
+        assert!(!status.installed.as_ref().unwrap().protocol_compatible());
+        assert!(status.update_ready);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn protocol_mismatch_blocks_launch_until_updated() {
+        let dir = fixture("blocked");
+        let data = dir.join("data");
+        let installed = data.join(ADDON_DIR);
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join(exe_name()), b"old payload").unwrap();
+        fs::write(
+            installed.join(META_FILE),
+            br#"{"protocol":99,"version":"1.0"}"#,
+        )
+        .unwrap();
+        assert!(launch_blocker_in(&data, None).is_some());
+
+        let packaged = dir.join("package").join(exe_name());
+        fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        fs::write(&packaged, b"packaged payload").unwrap();
+        assert!(launch_blocker_in(&data, Some(packaged)).is_none());
+
+        let source = source(&dir, "current.exe", b"current payload", "1.0");
+        let cancel = AtomicBool::new(false);
+        install_in(&source, &data, &mut |_| {}, &cancel).unwrap();
+        assert!(launch_blocker_in(&data, None).is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn packaged_runtime_wins_over_stale_local_copy() {
+        let dir = fixture("precedence");
+        let data = dir.join("data");
+        let source = source(&dir, "source.exe", b"payload", "1.0");
+        let cancel = AtomicBool::new(false);
+        install_in(&source, &data, &mut |_| {}, &cancel).unwrap();
+        let packaged = dir.join("package").join(exe_name());
+        fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        fs::write(&packaged, b"packaged payload").unwrap();
+
+        let (path, kind) = selected_runtime_in(&data, Some(packaged.clone())).unwrap();
+        assert_eq!(kind, RuntimeKind::Packaged);
+        assert_eq!(path, packaged);
+
+        let (path, kind) = selected_runtime_in(&data, None).unwrap();
+        assert_eq!(kind, RuntimeKind::Installed);
+        assert_eq!(path, installed_exe(&data));
+
+        // A missing package candidate must not shadow the local copy.
+        let (_, kind) = selected_runtime_in(&data, Some(dir.join("missing.exe"))).unwrap();
+        assert_eq!(kind, RuntimeKind::Installed);
         let _ = fs::remove_dir_all(dir);
     }
 }
