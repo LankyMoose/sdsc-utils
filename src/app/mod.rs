@@ -8,6 +8,7 @@
 
 pub(crate) mod actions;
 mod browser;
+mod browser_remote;
 mod configure;
 mod feedback;
 mod home;
@@ -1082,7 +1083,9 @@ impl App {
             crate::browser::tabs::boot_url()
         };
         #[cfg(feature = "cef-engine")]
-        let browser_engine = {
+        let browser_engine = if browser_remote::remote_enabled() {
+            None
+        } else {
             crate::browser::engine_install::cleanup_pending_uninstall();
             crate::browser::cef_backend::spawn_engine(&boot_url, initial_page)
         };
@@ -2802,6 +2805,10 @@ impl App {
         // teardown also clears).
         self.input_hub.clear();
         self.hid_worker.shutdown();
+        // Close the optional Browser add-on process and wait briefly.
+        if let Some(mut remote) = self.browser.remote.take() {
+            remote.shutdown();
+        }
         // Close CEF browsers and let the worker ack. Bounded: a wedged
         // engine must not hang quit. Profile state is flushed continuously
         // by CEF; process exit follows immediately.

@@ -129,6 +129,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
 - **Browser v0 is chrome-less and single-tab**: no address/tabs/bookmarks/history/status UI, popups denied, Home/PS is the only close path. L1/R1/Options are semantic back/forward/reload via `src/app/actions.rs`; tap only. Keep page cursor/D-pad/docking/IME intact.
 - **The OSK is a system service**: `src/ui/osk/` + `src/app/osk.rs`, topmost no-activate overlay; the Browser ships no OSK UI/layout/gesture/mode code. Cross is the only opener (first Cross on a page field); real mouse/keyboard/IME/touch closes it, keyboard keys hand off (Escape consumed). Quadrant is default; Grid fallback; `OskMode` is a system pref (`SDSC_OSK_MODE=quadrant|grid` debug override).
+- **Browser add-on process (D2b, opt-in)**: `SDSC_BROWSER_REMOTE=1` makes the main app launch `sdsc-browser.exe` over stdin/stdout instead of the in-process Browser. It streams HID edges/actions and OSK text; Home/OSK remain in the main app. Default is still in-process until the remote path is fully validated.
 
 ## Where to find things
 

@@ -339,10 +339,12 @@ impl App {
             return self.rehost_toast_after_composite();
         };
         let task = window::close(id).chain(self.rehost_toast_after_composite());
-        if self.browser_visible
-            && let Some(browser) = self.browser_window
-        {
-            return task.chain(focus_window(browser));
+        if self.browser_visible {
+            if self.browser.remote.is_some() {
+                self.remote_browser_focus();
+            } else if let Some(browser) = self.browser_window {
+                return task.chain(focus_window(browser));
+            }
         }
         if self.launcher_visible
             && let Some(start) = self.launcher_window

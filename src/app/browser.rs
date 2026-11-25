@@ -139,6 +139,13 @@ pub struct BrowserAppState {
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
     pub tabs_restored: bool,
+    /// Optional Browser add-on process (Option A split). `None` keeps the
+    /// in-process Browser path.
+    pub remote: Option<super::browser_remote::BrowserRemote>,
+    /// Latest published add-on app spec.
+    pub remote_spec: Option<crate::hosted::AppSpec>,
+    /// Last add-on launch/protocol error, for Home/diagnostics.
+    pub remote_error: Option<String>,
 }
 
 use iced::Task;
@@ -1117,6 +1124,10 @@ impl super::App {
     /// Browser text-session client: insert committed text into the focused
     /// page field through CEF's key path.
     pub(crate) fn browser_text_insert(&mut self, text: &str) {
+        if self.browser.remote.is_some() {
+            self.remote_browser_text(crate::hosted::TextAction::Insert(text.to_string()));
+            return;
+        }
         let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
         for raw in events {
             let _ = self.on_browser_key(raw);
@@ -1125,6 +1136,10 @@ impl super::App {
 
     /// Browser text-session client: backspace in the focused page field.
     pub(crate) fn browser_text_backspace(&mut self) {
+        if self.browser.remote.is_some() {
+            self.remote_browser_text(crate::hosted::TextAction::Backspace);
+            return;
+        }
         if let Some(events) =
             crate::browser::keys::synthetic_named("Backspace", iced::keyboard::Modifiers::empty())
         {
@@ -1136,6 +1151,10 @@ impl super::App {
 
     /// Browser text-session client: Enter in the focused page field.
     pub(crate) fn browser_text_enter(&mut self) {
+        if self.browser.remote.is_some() {
+            self.remote_browser_text(crate::hosted::TextAction::Enter);
+            return;
+        }
         if let Some(events) =
             crate::browser::keys::synthetic_named("Enter", iced::keyboard::Modifiers::empty())
         {
@@ -1359,6 +1378,12 @@ impl super::App {
     /// Show the standalone Browser window (idempotent). Restores the persisted
     /// tab strip on a fresh session, else resumes the cached page.
     pub(crate) fn open_browser_window(&mut self) -> Task<Message> {
+        if self.browser.remote.is_some() {
+            return Task::none();
+        }
+        if crate::app::browser_remote::remote_enabled() {
+            return self.open_remote_browser();
+        }
         if self.browser_visible
             && let Some(id) = self.browser_window
         {
@@ -1441,6 +1466,9 @@ impl super::App {
     /// Close the standalone Browser window and suspend its engine (cached
     /// page survives for the next open).
     pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
+        if self.browser.remote.is_some() {
+            return self.close_remote_browser();
+        }
         self.browser_visible = false;
         self.browser_monitor_cover = None;
         self.browser_window_size = None;
@@ -1522,6 +1550,9 @@ impl super::App {
         if !self.browser_visible {
             return Task::none();
         }
+        if self.browser.remote.is_some() {
+            return self.poll_remote_browser();
+        }
         self.check_history_travel_timeout();
         // Cursor glides and script-driven scroll still need one mouse sync
         // per paint even when no new pad edge arrived.
@@ -1562,6 +1593,9 @@ impl super::App {
         use crate::browser::cursor::JumpDir;
         if readings.is_empty() {
             return Task::none();
+        }
+        if self.browser.remote.is_some() {
+            return self.remote_browser_pad(readings, tap_actions);
         }
         if readings
             .iter()
