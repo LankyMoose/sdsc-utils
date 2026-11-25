@@ -8,7 +8,7 @@ use crate::browser::keys::{RawKey, map_event, synthetic_named, synthetic_text};
 use crate::domain::pad::{NavAction, NavStepper, PadSample};
 use crate::hosted::{
     ActionInvoked, BrowserEvent, Hello, HostMessage, InputActionKind, InputButton,
-    LifecycleCommand, LifecycleState, PadSnapshot, TextAction, read_frame, write_frame,
+    LifecycleCommand, LifecycleState, PadSnapshot, RealInput, TextAction, read_frame, write_frame,
 };
 use crate::ui::browser::{BrowserMessage, BrowserPanel};
 use crate::ui::theme;
@@ -50,6 +50,7 @@ enum Message {
     Browser(BrowserMessage),
     Key(RawKey),
     Ime(iced::advanced::input_method::Event),
+    Touch,
     Tick,
 }
 
@@ -62,6 +63,7 @@ struct BrowserServer {
     host_link: HostLink,
     engine_link: EngineLink,
     ready_sent: bool,
+    osk_open: bool,
     dpad: NavStepper,
 }
 
@@ -138,6 +140,7 @@ impl BrowserServer {
             host_link,
             engine_link,
             ready_sent: false,
+            osk_open: false,
             dpad: NavStepper::default(),
         };
         let show = open
@@ -187,6 +190,12 @@ impl BrowserServer {
             Message::Browser(message) => self.on_browser_message(message),
             Message::Key(raw) => self.on_key(raw),
             Message::Ime(event) => self.on_ime(event),
+            Message::Touch => {
+                if self.osk_open {
+                    self.send(BrowserEvent::RealInput(RealInput::Touch));
+                }
+                Task::none()
+            }
             Message::Tick => {
                 let now = Instant::now();
                 self.panel.advance_stick(0.0, 0.0, 0.0, 0.0, false, now);
@@ -255,6 +264,7 @@ impl BrowserServer {
                     repeat: false,
                 })),
                 iced::Event::InputMethod(event) => Some(Message::Ime(event)),
+                iced::Event::Touch(_) => Some(Message::Touch),
                 _ => None,
             }),
         ];
@@ -292,6 +302,10 @@ impl BrowserServer {
                 Task::none()
             }
             HostMessage::Lifecycle(command) => self.on_lifecycle(command),
+            HostMessage::OskState { open } => {
+                self.osk_open = open;
+                Task::none()
+            }
         }
     }
 
@@ -495,12 +509,27 @@ impl BrowserServer {
     }
 
     fn on_key(&mut self, raw: RawKey) -> Task<Message> {
+        let escape = matches!(
+            raw.key,
+            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+        );
+        if self.osk_open {
+            self.send(BrowserEvent::RealInput(RealInput::Key { escape }));
+            // The system OSK consumes Escape on hand-off; other keys still
+            // reach the page after the OSK closes.
+            if escape {
+                return Task::none();
+            }
+        }
         self.send_key(raw);
         Task::none()
     }
 
     fn on_ime(&mut self, event: iced::advanced::input_method::Event) -> Task<Message> {
         use iced::advanced::input_method::Event;
+        if self.osk_open {
+            self.send(BrowserEvent::RealInput(RealInput::Ime));
+        }
         let tab = self.panel.active_tab;
         let Some(engine) = &self.engine else {
             return Task::none();
@@ -533,6 +562,7 @@ impl BrowserServer {
     fn on_browser_message(&mut self, message: BrowserMessage) -> Task<Message> {
         match message {
             BrowserMessage::PagePointerMoved { x, y } => {
+                self.note_mouse_input();
                 let (x, y) = self.clamp_mouse(x, y);
                 self.panel.page_mouse_active = true;
                 if let Some(engine) = &self.engine {
@@ -545,6 +575,7 @@ impl BrowserServer {
                 }
             }
             BrowserMessage::PagePress => {
+                self.note_mouse_input();
                 self.panel.page_mouse_active = true;
                 self.panel.page_mouse_down = true;
                 let (x, y) = self.panel.page_mouse;
@@ -583,6 +614,7 @@ impl BrowserServer {
                 }
             }
             BrowserMessage::PageWheel { dx, dy } => {
+                self.note_mouse_input();
                 let (x, y) = self.panel.page_mouse;
                 if let Some(engine) = &self.engine {
                     engine.send(EngineCommand::MouseWheel {
@@ -608,6 +640,12 @@ impl BrowserServer {
             BrowserMessage::Shot(_) => {}
         }
         Task::none()
+    }
+
+    fn note_mouse_input(&mut self) {
+        if self.osk_open {
+            self.send(BrowserEvent::RealInput(RealInput::Mouse));
+        }
     }
 
     fn clamp_mouse(&mut self, x: f32, y: f32) -> (f32, f32) {

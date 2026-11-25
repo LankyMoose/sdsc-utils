@@ -259,17 +259,37 @@ pub enum LifecycleState {
     Closed,
 }
 
+/// Real (non-controller) input the host needs for OSK dismissal/hand-off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RealInput {
+    /// A physical keyboard event. `escape` is the only key the OSK consumes.
+    Key {
+        escape: bool,
+    },
+    Ime,
+    Mouse,
+    Touch,
+}
+
 /// Host → Browser control messages. Pad samples and semantic actions only;
 /// the Browser renders its own window, so no frame/pixel IPC exists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostMessage {
     Hello(Hello),
-    Resize { width: u32, height: u32 },
+    Resize {
+        width: u32,
+        height: u32,
+    },
     Input(InputEdge),
     Action(ActionInvoked),
     Text(TextAction),
     Lifecycle(LifecycleCommand),
+    /// System OSK open/close state for the Browser text session.
+    OskState {
+        open: bool,
+    },
 }
 
 /// Browser → Host state messages.
@@ -287,6 +307,8 @@ pub enum BrowserEvent {
     /// A Cross landed on a page text field; the host may open the system OSK.
     /// The request is tied to the input/action that produced it.
     RequestTextInput,
+    /// Real mouse/keyboard/IME/touch input. Closes the system OSK.
+    RealInput(RealInput),
     Lifecycle(LifecycleState),
     Closed {
         reason: String,

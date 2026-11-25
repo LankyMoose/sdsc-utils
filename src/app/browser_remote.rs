@@ -247,6 +247,9 @@ impl App {
                             .chain(self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage));
                     }
                 }
+                BrowserEvent::RealInput(_) => {
+                    task = task.chain(self.close_osk("real_input"));
+                }
                 BrowserEvent::Lifecycle(state) => {
                     crate::platform::app_log::info(format!("browser add-on lifecycle {state:?}"));
                 }
@@ -290,6 +293,12 @@ impl App {
     pub(crate) fn remote_browser_focus(&mut self) {
         if let Some(remote) = &mut self.browser.remote {
             remote.send(HostMessage::Lifecycle(LifecycleCommand::Focus));
+        }
+    }
+
+    pub(crate) fn remote_browser_osk(&mut self, open: bool) {
+        if let Some(remote) = &mut self.browser.remote {
+            remote.send(HostMessage::OskState { open });
         }
     }
 }

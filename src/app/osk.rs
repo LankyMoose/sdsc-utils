@@ -47,10 +47,16 @@ impl App {
         if self.osk.state.open {
             if self.osk.state.target != Some(target) {
                 self.osk.state.target = Some(target);
+                if target == OskTarget::BrowserPage {
+                    self.remote_browser_osk(true);
+                }
             }
             return self.show_osk_window();
         }
         self.osk.state.open(target);
+        if target == OskTarget::BrowserPage {
+            self.remote_browser_osk(true);
+        }
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.open")
             .field("target", target.label())
             .field("mode", self.osk.state.mode.label())
@@ -117,7 +123,11 @@ impl App {
         if !self.osk.state.open {
             return Task::none();
         }
+        let browser_page = self.osk.state.target == Some(OskTarget::BrowserPage);
         self.osk.state.close();
+        if browser_page {
+            self.remote_browser_osk(false);
+        }
         self.osk.r2_latched = false;
         self.osk.l3_latched = false;
         self.osk.r3_latched = false;
