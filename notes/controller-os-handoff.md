@@ -19,7 +19,9 @@ separate-app split was reverted in favour of the single-process Browser.
 > Triangle opens the system OSK with `OskTarget::BrowserUrl`; long URLs use a
 > trailing ellipsis before the right-anchored Triangle prompt, and editing
 > shows the draft tail with a leading ellipsis. The page shrinks by 45px.
-> Tabs, bookmarks, history UI, and status chrome remain absent. The
+> Circle now suspends/closes the Browser when no URL edit owns the pad (it
+> cancels the edit first). Tabs, bookmarks, history UI, and status chrome
+> remain absent. The
 > "no address/Triangle→URL removed" lines below describe the original v0 and
 > are superseded by this row.
 
@@ -178,7 +180,8 @@ Do not re-litigate these unless the user explicitly changes them.
 - **No tabs UI or tab bindings.**
 - **No bookmarks/history UI or bindings.**
 - **No status chrome** (no loading/error/title strip).
-- **Close only via Home/PS.**
+- **Close via Circle (when no URL edit owns the pad) or Home/PS.** Circle
+  cancels an active URL edit first; Escape cancels the edit but never closes.
 - Keep page surface, cursor, scroll, click, page text/IME.
 - Keep back/forward/reload actions.
 - Keep backends: tabs, session history, bookmarks, history data, exact
@@ -531,7 +534,8 @@ too small for a full OSK overlay.
 - F6/Square OSK open; Triangle→URL.
 - Ctrl+L URL entry and the URL draft; keep ordinary page keyboard input and
   non-address navigation shortcuts.
-- Circle/Esc Browser close; Home/PS is the only close path.
+- Circle/Esc Browser close (original v0); v0.1 reintroduced Circle close, with
+  Escape still cancelling URL editing only.
 
 ### Keep page cursor/docking
 
@@ -786,7 +790,8 @@ Docs to update during implementation:
   (Back/URL/Forward) is the only Browser chrome.
 - Single tab v0; popups denied.
 - L1/R1/Options actions; tap only; no hold/history selector/hints.
-- Home/PS is the only Browser close path.
+- Circle closes/suspends the Browser when no URL edit owns the pad (it cancels
+  the edit first); Home/PS also closes. Escape cancels the edit only.
 - Keep session/tab/bookmark/history backends and the exact DevTools history
   backend dormant.
 - No OS input injection in QA; use synthetic replay with real input locked.

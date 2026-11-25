@@ -15,12 +15,19 @@ pub const BROWSER_HEADER_RULE: f32 = 1.0;
 pub const BROWSER_HEADER_TOTAL: f32 = BROWSER_HEADER_H + BROWSER_HEADER_RULE;
 /// Horizontal inset for header content against the card page width.
 pub const BROWSER_HEADER_PAD: f32 = 12.0;
-/// Fixed Back/Forward group width before narrow-stage clamping.
-pub const BROWSER_HEADER_SIDE_W: f32 = 190.0;
-/// Gap between the Back group, URL bar, and Forward group.
-pub const BROWSER_HEADER_GAP: f32 = 16.0;
-/// URL well height; matches the shared 32px action-hint slot with border room.
-pub const BROWSER_URL_BAR_H: f32 = 34.0;
+/// Small gap between the history prompts and the URL well.
+pub const BROWSER_HEADER_GROUP_GAP: f32 = 8.0;
+/// Fixed side slot for the Back/Forward prompt clusters. The Back cluster is
+/// right-aligned and Forward left-aligned, so both stay snug to the URL while
+/// equal slots keep the URL exactly centred.
+pub const BROWSER_HEADER_SIDE_W: f32 = 136.0;
+/// URL well width bounds.
+pub const BROWSER_URL_W_MIN: f32 = 420.0;
+pub const BROWSER_URL_W_MAX: f32 = 680.0;
+/// URL well height; matches the shared 32px action-hint slot.
+pub const BROWSER_URL_BAR_H: f32 = 32.0;
+/// Symmetric vertical padding around the URL well inside the header row.
+pub const BROWSER_HEADER_V_PAD: f32 = (BROWSER_HEADER_H - BROWSER_URL_BAR_H) * 0.5;
 /// URL well horizontal padding.
 pub const BROWSER_URL_BAR_PAD: f32 = 10.0;
 /// Globe icon size inside the URL well.
@@ -604,26 +611,25 @@ pub fn browser_layout(stage_w: f32, stage_h: f32) -> BrowserLayout {
     }
 }
 
-/// Horizontal split for the one-row header.
+/// Horizontal split for the centred header group.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrowserHeaderLayout {
-    /// Width of each Back/Forward group (they are symmetric).
+    /// Equal side slots for the Back/Forward clusters.
     pub side_w: f32,
-    /// Width of the URL well between the groups.
+    /// URL well width.
     pub url_w: f32,
 }
 
-/// Split `content_w` into equal Back/Forward groups plus the URL well.
+/// URL well + equal side slots for the available header content width.
 ///
-/// Sides are the preferred 190px when there is room, clamped so the URL keeps
-/// at least 160px on narrow stages. The three pieces plus two gaps always sum
-/// to `content_w`, so the URL well is exactly centred.
+/// The well is clamped to 420–680px. Side slots keep the URL exactly centred;
+/// on narrow stages they shrink so the group still fits.
 pub fn browser_header_layout(content_w: f32) -> BrowserHeaderLayout {
     let content_w = content_w.max(1.0);
-    let min_url_w = 160.0_f32.min(content_w * 0.5);
-    let max_side = ((content_w - 2.0 * BROWSER_HEADER_GAP - min_url_w) * 0.5).max(0.0);
-    let side_w = BROWSER_HEADER_SIDE_W.min(max_side);
-    let url_w = (content_w - 2.0 * side_w - 2.0 * BROWSER_HEADER_GAP).max(1.0);
+    let available = content_w - 2.0 * BROWSER_HEADER_GROUP_GAP - 2.0 * BROWSER_HEADER_SIDE_W;
+    let url_w = available.clamp(BROWSER_URL_W_MIN, BROWSER_URL_W_MAX);
+    let available_side = (content_w - 2.0 * BROWSER_HEADER_GROUP_GAP - url_w).max(0.0) * 0.5;
+    let side_w = BROWSER_HEADER_SIDE_W.min(available_side);
     BrowserHeaderLayout { side_w, url_w }
 }
 
@@ -843,19 +849,32 @@ mod tests {
     }
 
     #[test]
-    fn header_groups_and_url_fill_the_content_width() {
-        let content_w = 1710.0;
-        let h = browser_header_layout(content_w);
-        assert_eq!(
-            h.side_w * 2.0 + h.url_w + 2.0 * BROWSER_HEADER_GAP,
-            content_w
+    fn url_width_is_clamped_and_side_slots_keep_it_centred() {
+        let wide = browser_header_layout(1710.0);
+        assert_eq!(wide.url_w, BROWSER_URL_W_MAX);
+        assert_eq!(wide.side_w, BROWSER_HEADER_SIDE_W);
+        let wide_group = wide.side_w * 2.0 + wide.url_w + 2.0 * BROWSER_HEADER_GROUP_GAP;
+        assert_eq!(wide_group, 968.0);
+        assert!(
+            wide_group < 1710.0,
+            "group stays centred with air either side"
         );
-        assert!(h.url_w >= 160.0);
 
-        // Narrow stage: sides clamp so the URL keeps its minimum.
-        let narrow = browser_header_layout(500.0);
-        assert!(narrow.side_w * 2.0 + narrow.url_w + 2.0 * BROWSER_HEADER_GAP == 500.0);
-        assert!(narrow.url_w >= 160.0);
+        let narrow = browser_header_layout(668.0);
+        assert_eq!(narrow.url_w, BROWSER_URL_W_MIN);
+        assert!(narrow.side_w < BROWSER_HEADER_SIDE_W);
+        assert_eq!(
+            narrow.side_w * 2.0 + narrow.url_w + 2.0 * BROWSER_HEADER_GROUP_GAP,
+            668.0
+        );
+    }
+
+    #[test]
+    fn header_vertical_padding_is_symmetric() {
+        assert_eq!(
+            BROWSER_HEADER_H - BROWSER_URL_BAR_H,
+            2.0 * BROWSER_HEADER_V_PAD
+        );
     }
 
     #[test]

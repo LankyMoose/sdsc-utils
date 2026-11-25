@@ -7,9 +7,10 @@
 
 use crate::browser::engine::BrowserCursor;
 use crate::ui::browser::state::{
-    BROWSER_HEADER_GAP, BROWSER_HEADER_H, BROWSER_HEADER_PAD, BROWSER_HEADER_RULE,
-    BROWSER_HEADER_TOTAL, BROWSER_URL_BAR_H, BROWSER_URL_BAR_PAD, BROWSER_URL_GAP,
-    BROWSER_URL_ICON, BrowserPanel, browser_header_layout, browser_url_text_budget, display_url,
+    BROWSER_HEADER_GROUP_GAP, BROWSER_HEADER_H, BROWSER_HEADER_PAD, BROWSER_HEADER_RULE,
+    BROWSER_HEADER_TOTAL, BROWSER_HEADER_V_PAD, BROWSER_URL_BAR_H, BROWSER_URL_BAR_PAD,
+    BROWSER_URL_GAP, BROWSER_URL_ICON, BrowserPanel, browser_header_layout,
+    browser_url_text_budget, display_url,
 };
 use crate::ui::face::{FaceButton, RingStyle, face_glyph, hint_text_capsule};
 use crate::ui::{svg_icon, text_fit, theme};
@@ -45,6 +46,9 @@ pub enum BrowserMessage {
     Scrolled(f32),
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
+    /// Debug replay: capture after the scheduled settle delay.
+    #[cfg(debug_assertions)]
+    Capture,
 }
 
 impl BrowserMessage {
@@ -63,7 +67,7 @@ impl BrowserMessage {
             | Self::PageWheel { .. } => None,
             Self::Scrolled(_) => None,
             #[cfg(debug_assertions)]
-            Self::Shot(_) => None,
+            Self::Shot(_) | Self::Capture => None,
         }
     }
 }
@@ -336,23 +340,24 @@ fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessa
     let content = row![
         container(back)
             .width(Length::Fixed(layout.side_w))
-            .align_x(Alignment::Start),
+            .align_x(Alignment::End),
         browser_url_bar(panel, layout.url_w),
         container(forward)
             .width(Length::Fixed(layout.side_w))
-            .align_x(Alignment::End),
+            .align_x(Alignment::Start),
     ]
-    .spacing(BROWSER_HEADER_GAP)
+    .spacing(BROWSER_HEADER_GROUP_GAP)
     .align_y(Alignment::Center);
     let row = container(content)
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(BROWSER_HEADER_H))
         .padding(Padding {
-            top: 0.0,
+            top: BROWSER_HEADER_V_PAD,
             right: BROWSER_HEADER_PAD,
-            bottom: 0.0,
+            bottom: BROWSER_HEADER_V_PAD,
             left: BROWSER_HEADER_PAD,
         })
+        .align_x(Alignment::Center)
         .align_y(Alignment::Center);
     let rule = container(space())
         .width(Length::Fixed(page_w))

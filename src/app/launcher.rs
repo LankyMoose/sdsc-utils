@@ -1047,6 +1047,18 @@ impl App {
         }
     }
 
+    /// One-shot replay capture: no debug-auto cadence, exactly one shot per
+    /// requested step so QA flows can map screenshots to actions.
+    #[cfg(debug_assertions)]
+    pub(crate) fn capture_browser_window(&mut self) -> Task<Message> {
+        let Some(win) = self.browser_window else {
+            return Task::none();
+        };
+        iced::window::screenshot(win)
+            .map(crate::ui::browser::BrowserMessage::Shot)
+            .map(Message::Browser)
+    }
+
     /// Debug-only window shot: every 5s while the browser overlay is on (or
     /// immediately on a fresh dock), plus forced on R3 issue flags.
     /// `force` bypasses the cadence gate. Encode + write happen on a
@@ -1099,6 +1111,7 @@ impl App {
             .unwrap_or_else(|| "-".to_string());
         let wells = panel.focusables.len();
         let scroll = panel.scroll_offset;
+        let frame_gen = panel.session.frame_slot().generation();
         let (w, h) = (shot.size.width, shot.size.height);
         let scale = shot.scale_factor;
         let rgba = shot.rgba.to_vec();
@@ -1115,7 +1128,7 @@ impl App {
             let path = dir.join(format!("shot-{ms}.png"));
             match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
                 Ok(()) => app_log::info(format!(
-                    "shot saved path={} size={w}x{h} scale={scale} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({:.0},{:.0})",
+                    "shot saved path={} size={w}x{h} scale={scale} frame_gen={frame_gen} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({:.0},{:.0})",
                     path.display(),
                     cursor.0,
                     cursor.1,

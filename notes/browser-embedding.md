@@ -67,9 +67,11 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   `resolve_navigate_target`).
 - `src/browser/keys.rs` — iced → engine keyboard mapping.
 - `src/ui/browser/state.rs` / `view.rs` — panel state + standalone-window
-  rendering and `BrowserMessage`. The header is one row inside the 16:9 card:
-  Back/L1 · URL well · Forward/R1. `BrowserPanel` owns the URL draft/edit
-  state; the page starts below a 44px row + 1px rule.
+  rendering and `BrowserMessage`. The header is one centred row inside the
+  16:9 card: Back/L1 · URL well · Forward/R1. The URL well is 420–680px wide;
+  equal side slots keep it centred with an 8px gap to each prompt cluster.
+  `BrowserPanel` owns the URL draft/edit state; the page starts below a 44px
+  row + 1px rule.
 - `src/app/browser.rs` — top-level `BrowserAppState`, window lifecycle,
   pad/key routing, URL editor (`OskTarget::BrowserUrl`), and `BrowserMessage`
   reducer.
@@ -104,9 +106,10 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 
 PS opens the topmost Home over Launcher, Browser, or a game; while Home is
 open it owns pad input and the app underneath is gated. Selecting Browser
-closes Home and opens the standalone fullscreen Browser window. Browser
-close (Circle/Esc with no modal) suspends the engine and returns focus to
-Launcher when it is visible.
+closes Home and opens the standalone fullscreen Browser window. Browser close
+(Circle with no modal, or Home/PS) suspends the engine and returns focus to
+Launcher when it is visible. Circle cancels an active URL edit instead of
+closing; Escape cancels the edit but never closes.
 
 Input priority is **Home → Browser → Launcher**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
@@ -135,8 +138,9 @@ meters still use the legacy per-surface bank.
 - Cross clicks the docked page target (exact-element click, else point click).
   Cross on a page text field also requests the system OSK. L1/R1/Options are
   semantic back/forward/reload actions from the OS binding table (tap only);
-  L3 toggles magnet; R3 dumps an issue bundle. Circle/Esc do not close the
-  Browser — Home/PS is the only close path.
+  L3 toggles magnet; R3 dumps an issue bundle. Circle suspends/closes the
+  Browser when no URL edit owns the pad (if editing, it cancels the edit
+  first); Escape cancels the edit only. Home/PS also closes.
 - Real keyboard input goes to the page as `RAWKEYDOWN` + `CHAR` + `KEYUP`
   (text needs the separate `CHAR` leg). `Ctrl+R` and `Alt+Left`/`Alt+Right`
   stay app shortcuts; while the URL well is editing, printable keys/backspace/

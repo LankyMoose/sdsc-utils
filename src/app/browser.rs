@@ -397,9 +397,10 @@ impl super::App {
             #[cfg(debug_assertions)]
             "text" => {
                 if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str) {
-                    self.replay_type_text(text);
+                    self.replay_type_text(text)
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
             #[cfg(debug_assertions)]
             "key" => {
@@ -428,27 +429,46 @@ impl super::App {
                         return close.chain(self.cancel_manual_add());
                     }
                 }
-                if !self.replay_press_key(key, modifiers) {
-                    if key.chars().count() == 1 {
-                        self.replay_type_text(key);
-                    } else {
-                        crate::platform::trace::event(
-                            crate::platform::trace::Lane::Platform,
-                            "replay.unsupported",
-                        )
-                        .field("app", &step.app)
-                        .field("action", &step.action)
-                        .field("key", key)
-                        .emit();
-                    }
-                }
-                close
+                let task = if let Some(task) = self.replay_press_key(key, modifiers) {
+                    task
+                } else if key.chars().count() == 1 {
+                    self.replay_type_text(key)
+                } else {
+                    crate::platform::trace::event(
+                        crate::platform::trace::Lane::Platform,
+                        "replay.unsupported",
+                    )
+                    .field("app", &step.app)
+                    .field("action", &step.action)
+                    .field("key", key)
+                    .emit();
+                    Task::none()
+                };
+                close.chain(task)
+            }
+            #[cfg(debug_assertions)]
+            "wait" => {
+                // A no-op replay step is also a settle pump: invalidate the
+                // Browser so a just-committed navigation presents before the
+                // next screenshot step.
+                self.browser_window
+                    .map(crate::ui::layout::invalidate_window)
+                    .unwrap_or_else(Task::none)
             }
             #[cfg(debug_assertions)]
             "screenshot" => {
-                self.debug_browser = true;
                 self.browser.panel.debug_overlay = false;
-                self.shoot_browser_window(true)
+                // Capture one settle-delayed frame. A screenshot requested in
+                // the same update as a committed navigation can still read the
+                // previous presented frame.
+                let invalidate = self
+                    .browser_window
+                    .map(crate::ui::layout::invalidate_window)
+                    .unwrap_or_else(Task::none);
+                invalidate.chain(Task::perform(
+                    super::delay(std::time::Duration::from_millis(250)),
+                    |()| Message::Browser(crate::ui::browser::BrowserMessage::Capture),
+                ))
             }
             #[cfg(debug_assertions)]
             "ime.preedit" => {
@@ -1074,6 +1094,8 @@ impl super::App {
             }
             #[cfg(debug_assertions)]
             BrowserMessage::Shot(shot) => self.save_browser_shot(shot),
+            #[cfg(debug_assertions)]
+            BrowserMessage::Capture => self.capture_browser_window(),
         }
     }
 
@@ -1329,37 +1351,42 @@ impl super::App {
     }
 
     /// Replay text injection: press+release each character through the real
-    /// browser key handler. Never touches the OS keyboard.
+    /// browser key handler. Never touches the OS keyboard. Tasks are chained so
+    /// header/OSK invalidations and commits land before the next replay step.
     #[cfg(debug_assertions)]
-    pub(crate) fn replay_type_text(&mut self, text: &str) {
+    pub(crate) fn replay_type_text(&mut self, text: &str) -> Task<Message> {
         let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
-        self.replay_raw_keys(events, "text");
+        let task = self.replay_raw_keys(events, "text");
         crate::platform::trace::event(
             crate::platform::trace::Lane::Browser,
             "browser.synthetic_text",
         )
         .field("len", text.chars().count())
         .emit();
+        task
     }
 
-    /// Replay named-key tap through the real browser key handler.
+    /// Replay named-key tap through the real browser key handler. `None` means
+    /// the name is not a known named key (the caller may treat it as text).
     #[cfg(debug_assertions)]
     pub(crate) fn replay_press_key(
         &mut self,
         name: &str,
         modifiers: iced::keyboard::Modifiers,
-    ) -> bool {
-        let Some(events) = crate::browser::keys::synthetic_named(name, modifiers) else {
-            return false;
-        };
-        self.replay_raw_keys(events.to_vec(), name);
-        true
+    ) -> Option<Task<Message>> {
+        let events = crate::browser::keys::synthetic_named(name, modifiers)?;
+        Some(self.replay_raw_keys(events.to_vec(), name))
     }
 
     #[cfg(debug_assertions)]
-    fn replay_raw_keys(&mut self, events: Vec<crate::browser::keys::RawKey>, label: &str) {
+    fn replay_raw_keys(
+        &mut self,
+        events: Vec<crate::browser::keys::RawKey>,
+        label: &str,
+    ) -> Task<Message> {
+        let mut task = Task::none();
         for raw in events {
-            let _ = self.on_browser_key(raw);
+            task = task.chain(self.on_browser_key(raw));
         }
         crate::platform::trace::event(
             crate::platform::trace::Lane::Browser,
@@ -1367,6 +1394,7 @@ impl super::App {
         )
         .field("key", label)
         .emit();
+        task
     }
 }
 
@@ -1663,9 +1691,9 @@ impl super::App {
                     // Triangle is the URL editor; page navigation itself
                     // never uses it.
                     Some(NavAction::Triangle) => self.on_browser_url_edit(),
-                    // Escape does not close the Browser; Home/PS is the only
-                    // close path.
-                    Some(NavAction::Cancel) => self.browser_cancel(),
+                    // Circle closes the Browser unless the URL well owns the
+                    // pad; in that case it cancels the edit first.
+                    Some(NavAction::Cancel) => self.on_browser_circle(),
                     Some(NavAction::ToggleMagnetism) => {
                         self.play_ui_cue(UiSoundKind::Action);
                         let cursor = &mut self.browser.panel.cursor;
@@ -1701,18 +1729,30 @@ impl super::App {
                 }
                 Some(NavAction::Confirm) => self.on_browser_go_default(),
                 Some(NavAction::Triangle) => self.on_browser_url_edit(),
-                Some(NavAction::Cancel) => self.browser_cancel(),
+                Some(NavAction::Cancel) => self.on_browser_circle(),
                 _ => Task::none(),
             }
         }
     }
 
-    /// Escape no longer closes the Browser; Home/PS is the only close path.
+    /// Escape cancels URL editing but never closes the Browser.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
         if self.browser.panel.url_editing {
             return self.cancel_browser_url_edit();
         }
         Task::none()
+    }
+
+    /// Circle: cancel URL editing when it owns the pad, else suspend and close
+    /// the Browser window. Home/PS remains the overlay/close path from afar.
+    pub(crate) fn on_browser_circle(&mut self) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.cancel_browser_url_edit();
+        }
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.close")
+            .field("source", "circle")
+            .emit();
+        self.close_browser_window()
     }
 
     /// Open the URL editor (Triangle). If already editing, commit instead.
@@ -1742,7 +1782,15 @@ impl super::App {
         if draft.is_empty() {
             return close.chain(redraw);
         }
-        close.chain(self.navigate_browser_to(draft)).chain(redraw)
+        let navigate = self.navigate_browser_to(draft);
+        // Closing the URL keyboard can leave CEF's OSR paint paused; reassert
+        // engine visibility and OS focus so the committed page presents.
+        self.resume_browser_engine();
+        let focus = self
+            .browser_window
+            .map(crate::ui::layout::focus_window)
+            .unwrap_or_else(Task::none);
+        close.chain(navigate).chain(focus).chain(redraw)
     }
 
     /// Cancel URL editing and dismiss the OSK when it belongs to the URL well.
@@ -2579,6 +2627,8 @@ pub(crate) fn trace_browser_state(
             "title": session.title(),
             "loading": session.loading(),
             "generation": session.generation(),
+            "url_editing": panel.url_editing,
+            "url_draft_len": panel.url_draft.chars().count(),
             "nav": nav_window(session.nav_entries(), session.nav_current()),
         },
         "engine": {
@@ -2638,7 +2688,14 @@ mod tests {
         assert_eq!(state["ui"]["nav"]["current"], 1);
         assert_eq!(state["ui"]["nav"]["entries"][0]["url"], "https://a.test/");
         assert!(state["ui"].get("selector").is_none());
-        assert!(state["ui"].get("url_editing").is_none());
+        assert_eq!(state["ui"]["url_editing"], false);
+        assert_eq!(state["ui"]["url_draft_len"], 0);
+
+        panel.start_url_edit();
+        panel.url_edit_insert("https://c.test/");
+        let state = trace_browser_state(&panel);
+        assert_eq!(state["ui"]["url_editing"], true);
+        assert_eq!(state["ui"]["url_draft_len"], "https://c.test/".len());
     }
 
     #[test]

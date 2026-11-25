@@ -131,8 +131,11 @@ synthetic input steps for automation:
 - `osk.stick` — `{"side": "left", "x": 0.65, "y": 0}` feeds the real Quadrant
   state machine; a following neutral sample releases/commits.
 - `osk.open` / `osk.close` — debug-only direct system-OSK open/close for QA.
-- `screenshot` — debug-only: capture the Browser window to `<data>/shots`;
-  `scripts/qa_browser_visual.py` uses it as a pixel smoke test.
+- `wait` — debug-only no-op settle step; invalidates the Browser so a
+  just-committed navigation/URL edit presents before the next screenshot.
+- `screenshot` — debug-only one-shot capture to `<data>/shots` (no auto
+  cadence); `scripts/qa_browser_visual.py` uses it as a pixel smoke test and
+  `scripts/qa_browser_flows.py` maps one shot per behavioral step.
 
 Input steps call the real browser handlers with explicit page coordinates;
 they never use the OS keyboard, mouse, cursor position, or window focus. The
@@ -153,8 +156,11 @@ drag selection / cursor-shape trace, and kills the process immediately.
 (no second tab, source page intact, `browser.popup_denied` traced).
 `python scripts/qa_browser_visual.py` captures a debug screenshot and verifies
 the actual page pixels, catching widget-tree render regressions that traces
-cannot see. `python scripts/qa_browser_actions.py` fires L1/R1/Options and
-checks `app.action` enabled-state/back/forward/reload. `python
+cannot see. `python scripts/qa_browser_flows.py` runs a realistic deterministic
+session (Google-like search → result click → L1 back → Triangle URL edit →
+Circle close) with a screenshot and trace-state assertion at every step.
+`python scripts/qa_browser_actions.py` fires L1/R1/Options and checks
+`app.action` enabled-state/back/forward/reload. `python
 scripts/qa_browser_osk.py` exercises the system OSK in Quadrant and Grid modes
 (first Cross open, split-stick typing, keyboard/mouse close). `python
 scripts/qa_launcher_osk.py` is the non-browser proof: Add shortcut Title/
