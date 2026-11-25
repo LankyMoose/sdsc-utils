@@ -79,6 +79,29 @@ def protocol_check(exe: Path, data_dir: Path) -> tuple[bool, str]:
             proc.kill()
 
 
+def child_pids(parent_pid: int) -> list[int]:
+    if os.name != "nt":
+        return []
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        f"Get-CimInstance Win32_Process -Filter \"ParentProcessId={parent_pid}\" | Select-Object -ExpandProperty ProcessId",
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
 def host_check(main: Path, data_dir: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["SDSC_DEBUG_OPEN"] = "browser"
@@ -95,15 +118,45 @@ def host_check(main: Path, data_dir: Path) -> tuple[bool, str]:
     try:
         log = data_dir / "app.log"
         deadline = time.time() + 20
+        launched = False
         while time.time() < deadline:
-            if log.is_file() and "browser add-on process open" in log.read_text(
-                encoding="utf-8", errors="replace"
-            ):
-                return True, "host launched add-on"
+            text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+            if "browser add-on process open" in text:
+                launched = True
+                break
             if proc.poll() is not None:
                 return False, f"main app exited {proc.returncode}"
             time.sleep(0.5)
-        return False, "host did not log add-on launch"
+        if not launched:
+            return False, "host did not log add-on launch"
+
+        # Kill the add-on and verify the supervisor notices without exiting.
+        deadline = time.time() + 10
+        children: list[int] = []
+        while time.time() < deadline and not children:
+            children = child_pids(proc.pid)
+            if not children:
+                time.sleep(0.25)
+        if not children:
+            return False, "add-on child process not found"
+        for pid in children:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+            if "browser add-on closed:" in text:
+                if proc.poll() is not None:
+                    return False, "main app exited after add-on crash"
+                return True, "host launched and recovered from add-on exit"
+            if proc.poll() is not None:
+                return False, f"main app exited {proc.returncode} after add-on crash"
+            time.sleep(0.5)
+        return False, "host did not notice add-on exit"
     finally:
         subprocess.run(
             ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
