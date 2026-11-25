@@ -2,7 +2,7 @@
 
 **Decision:** the Browser becomes a separate optional process/executable
 (`sdsc-browser`), not a DLL/module. Main app remains the OS/shell.
-**Status:** D1 protocol crate landed (`6e1a201`); process split/packaging next.
+**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`src/bin/sdsc-browser.rs` + `src/browser/server.rs`); host supervisor/main switch next, then D3 packaging.
 
 ## Transport
 

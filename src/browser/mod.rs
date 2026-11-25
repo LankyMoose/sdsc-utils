@@ -22,6 +22,8 @@ pub mod favicon;
 pub mod frame_slot;
 pub mod keys;
 pub mod nav;
+#[cfg(feature = "cef-engine")]
+pub mod server;
 pub mod tabs;
 
 /// One remembered navigation for omnibox autocomplete: URL plus the title

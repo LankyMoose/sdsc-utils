@@ -6,7 +6,7 @@
 //! compositor; popup, Settings, and Launcher stay ephemeral (create/destroy on each
 //! open — Launcher uses a normal OS window open).
 
-mod actions;
+pub(crate) mod actions;
 mod browser;
 mod configure;
 mod feedback;

@@ -31,6 +31,10 @@ path = "src/bin/sdsc-utils.rs"
 name = "gen_msix_logos"
 path = "src/bin/gen_msix_logos.rs"
 
+[[bin]]
+name = "sdsc-browser"
+path = "src/bin/sdsc-browser.rs"
+
 [features]
 # Single executable with CEF OSR in-process. `--no-default-features` is the
 # UI-only iteration build (Browser tile shows the engine install state); it

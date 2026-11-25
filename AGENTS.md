@@ -68,7 +68,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 
 - `src/bin/sdsc-utils.rs` — the app: tray, HID, session, and iced UI in one process (the default binary). Internal `--replace` argv lets a renderer-pref reload successor retry the single-instance guard while the parent exits; a fresh launch instead terminates the predecessor and takes over (`src/platform/prev_instance.rs`).
 - `src/bin/gen_msix_logos.rs` — MSIX logo generator
-- Plain `cargo build` builds **all** binaries. `cargo run` runs the whole app; there is no second process to keep in sync.
+- `src/bin/sdsc-browser.rs` — optional Browser add-on process (protocol over stdin/stdout, own iced window + CEF). Not launched by the main app yet; D2 host supervisor is next.
+- Plain `cargo build` builds **all** binaries. `cargo run` runs the main app; `cargo run --bin sdsc-browser` waits for a protocol `Hello` on stdin.
 - `src/lib.rs` — re-exports all internal modules (`app`, `controller`, `domain`, `games`, `persist`, `platform`, `session`, `ui`)
 
 ## Conventions & quirks
@@ -98,7 +99,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | Directory | Typical changes |
 |---|---|
 | `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
-| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture; no reader fallback |
+| `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture, `server.rs` add-on process; no reader fallback |
 | `src/hosted/` | Re-export of the shared hosted-app contract v0 (manifest/native surface/actions/text session/lifecycle); canonical types live in `crates/browser-protocol/` |
 | `crates/browser-protocol/` | Versioned wire protocol + contract crate: messages, framing, in-process channel, no UI/CEF deps |
 | `src/ui/osk/` | System controller keyboard: Quadrant core/layouts + Grid fallback; no Browser imports |
