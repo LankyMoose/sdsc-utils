@@ -2,7 +2,7 @@
 
 **Decision:** the Browser becomes a separate optional process/executable
 (`sdsc-browser`), not a DLL/module. Main app remains the OS/shell.
-**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`6e1a201`/`6e8fbd3`: `src/bin/sdsc-browser.rs` + `src/browser/server.rs`). D2b/D2c host supervisor + OSK real-input bridge landed. The main app now prefers the add-on when `sdsc-browser` sits next to it; `SDSC_BROWSER_REMOTE=0` keeps the in-process fallback for replay QA. Full in-process removal and packaging next.
+**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`6e1a201`/`6e8fbd3`: `src/bin/sdsc-browser.rs` + `src/browser/server.rs`). D2b/D2c host supervisor + OSK real-input bridge landed. The main app prefers `sdsc-browser` next to the exe, then `<data>/browser-addon/` (local install via `scripts/install_browser_addon.py`); `SDSC_BROWSER_REMOTE=0` keeps the in-process fallback for replay QA. Full in-process removal and MSIX/Store packaging remain.
 
 ## Transport
 

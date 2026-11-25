@@ -22,6 +22,7 @@
 | Browser popup-denial QA (synthetic, no OS input) | `python scripts/qa_browser_popup.py` |
 | System OSK QA (Quadrant + Grid) | `python scripts/qa_browser_osk.py` |
 | Launcher Settings OSK proof QA | `python scripts/qa_launcher_osk.py` |
+| Install/remove local Browser add-on | `python scripts/install_browser_addon.py` (`--remove`) |
 | Browser pixel QA (render smoke test) | `python scripts/qa_browser_visual.py` |
 
 ## Project structure

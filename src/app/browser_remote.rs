@@ -24,14 +24,22 @@ pub fn remote_enabled() -> bool {
 }
 
 fn addon_path() -> Option<std::path::PathBuf> {
-    let current = std::env::current_exe().ok()?;
     let name = if cfg!(windows) {
         "sdsc-browser.exe"
     } else {
         "sdsc-browser"
     };
-    let path = current.with_file_name(name);
-    path.is_file().then_some(path)
+    // Sidecar next to the main app wins (portable/dev), then the locally
+    // installed add-on under the app data directory.
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_exe() {
+        candidates.push(current.with_file_name(name));
+    }
+    let installed = crate::persist::paths::data_dir()
+        .join("browser-addon")
+        .join(name);
+    candidates.push(installed);
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 pub struct BrowserRemote {
