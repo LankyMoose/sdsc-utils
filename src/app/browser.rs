@@ -1841,6 +1841,19 @@ impl super::App {
     /// portable sidecar placed next to the exe).
     #[cfg(feature = "cef-engine")]
     pub(crate) fn refresh_engine_status(&mut self) {
+        // Remote add-on mode owns CEF in the child process. Never spawn a
+        // second engine in the shell just because Home asked for status.
+        if crate::app::browser_remote::remote_enabled() {
+            if let Some(path) = crate::app::browser_remote::addon_path_for_status() {
+                self.browser.engine_available = true;
+                self.browser.engine_managed = false;
+                self.browser.engine_status = EngineStatus::Ready(path);
+            } else {
+                self.browser.engine_available = false;
+                self.browser.engine_status = EngineStatus::Missing;
+            }
+            return;
+        }
         if self.browser.engine.is_some() {
             self.browser.engine_available = true;
             // The engine may already be attached at boot (sidecar/package);

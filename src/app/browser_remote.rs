@@ -19,8 +19,17 @@ pub fn remote_enabled() -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
         ),
-        Err(_) => addon_path().is_some(),
+        Err(_) => addon_available(),
     }
+}
+
+pub(crate) fn addon_available() -> bool {
+    addon_path().is_some()
+}
+
+#[cfg(feature = "cef-engine")]
+pub(crate) fn addon_path_for_status() -> Option<std::path::PathBuf> {
+    addon_path()
 }
 
 fn addon_path() -> Option<std::path::PathBuf> {
