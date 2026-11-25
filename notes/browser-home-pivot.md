@@ -9,27 +9,28 @@ remain.
 **When to read:** before touching Launcher/browser window ownership, the PS
 overlay, app selection, the engine backend, or MSIX packaging.
 
-> **Ownership update:** the target product model is now the **Browser as a
-> separate optional app** (UI + engine), not only the CEF engine DLC. The
-> CEF/Home/DLC history here remains useful, but the packaging/ownership plan
-> is revised by [controller-os-handoff.md](controller-os-handoff.md).
+> **Ownership update (reverted 2026-11-26):** the Browser was briefly split
+> into a separate optional app (`sdsc-browser` + stdio protocol + Home
+> add-on install/update). That split was reverted; the Browser is in-process
+> again, and the optional CEF engine DLC is the only optional payload. See
+> [single-process-browser.md](single-process-browser.md).
 >
-> **v0 update (Phases A–D process split landed):** the Browser is chrome-less,
-> single-tab, and runs in the `sdsc-browser` add-on (window + CEF + page
-> surface + cursor + text session). The OSK is system owned;
-> L1/R1/Options map to semantic back/forward/reload; popups are denied. The
-> in-process Browser window path is removed. MSIX/Store packaging remains.
+> **v0 update (Phases A–C landed):** the in-process Browser is chrome-less
+> and single-tab (page surface + cursor + page text only); the OSK is system
+> owned; L1/R1/Options map to semantic back/forward/reload; popups are denied.
+> The app split below (Phase D) was reverted; keep the Browser in-process.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
 ## Goal
 
 Split the controller browser out of the Launcher and make it a standalone
-managed app. PS opens a small overlay **Home** listing installed apps (Launcher
-first, Browser second when its engine is installed, ＋ tile for adding optional
-packages). Future controller-first apps register the same way.
-Browser runs its own fullscreen window with its own chrome. Home, Launcher, and
-Browser are all managed by sdsc-utils (tray + HID + iced daemon, one process).
+managed app **inside the shell process**. PS opens a small overlay **Home**
+listing installed apps (Launcher first, Browser second when its engine is
+installed, ＋ tile for adding optional packages). Future controller-first apps
+register the same way. Browser runs its own fullscreen window with its own
+chrome. Home, Launcher, and Browser are all managed by sdsc-utils (tray + HID +
+iced daemon, one process).
 
 Engine target: **CEF OSR** as a Store/standalone DLC. Servo is deleted with no
 reader fallback (viability already proven; no `A11yTree`-dependent

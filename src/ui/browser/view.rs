@@ -1,9 +1,9 @@
-//! Standalone Browser add-on window rendering.
+//! Standalone Browser window rendering.
 //!
 //! v0 is chrome-less: the window renders the CEF page surface plus the pad
-//! cursor. The panel state lives in `ui::browser::state`; this module owns the
-//! page/cursor composition and the browser-facing message vocabulary. The
-//! system OSK is an overlay owned by the main app, never rendered here.
+//! cursor and the controller text keyboard. The panel state lives in
+//! `ui::browser::state`; this module owns the page/cursor composition and the
+//! browser-facing message vocabulary.
 
 use crate::browser::engine::BrowserCursor;
 use crate::ui::browser::state::BrowserPanel;

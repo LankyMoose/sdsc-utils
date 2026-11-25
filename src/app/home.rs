@@ -243,7 +243,6 @@ impl App {
             height: 1080.0,
         });
         let close_osk = self.close_osk("home");
-        self.remote_browser_pause();
         // The backdrop always covers the monitor; the card scales/centers
         // inside it. On an opaque backend the scrim blends over the opaque
         // clear color instead of the desktop.
@@ -255,15 +254,13 @@ impl App {
         }
         let window_size = Size::new(cover.width, cover.height);
         let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
-        self.refresh_addon_status();
         self.refresh_engine_status();
         self.sync_home_engine_info();
         self.sync_home_settings();
         self.home_state.on_open(
             self.session.prefs.home_enabled,
-            self.browser.addon_installed && self.browser.engine_status.is_ready(),
+            self.browser.engine_status.is_ready(),
         );
-        self.sync_home_app_state();
         // `on_open` resets transient screens; engine info and settings are
         // persistent shell state, so re-apply them after the reset.
         self.sync_home_engine_info();
@@ -342,9 +339,10 @@ impl App {
             return self.rehost_toast_after_composite();
         };
         let task = window::close(id).chain(self.rehost_toast_after_composite());
-        if self.browser_visible {
-            self.remote_browser_resume();
-            self.remote_browser_focus();
+        if self.browser_visible
+            && let Some(browser) = self.browser_window
+        {
+            return task.chain(focus_window(browser));
         }
         if self.launcher_visible
             && let Some(start) = self.launcher_window
@@ -612,21 +610,17 @@ impl App {
         };
         self.play_ui_cue(UiSoundKind::Action);
         match action {
-            home_view::AppAction::Install => {
+            home_view::AppAction::Install | home_view::AppAction::Update => {
                 self.home_state.close_apps_menu();
-                self.start_browser_app_install(false, None, None)
-            }
-            home_view::AppAction::Update => {
-                self.home_state.close_apps_menu();
-                self.start_browser_app_install(true, None, None)
+                self.start_engine_install()
             }
             home_view::AppAction::Cancel => {
                 self.home_state.close_apps_menu();
-                self.cancel_browser_app_install()
+                self.cancel_engine_install()
             }
             home_view::AppAction::Uninstall => {
                 self.home_state.close_apps_menu();
-                self.start_browser_app_uninstall()
+                self.start_engine_uninstall()
             }
             home_view::AppAction::Info => {
                 self.home_state.show_app_info(index);
@@ -823,9 +817,9 @@ impl App {
                 self.close_home().chain(self.open_launcher())
             }
             home_view::HomeTile::Browser => {
-                if !self.home_state.engine_ready {
+                if self.browser.engine.is_none() {
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: home Browser requested but add-on not installed",
+                        "ui-diag: home Browser requested but engine not installed",
                     );
                     self.home_state.open_apps_menu(0);
                     return Task::none();
@@ -834,43 +828,6 @@ impl App {
                 self.close_home().chain(self.open_browser_window())
             }
         }
-    }
-
-    /// Bounded Home/add-on state for action traces and replay preconditions.
-    pub(crate) fn trace_home_state(&self) -> serde_json::Value {
-        serde_json::json!({
-            "home": {
-                "open": self.home_visible,
-                "busy": self.home_state.busy(),
-                "installing": self.home_state.installing,
-                "uninstalling": self.home_state.uninstalling,
-                "cancelling": self.home_state.cancelling,
-                "apps_menu": self.home_state.apps_menu,
-            },
-            "addon": {
-                "installed": self.browser.addon_installed,
-                "managed": self.browser.addon_managed,
-                "version": self.browser.addon_version,
-                "latest_version": self.browser.addon_latest_version,
-                "update_ready": self.browser.addon_update_ready,
-                "source_available": self.browser.addon_source_available,
-                "size": self.browser.addon_size,
-                "running": self.browser.remote.is_some(),
-            },
-            "engine": {
-                "ready": self.browser.engine_status.is_ready(),
-                "managed": self.browser.engine_managed,
-                "update_ready": self.home_state.engine_update_ready,
-                "restart_required": self.home_state.engine_restart_required,
-                "version": self.home_state.engine_version,
-            },
-            "app": {
-                "ready": self.home_state.engine_ready,
-                "installed": self.home_state.app_installed,
-                "update_ready": self.home_state.app_update_ready,
-                "version": self.home_state.app_version,
-            },
-        })
     }
 
     /// Rebuild Home controller strip from the live session.

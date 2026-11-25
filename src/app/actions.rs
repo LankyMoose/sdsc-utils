@@ -4,12 +4,13 @@
 //! `ActionInvoked { id }`. Browser v0 uses L1/R1/Options for back/forward/
 //! reload, tap only.
 
-use super::App;
+use super::{App, Message};
 use crate::domain::pad::{PadButton, PadButtonAction};
 use crate::hosted::{
     ActionInvoked, ActionSpec, AppId, AppSpec, CONTRACT_VERSION, Capabilities, LifecycleSpec,
     Manifest, SurfaceKind, SurfaceSpec, TextSessionState,
 };
+use iced::Task;
 
 pub const BROWSER_APP: &str = "browser";
 pub const ACTION_BACK: &str = "back";
@@ -48,7 +49,6 @@ pub fn browser_action(button: PadButton) -> Option<&'static str> {
 }
 
 /// The Browser's published contract v0 specification.
-#[cfg_attr(not(feature = "cef-engine"), allow(dead_code))]
 pub fn browser_spec(panel: &crate::ui::browser::BrowserPanel) -> AppSpec {
     AppSpec {
         contract: CONTRACT_VERSION,
@@ -95,6 +95,36 @@ pub fn browser_spec(panel: &crate::ui::browser::BrowserPanel) -> AppSpec {
 }
 
 impl App {
+    /// OS action-invoked path. Validates the published enabled state before the
+    /// app receives the action; the app never knows the button.
+    pub(crate) fn invoke_hosted_action(&mut self, invoked: ActionInvoked) -> Task<Message> {
+        if invoked.app.as_str() != BROWSER_APP {
+            crate::platform::trace::event(crate::platform::trace::Lane::Platform, "app.action")
+                .field("app", invoked.app.as_str())
+                .field("action", &invoked.action)
+                .field("known_app", false)
+                .emit();
+            return Task::none();
+        }
+        let spec = browser_spec(&self.browser.panel);
+        let enabled = spec.action_enabled(&invoked.action);
+        crate::platform::trace::event(crate::platform::trace::Lane::Platform, "app.action")
+            .field("app", invoked.app.as_str())
+            .field("action", &invoked.action)
+            .field("known_app", true)
+            .field("enabled", enabled)
+            .emit();
+        if !enabled {
+            return Task::none();
+        }
+        match invoked.action.as_str() {
+            ACTION_BACK => self.on_browser_go_back(),
+            ACTION_FORWARD => self.on_browser_go_forward(),
+            ACTION_RELOAD => self.on_browser_reload(),
+            _ => Task::none(),
+        }
+    }
+
     /// Dispatch a source-side tap through the binding table. Returns `None`
     /// when the button is not a semantic action.
     pub(crate) fn hosted_action_for_tap(

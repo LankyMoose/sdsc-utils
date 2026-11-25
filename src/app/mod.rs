@@ -6,13 +6,8 @@
 //! compositor; popup, Settings, and Launcher stay ephemeral (create/destroy on each
 //! open — Launcher uses a normal OS window open).
 
-pub(crate) mod actions;
-mod addons;
+mod actions;
 mod browser;
-mod browser_remote;
-
-#[cfg(feature = "cef-engine")]
-pub(crate) use browser::trace_browser_state;
 mod configure;
 mod feedback;
 mod home;
@@ -28,6 +23,7 @@ use crate::domain::color::SpectrumService;
 use crate::domain::pad::{InputHub, PadAction, PadActionGate};
 use crate::{AppError, AppResult};
 
+use crate::browser::engine::{EngineCommand, EngineEvent, EngineHandle};
 use crate::browser::keys::RawKey;
 #[cfg(debug_assertions)]
 use crate::controller::emulate;
@@ -175,33 +171,16 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
-    /// 60Hz poll tick for the Browser add-on supervisor.
+    /// Standalone Browser window opened (focus + size the engine viewport).
+    BrowserOpened(window::Id),
+    /// Browser-window chrome / page / cursor message.
+    Browser(crate::ui::browser::BrowserMessage),
+    /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
     BrowserFrame,
-    /// Keyboard while a shell window has focus (Launcher/Home). The Browser
-    /// add-on receives its own keys in its process.
-    ShellKey {
-        id: window::Id,
-        key: RawKey,
-    },
     /// System OSK overlay window opened.
     OskOpened(window::Id),
     /// System OSK overlay message (no interactive keys; reserved).
     Osk(crate::ui::osk::OskMessage),
-    /// Browser add-on install/update finished or was cancelled.
-    AddonInstallDone {
-        generation: u64,
-        outcome: crate::browser::addon_install::AddonInstallOutcome,
-    },
-    /// Live add-on copy progress.
-    AddonInstallProgress {
-        generation: u64,
-        progress: crate::browser::addon_install::AddonProgress,
-    },
-    /// Browser add-on uninstall finished.
-    AddonUninstallDone {
-        generation: u64,
-        result: Result<(), String>,
-    },
     /// Optional BrowserEngine install/update finished or was cancelled.
     EngineInstallDone {
         generation: u64,
@@ -248,6 +227,18 @@ pub enum Message {
     HomeOpened(window::Id),
     /// Home selection / activation from pad, keyboard, or mouse.
     Home(crate::ui::home::HomeMessage),
+    /// Raw keyboard event for the Browser app (controller-first: no mouse).
+    /// Routed in `update` — page mode forwards to the engine, URL-edit mode
+    /// and reader mode fall back to the legacy Launcher-key mapping.
+    BrowserRawKey {
+        id: window::Id,
+        key: RawKey,
+    },
+    /// Platform IME preedit/commit for the Browser page.
+    BrowserIme {
+        id: window::Id,
+        event: iced::advanced::input_method::Event,
+    },
     /// Debug-only standalone ambient preview window opened.
     #[cfg(debug_assertions)]
     AmbientPreviewOpened(window::Id),
@@ -272,6 +263,10 @@ pub enum Message {
     /// Single-flight art worker milestone (selected / near / job done).
     LauncherArtEvent(crate::ui::launcher::art_worker::ArtEvent),
     Launcher(LauncherMessage),
+    /// CEF engine worker event (title / URL / load / DOM). System-class:
+    /// frames flow continuously while visible and must not count as user
+    /// activity (or idle-dim and cursor-hide would never fire).
+    BrowserEngine(EngineEvent),
     /// Keyboard while some iced window has focus; filtered to the launcher in update.
     LauncherKey {
         id: window::Id,
@@ -301,6 +296,10 @@ pub enum Message {
     /// Debug-only: flip the layout-bounding-box overlay (Diagnostics toggle or F9).
     #[cfg(debug_assertions)]
     ToggleDebugLayoutBounds,
+    /// Debug-only: browser target overlay + frame shots (Diagnostics toggle
+    /// or F10). Mirrored into the browser panel for the card readout.
+    #[cfg(debug_assertions)]
+    ToggleDebugBrowser,
 
     PlaceToast {
         id: window::Id,
@@ -376,13 +375,10 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
+            | Message::BrowserOpened(_)
             | Message::BrowserFrame
-            | Message::ShellKey { .. }
             | Message::OskOpened(_)
             | Message::Osk(_)
-            | Message::AddonInstallDone { .. }
-            | Message::AddonInstallProgress { .. }
-            | Message::AddonUninstallDone { .. }
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::HomeProgressTick
@@ -396,6 +392,7 @@ impl Message {
             | Message::LauncherFrame
             | Message::LauncherCursorActivity(_)
             | Message::LauncherArtEvent(_)
+            | Message::BrowserEngine(_)
             | Message::SteamScanDone(_)
             | Message::SteamScanIdleFallback
             | Message::PlaceToast { .. }
@@ -427,6 +424,11 @@ impl Message {
             Message::TrayLeftClick(_) => Some(input_trace("tray.click", "tray")),
             Message::Popup(_) => Some(input_trace("ui.popup", "popup")),
             Message::Configure(_) => Some(input_trace("ui.settings", "settings")),
+            Message::Browser(message) => message
+                .trace_label()
+                .map(|label| input_trace(label, "browser")),
+            Message::BrowserRawKey { .. } => Some(input_trace("ui.key", "browser")),
+            Message::BrowserIme { .. } => None,
             Message::Home(message) => {
                 let mut trace = input_trace(message.trace_label(), "home");
                 if let crate::ui::home::HomeMessage::AppsMenuOpen(index) = message {
@@ -468,6 +470,7 @@ impl Message {
             #[cfg(debug_assertions)]
             Message::ToggleDebugLayoutBounds => Some(input_trace("debug.toggle.layout", "debug")),
             #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => Some(input_trace("debug.toggle.browser", "debug")),
             #[cfg(debug_assertions)]
             Message::PreviewDrag | Message::PreviewClose => {
                 Some(input_trace("debug.preview", "debug"))
@@ -506,17 +509,14 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
+            | Message::BrowserOpened(_)
             | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
             | Message::LauncherFrame
             | Message::BrowserFrame
-            | Message::ShellKey { .. }
             | Message::OskOpened(_)
             | Message::Osk(_)
-            | Message::AddonInstallDone { .. }
-            | Message::AddonInstallProgress { .. }
-            | Message::AddonUninstallDone { .. }
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
@@ -536,7 +536,10 @@ impl Message {
             | Message::Configure(_)
             | Message::Home(_)
             | Message::EngineInstallCancel
+            | Message::Browser(_)
             | Message::Launcher(_)
+            | Message::BrowserRawKey { .. }
+            | Message::BrowserIme { .. }
             | Message::LauncherCursorActivity(_)
             | Message::PadInput(_) => true,
             Message::LauncherKey { .. } => true,
@@ -544,12 +547,15 @@ impl Message {
             | Message::ManualIconPicked(_)
             | Message::SteamPathPicked(_) => true,
             Message::SteamScanDone(_) | Message::SteamScanIdleFallback => false,
+            Message::BrowserEngine(_) => false,
             #[cfg(debug_assertions)]
             Message::StressWindows(_) => true,
             #[cfg(debug_assertions)]
             Message::DebugOpen(_) => true,
             #[cfg(debug_assertions)]
             Message::ToggleDebugLayoutBounds => true,
+            #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => true,
             Message::PlaceToast { .. }
             | Message::ToastShown { .. }
             | Message::ToastFrame
@@ -660,6 +666,8 @@ pub struct App {
     pub debug_layout_bounds: bool,
     /// Debug-only browser overlay + frame shots (Diagnostics toggle / F10).
     /// Local UI state: never persisted. Mirrored into the browser panel.
+    #[cfg(debug_assertions)]
+    pub debug_browser: bool,
     /// Debug-only ambient pulse + ken-burns tuning (Diagnostics sliders).
     /// Local UI state: never persisted; defaults
     /// reproduce release visuals. Mirrored into the process-wide tuning
@@ -702,8 +710,18 @@ pub struct App {
     launcher_window: Option<window::Id>,
     /// True only while Launcher is revealed (warm HWND may exist while false).
     launcher_visible: bool,
-    /// True while the Browser add-on window is the active surface.
+    /// Standalone fullscreen Browser app window.
+    browser_window: Option<window::Id>,
     browser_visible: bool,
+    /// Monitor covered by the Browser window (stage size for its view).
+    browser_monitor_cover: Option<MonitorCover>,
+    /// Actual logical window size reported by iced after creation/resize.
+    browser_window_size: Option<(f32, f32)>,
+    /// Browser HWND is created hidden until its final size + DWM transition
+    /// setup; then it is shown so no create-time scale animation is visible.
+    browser_pending_show: bool,
+    /// Launcher instant for the Browser backdrop fade-in (card first, scrim after).
+    browser_backdrop_fade: Option<Instant>,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
     home_window: Option<window::Id>,
@@ -748,6 +766,7 @@ pub struct App {
     launcher_monitor_cover: Option<MonitorCover>,
     /// This process was relaunched by the crash handler: restore tabs in
     /// safe mode (default live tab, saved tabs stored).
+    crash_restart_boot: bool,
     /// Last user activity on Launcher (mouse / keyboard / pad) for idle/sleep.
     launcher_last_activity: Instant,
     /// Last mouse activity on Launcher (cursor hide only — pad must not unhide).
@@ -778,7 +797,9 @@ pub struct App {
     /// every tap without changing the one-action surface contracts.
     pending_pad_actions: VecDeque<PadAction>,
     /// Browser history/nav action waiting for the engine to settle.
+    pending_browser_trace: Option<crate::app::browser::PendingBrowserTrace>,
     /// Multi-step history jump, advanced one CEF step per canonical snapshot.
+    pending_history_travel: Option<crate::app::browser::PendingHistoryTravel>,
     /// In-process replay plan when launched with `--trace-replay`.
     replay: Option<crate::platform::trace::replay::ReplayPlan>,
     /// Surface receiving source-side tap actions.
@@ -1031,10 +1052,46 @@ impl App {
             (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
 
         let last_discovered = hid_worker.presence_paths();
-        // The add-on owns its window and CEF. The shell only cleans up a
-        // deferred local uninstall left by the previous boot.
+        // The browser card is height-driven (16:9): resolve the primary
+        // monitor before spawning the engine so the software surface is
+        // created at its final page size. Starting at a placeholder size
+        // would reflow the first document (and leave it laid out at the old
+        // width if only the pixel buffer grew).
+        let initial_cover =
+            crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+        let (initial_page_w, initial_page_h) =
+            crate::ui::browser::view::fullscreen_layout(initial_cover.width, initial_cover.height);
+        let initial_page = (
+            initial_page_w.round().max(1.0) as u32,
+            initial_page_h.round().max(1.0) as u32,
+        );
+        // A crash-restart successor must not re-open the page that killed
+        // CEF can crash on a hostile page too. Boot the default page; saved tabs stay
+        // stored for a manual switch.
+        let crash_restart_boot = crate::platform::crash_restart::has_pending_notice()
+            || crate::platform::crash_restart::recent_crash()
+            || crate::platform::crash_restart::take_panic_flag();
+        let boot_url = if crash_restart_boot {
+            crate::browser::BROWSER_DEFAULT_URL.to_string()
+        } else {
+            crate::browser::tabs::boot_url()
+        };
         #[cfg(feature = "cef-engine")]
-        crate::browser::engine_install::cleanup_pending_uninstall();
+        let browser_engine = {
+            crate::browser::engine_install::cleanup_pending_uninstall();
+            crate::browser::cef_backend::spawn_engine(&boot_url, initial_page)
+        };
+        #[cfg(not(feature = "cef-engine"))]
+        let browser_engine: Option<EngineHandle> = {
+            // UI-only iteration build: no engine, no reader fallback.
+            let _ = (&boot_url, initial_page);
+            None
+        };
         let install_limit = session.prefs.apps_download_limit_kbps;
         let replay = crate::platform::trace::replay::request()
             .and_then(crate::platform::trace::replay::plan);
@@ -1071,6 +1128,8 @@ impl App {
             #[cfg(debug_assertions)]
             debug_layout_bounds: false,
             #[cfg(debug_assertions)]
+            debug_browser: false,
+            #[cfg(debug_assertions)]
             debug_ambient_freq: debug_tune.pulse_freq,
             #[cfg(debug_assertions)]
             debug_ambient_veil_freq: debug_tune.veil_freq,
@@ -1105,7 +1164,12 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             launcher_window: None,
             launcher_visible: false,
+            browser_window: None,
             browser_visible: false,
+            browser_monitor_cover: None,
+            browser_window_size: None,
+            browser_pending_show: false,
+            browser_backdrop_fade: None,
             home_window: None,
             home_visible: false,
             home_stage: (crate::ui::home::HOME_WIDTH, crate::ui::home::HOME_HEIGHT),
@@ -1118,11 +1182,15 @@ impl App {
             last_start_paint_active: std::cell::Cell::new(false),
             launcher_nav_ready: false,
             launcher_state: launcher_view::State::default(),
-            browser: browser::BrowserAppState::default(),
+            browser: browser::BrowserAppState {
+                engine: browser_engine,
+                ..Default::default()
+            },
             osk: osk::SystemOsk::new(osk_mode),
             install_policy: installs::AppInstallPolicy::new(install_limit),
             home_apps: home::HomeApps::new(),
             launcher_monitor_cover: None,
+            crash_restart_boot,
             launcher_last_activity: Instant::now(),
             launcher_cursor_last_active: Instant::now(),
             launcher_home_pause: None,
@@ -1135,6 +1203,8 @@ impl App {
             pad_nav: PadNavBank::default(),
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
+            pending_browser_trace: None,
+            pending_history_travel: None,
             replay,
             pad_input_owner: PadInputOwner::None,
             manual_add_r2_latched: false,
@@ -1194,6 +1264,20 @@ impl App {
             pending_emulator_commits: std::collections::HashMap::new(),
         };
 
+        // Apply the boot-time browser geometry to the panel/cursor now; the
+        // browser window may not open for a while and must be ready at the
+        // right fullscreen size when it does.
+        app.browser
+            .panel
+            .set_viewport(initial_page_w.max(1.0), initial_page_h.max(1.0));
+        // The default cursor is centered in the compile-time 800x600 box;
+        // recenter it in the real boot page area before the first Browser
+        // frame so it never appears near the top-left corner.
+        app.browser.panel.cursor.reset_for_page();
+
+        // Disk-persisted bookmarks stay loaded as dormant data (no v0 UI).
+        app.browser.panel.bookmarks = crate::browser::bookmarks::load();
+
         // Show the tray immediately; the daemon owns it for its whole lifetime.
         app.create_tray();
         // Forensics line: which binary, which install flavor, and whether the
@@ -1212,25 +1296,24 @@ impl App {
         app.sync_low_battery();
         app.refresh_analytics_panel();
         app.seed_steam_library_from_cache();
-        app.refresh_addon_status();
-        app.refresh_engine_status();
-        app.sync_home_app_state();
-        crate::platform::trace::manifest(
-            "browser_addon",
-            serde_json::json!({
-                "state": if app.browser.addon_installed { "installed" } else { "not_installed" },
-                "managed": app.browser.addon_managed,
-                "version": app.browser.addon_version,
-                "source_available": app.browser.addon_source_available,
-                "update_ready": app.browser.addon_update_ready,
-            }),
-        );
-        crate::platform::app_log::info(format!(
-            "browser: add-on installed={} version={} engine_ready={}",
-            app.browser.addon_installed,
-            app.browser.addon_version.as_deref().unwrap_or("-"),
-            app.browser.engine_status.is_ready()
-        ));
+        // Engine presence is process-static: sync once so the browser card
+        // can label its backend (engine pixels vs reader text).
+        app.browser.engine_available = app.browser.engine.is_some();
+        #[cfg(feature = "cef-engine")]
+        {
+            app.browser.engine_status = if app.browser.engine.is_some() {
+                crate::app::browser::EngineStatus::Ready(
+                    crate::browser::cef_backend::resolve_engine_dir().unwrap_or_default(),
+                )
+            } else {
+                crate::app::browser::EngineStatus::Missing
+            };
+        }
+        if app.browser.engine.is_some() {
+            crate::platform::app_log::info("browser: engine backend active");
+        } else {
+            crate::platform::app_log::info("browser: reader backend active");
+        }
 
         // Renderer-pref restart: reopen to the pre-restart UI state.
         // Consumed once; stale (>120s) records are ignored by `take()`.
@@ -1356,6 +1439,7 @@ impl App {
             "Settings".to_string()
         } else if Some(window) == self.launcher_window
             || Some(window) == self.home_window
+            || Some(window) == self.browser_window
             || Some(window) == self.osk.window
         {
             String::new()
@@ -1421,7 +1505,11 @@ impl App {
                         if key == keyboard::Key::Named(keyboard::key::Named::F9) {
                             return Some(Message::ToggleDebugLayoutBounds);
                         }
-                        Some(Message::ShellKey {
+                        #[cfg(debug_assertions)]
+                        if key == keyboard::Key::Named(keyboard::key::Named::F10) {
+                            return Some(Message::ToggleDebugBrowser);
+                        }
+                        Some(Message::BrowserRawKey {
                             id,
                             key: RawKey {
                                 key,
@@ -1439,7 +1527,7 @@ impl App {
                         location,
                         modifiers,
                         ..
-                    }) => Some(Message::ShellKey {
+                    }) => Some(Message::BrowserRawKey {
                         id,
                         key: RawKey {
                             key,
@@ -1457,6 +1545,7 @@ impl App {
                         | mouse::Event::WheelScrolled { .. },
                     ) => Some(Message::LauncherCursorActivity(id)),
                     iced::Event::Touch(_) => Some(Message::LauncherCursorActivity(id)),
+                    iced::Event::InputMethod(event) => Some(Message::BrowserIme { id, event }),
                     _ => None,
                 }
             }),
@@ -1495,7 +1584,7 @@ impl App {
                 .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
         }
 
-        if self.home_shell_anim.is_some() {
+        if self.browser_backdrop_fade.is_some() || self.home_shell_anim.is_some() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
         }
 
@@ -1547,6 +1636,12 @@ impl App {
                 self.input_hub.clone(),
                 pad_input_edge_stream,
             ));
+        }
+
+        // CEF engine worker → UI event bridge. The worker stays suspended
+        // until the Browser window is visible.
+        if let Some(engine) = self.browser.engine.clone() {
+            subscriptions.push(Subscription::run_with(engine, engine_event_stream));
         }
 
         // Home's full-screen overlay owns the screen; freezing Launcher's
@@ -1657,6 +1752,28 @@ impl App {
 
         if Some(window) == self.osk.window {
             return crate::ui::osk::view(&self.osk.state).map(Message::Osk);
+        }
+
+        if Some(window) == self.browser_window {
+            let (w, h) = self
+                .browser_window_size
+                .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
+                .unwrap_or((1920.0, 1080.0));
+            let now = Instant::now();
+            let backdrop_alpha = self
+                .browser_backdrop_fade
+                .map(|started| {
+                    crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
+                })
+                .unwrap_or(theme::BACKDROP_ALPHA);
+            return crate::ui::browser::view::root_view(
+                &self.browser.panel,
+                self.browser.engine_available,
+                w,
+                h,
+                backdrop_alpha,
+            )
+            .map(Message::Browser);
         }
 
         if Some(window) == self.home_window {
@@ -1822,6 +1939,11 @@ impl App {
                 Task::none()
             }
             #[cfg(debug_assertions)]
+            Message::ToggleDebugBrowser => {
+                self.debug_browser = !self.debug_browser;
+                self.browser.panel.debug_overlay = self.debug_browser;
+                Task::none()
+            }
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick => self.on_emulator_commit_tick(),
             Message::PollResult(result) => self.on_poll_result(result),
@@ -1896,20 +2018,11 @@ impl App {
                 task.chain(self.raise_toast_above_all())
             }
             Message::Configure(message) => self.on_configure_message(message),
-            Message::BrowserFrame => self.poll_remote_browser(),
+            Message::BrowserOpened(id) => self.on_browser_opened(id),
+            Message::Browser(message) => self.on_browser_message(message),
+            Message::BrowserFrame => self.on_browser_frame(),
             Message::OskOpened(id) => self.on_osk_opened(id),
             Message::Osk(_) => Task::none(),
-            Message::AddonInstallDone {
-                generation,
-                outcome,
-            } => self.on_addon_install_done(generation, outcome),
-            Message::AddonInstallProgress {
-                generation,
-                progress,
-            } => self.on_addon_install_progress(generation, progress),
-            Message::AddonUninstallDone { generation, result } => {
-                self.on_addon_uninstall_done(generation, result)
-            }
             Message::EngineInstallDone {
                 generation,
                 outcome,
@@ -1946,14 +2059,18 @@ impl App {
                 Task::none()
             }
             Message::WindowSized(id, size) => {
-                if self.home_window == Some(id) {
+                if self.browser_window == Some(id) {
+                    self.on_browser_window_sized(size)
+                } else if self.home_window == Some(id) {
                     self.on_home_window_sized(size)
                 } else {
                     Task::none()
                 }
             }
             Message::WindowShowNow(id) => {
-                if self.home_window == Some(id) {
+                if self.browser_window == Some(id) {
+                    self.on_browser_show_now()
+                } else if self.home_window == Some(id) {
                     self.on_home_show_now()
                 } else {
                     Task::none()
@@ -1962,6 +2079,14 @@ impl App {
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();
+                if let Some(started) = self.browser_backdrop_fade {
+                    if let Some(id) = self.browser_window {
+                        redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
+                    }
+                    if crate::ui::motion::shell_backdrop_done(started, now) {
+                        self.browser_backdrop_fade = None;
+                    }
+                }
                 if let Some(anim) = self.home_shell_anim {
                     if let Some(id) = self.home_window {
                         redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
@@ -2009,13 +2134,26 @@ impl App {
                 // Debug frame shots used to ride the per-frame engine event;
                 // the shader now pulls frames from the slot, so the 5s shot
                 // cadence lives on the Launcher frame tick.
-                self.on_start_frame()
+                #[cfg(debug_assertions)]
+                {
+                    let shot = self.shoot_browser_window(false);
+                    self.on_start_frame().chain(shot)
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    self.on_start_frame()
+                }
             }
             Message::LauncherCursorActivity(id) => {
                 if !crate::platform::debug_quiet::input_dropped() {
                     let close = self.close_osk("mouse");
                     if Some(id) == self.launcher_window && self.launcher_visible {
                         self.note_start_cursor_activity();
+                    }
+                    if Some(id) == self.browser_window && self.browser_visible {
+                        // Any real pointer activity on the Browser window wins
+                        // over the pad ring, including header hovers.
+                        self.browser.panel.page_mouse_active = true;
                     }
                     return close;
                 }
@@ -2027,6 +2165,7 @@ impl App {
                 self.note_launcher_activity();
                 self.on_launcher_message(message)
             }
+            Message::BrowserEngine(event) => self.on_engine_event(event),
             Message::LauncherKey {
                 id,
                 action,
@@ -2045,13 +2184,21 @@ impl App {
                     self.on_start_key(id, action, pressed)
                 }
             }
-            Message::ShellKey { id, key } => {
+            Message::BrowserRawKey { id, key } => {
                 if crate::platform::debug_quiet::input_dropped() {
                     Task::none()
                 } else if self.osk.state.open {
                     self.on_osk_key(id, key)
                 } else {
-                    self.on_shell_key(id, key)
+                    self.on_browser_raw_key(id, key)
+                }
+            }
+            Message::BrowserIme { id, event } => {
+                if crate::platform::debug_quiet::input_dropped() {
+                    Task::none()
+                } else {
+                    let close = self.close_osk("ime");
+                    close.chain(self.on_browser_ime(id, event))
                 }
             }
             Message::PadInput(edge) => {
@@ -2126,6 +2273,14 @@ impl App {
         } else if Some(id) == self.configure_window {
             self.configure_window = None;
             self.sync_toast_zorder()
+        } else if Some(id) == self.browser_window {
+            self.browser_window = None;
+            self.browser_visible = false;
+            self.browser_monitor_cover = None;
+            if self.browser.panel.session.is_open() {
+                let _ = self.close_browser_surface();
+            }
+            Task::none()
         } else if Some(id) == self.osk.window {
             self.on_osk_window_closed(id)
         } else if Some(id) == self.home_window {
@@ -2136,8 +2291,10 @@ impl App {
             // Return focus to Launcher when it is the app underneath. The toast
             // is AlwaysOnTop, so it stays above a normal-level Launcher without
             // re-raising anything.
-            if self.browser_visible {
-                self.remote_browser_focus();
+            if self.browser_visible
+                && let Some(browser) = self.browser_window
+            {
+                return focus_window(browser);
             }
             if self.launcher_visible
                 && let Some(start) = self.launcher_window
@@ -2161,6 +2318,7 @@ impl App {
             // a later window (the force_cursor gate above is the backstop).
             self.set_start_cursor_hidden(false);
             self.pad_nav.reset();
+            self.browser.dpad_stepper.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
             let sync = rehost_toast.chain(self.sync_toast_zorder());
@@ -2220,6 +2378,11 @@ impl App {
             } else {
                 self.close_launcher()
             }
+        } else if Some(id) == self.browser_window && self.browser_visible {
+            // A drag/selection must not survive alt-tab; clear held buttons
+            // and stale Shift/Ctrl state.
+            self.browser_pointer_focus_lost();
+            Task::none()
         } else {
             Task::none()
         }
@@ -2408,53 +2571,6 @@ impl App {
         task
     }
 
-    /// Keyboard routing for shell windows. The Browser add-on receives its
-    /// own physical keys, so this only covers Home and Launcher.
-    pub(crate) fn on_shell_key(&mut self, id: window::Id, raw: RawKey) -> Task<Message> {
-        self.haptic_pad_serial = None;
-        if Some(id) == self.home_window && self.home_visible {
-            return self.on_home_key(raw);
-        }
-        if Some(id) != self.launcher_window || !self.launcher_visible {
-            return Task::none();
-        }
-        self.note_launcher_activity();
-        let action = |key: &iced::keyboard::Key| match key {
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                Some(LauncherKeyAction::Cancel)
-            }
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
-                Some(LauncherKeyAction::Confirm)
-            }
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) => {
-                Some(LauncherKeyAction::Up)
-            }
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) => {
-                Some(LauncherKeyAction::Down)
-            }
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
-                Some(LauncherKeyAction::Left)
-            }
-            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
-                Some(LauncherKeyAction::Right)
-            }
-            _ => None,
-        };
-        if raw.pressed {
-            if let Some(action) = action(&raw.key) {
-                return self.on_start_key(id, action, true);
-            }
-        } else if let Some(action) = action(&raw.key)
-            && matches!(
-                action,
-                LauncherKeyAction::Cancel | LauncherKeyAction::Confirm
-            )
-        {
-            return self.on_start_key(id, action, false);
-        }
-        Task::none()
-    }
-
     fn on_start_key(
         &mut self,
         id: window::Id,
@@ -2505,6 +2621,8 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Up))
                     } else if self.launcher_state.settings.open {
                         self.on_launcher_settings_nav(Some(NavAction::Up))
+                    } else if self.browser.panel.session.is_open() {
+                        self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -2518,6 +2636,8 @@ impl App {
                         self.on_ambient_tuning_nav(Some(NavAction::Down))
                     } else if self.launcher_state.settings.open {
                         self.on_launcher_settings_nav(Some(NavAction::Down))
+                    } else if self.browser.panel.session.is_open() {
+                        self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                     } else if self.immersive_horizontal_games_nav() {
                         // Horizontal Games strip scrolls Left/Right only.
                         Task::none()
@@ -2675,13 +2795,22 @@ impl App {
         }
         let _ = crate::ui::launcher::icon_cache::bump_art_warm_generation();
         self.art.shutdown();
+        // Persist the tab strip (backstop — mutations already save on the
+        // way; this covers a crash-free quit with no prior change).
+        self.browser.panel.save_tabs();
         // Idempotent with `InputEdgeBindGuard::drop` (subscription
         // teardown also clears).
         self.input_hub.clear();
         self.hid_worker.shutdown();
-        // Close the optional Browser add-on process and wait briefly.
-        if let Some(mut remote) = self.browser.remote.take() {
-            remote.shutdown();
+        // Close CEF browsers and let the worker ack. Bounded: a wedged
+        // engine must not hang quit. Profile state is flushed continuously
+        // by CEF; process exit follows immediately.
+        if let Some(engine) = &self.browser.engine {
+            let (tx, rx) = std::sync::mpsc::channel();
+            engine.send(EngineCommand::Shutdown { done: tx });
+            if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                crate::controller::hid::diag::diag_info("ui-diag: engine shutdown timeout");
+            }
         }
         self.tray_icon.take();
         crate::controller::hid::diag::diag_info("ui-diag: process exit complete");
@@ -3228,6 +3357,58 @@ impl Drop for InputEdgeBindGuard {
         // Idempotent with the `Message::Exit` clear below (clearing an
         // unbound Home is a no-op).
         self.hub.clear();
+    }
+}
+
+/// CEF engine worker → iced event bridge.
+///
+/// Two transports merge here (see [`EngineHandle`]): frames conflate to the
+/// latest buffered one (paint output is absolute state, like pad
+/// snapshots); control events (title/URL/load/focus/tree/tabs) arrive
+/// lossless and in order. Bind/clear mirrors the pad edge Home.
+fn engine_event_stream(engine: &EngineHandle) -> impl Stream<Item = Message> + Send + use<> {
+    use iced::futures::StreamExt;
+    let engine = engine.clone();
+    stream::channel(64, async move |mut output| {
+        let (frame_tx, mut frame_rx) =
+            iced::futures::channel::mpsc::channel::<crate::browser::engine::TabFrame>(64);
+        let (ctrl_tx, mut ctrl_rx) = iced::futures::channel::mpsc::unbounded::<EngineEvent>();
+        engine.bind(frame_tx, ctrl_tx);
+        let _guard = EngineBindGuard { engine };
+        loop {
+            iced::futures::select! {
+                control = ctrl_rx.next() => {
+                    let Some(event) = control else { break };
+                    if output.send(Message::BrowserEngine(event)).await.is_err() {
+                        break;
+                    }
+                }
+                frame = frame_rx.next() => {
+                    let Some(first) = frame else { break };
+                    // Drain any newer frames; only the latest paints.
+                    let mut latest = first;
+                    while let Ok(newer) = frame_rx.try_recv() {
+                        latest = newer;
+                    }
+                    if output
+                        .send(Message::BrowserEngine(EngineEvent::Frame(latest)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+struct EngineBindGuard {
+    engine: EngineHandle,
+}
+impl Drop for EngineBindGuard {
+    fn drop(&mut self) {
+        self.engine.clear();
     }
 }
 

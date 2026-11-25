@@ -1,12 +1,15 @@
-//! Top-level Browser add-on state.
+//! Top-level Browser app state.
 //!
-//! The shell owns launch/lifecycle, Home, the system OSK, and the engine
-//! package install. The `sdsc-browser` child owns its window, CEF, cursor,
-//! page state, and text session.
+//! Phase 0 of Home pivot lifts the browser out of `LauncherState`: the panel,
+//! engine handle, capability flag, and browser-only D-pad stepper live here so
+//! the browser no longer disappears when the Launcher is not the owner.
+//! Behavior is unchanged — Launcher still renders the panel until the standalone
+//! Browser window lands. See `notes/browser-Home-pivot.md`.
 
-use crate::domain::pad::PadAction;
-#[cfg(debug_assertions)]
-use crate::domain::pad::PadButton;
+use crate::browser::engine::{EngineCommand, EngineHandle};
+use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadId};
+use crate::platform::ui_sound::UiSoundKind;
+use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
 
 /// Result of a background local install/update.
@@ -53,9 +56,46 @@ pub struct EngineRateSample {
     pub ewma_bps: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserTraceKind {
+    History,
+    Navigate,
+}
+
+/// In-flight browser navigation/history action whose real outcome is the
+/// settled engine state, not the command send.
+pub(crate) struct PendingBrowserTrace {
+    pub action: crate::platform::trace::PendingAction,
+    pub kind: BrowserTraceKind,
+    pub requested_index: Option<usize>,
+    pub requested_url: Option<String>,
+    /// Load generation for `Navigate`; history traversals have none.
+    pub generation: Option<u64>,
+}
+
+/// A history action that needs CEF's canonical snapshots to settle.
+///
+/// `target_index = None` is the L1/R1 contract: one CEF traversal step, accept
+/// wherever Chromium lands. A selector pick uses `target_index = Some(..)`
+/// and jumps directly to that index through the DevTools protocol, so
+/// Chromium's skippable-entry filter cannot skip past it.
+pub(crate) struct PendingHistoryTravel {
+    pub tab: crate::browser::engine::TabId,
+    pub target_index: Option<usize>,
+    pub target_url: Option<String>,
+    pub start_index: Option<usize>,
+    pub start_url: String,
+    pub started: Instant,
+}
+
 #[derive(Default)]
 pub struct BrowserAppState {
-    /// True when the add-on executable is available.
+    /// Tabs, chrome targets, cursor, bookmarks, and per-tab page state.
+    pub panel: BrowserPanel,
+    /// CEF OSR worker. `None` in UI-only builds or when CEF is missing.
+    pub engine: Option<EngineHandle>,
+    /// Process-static capability: true when an engine worker is live. Drives
+    /// the page placeholder copy and Home tile install state.
     pub engine_available: bool,
     /// Runtime/install status for the optional engine package.
     pub engine_status: EngineStatus,
@@ -84,68 +124,75 @@ pub struct BrowserAppState {
     /// An update is on disk but the running CEF is still the old version.
     #[cfg(feature = "cef-engine")]
     pub engine_restart_required: bool,
-    /// Optional Browser add-on process. `None` means the Browser is closed or
-    /// the add-on is not installed.
-    pub remote: Option<super::browser_remote::BrowserRemote>,
-    /// Latest published add-on app spec.
-    pub remote_spec: Option<crate::hosted::AppSpec>,
-    /// Last add-on launch/protocol error, for Home/diagnostics.
-    pub remote_error: Option<String>,
-    /// Latest state snapshot from the add-on's replay handler.
-    pub replay_state: Option<serde_json::Value>,
-    /// The add-on package is installed under `<data>/browser-addon/`.
-    pub addon_installed: bool,
-    /// Installed add-on version.
-    pub addon_version: Option<String>,
-    /// Version offered by the local/feed source.
-    pub addon_latest_version: Option<String>,
-    /// A newer add-on package is available.
-    pub addon_update_ready: bool,
-    /// A package-owned add-on exists; Home must not install/remove it.
-    pub addon_managed: bool,
-    /// A source package (sidecar or `SDSC_BROWSER_ADDON_SOURCE`) exists.
-    pub addon_source_available: bool,
-    /// Installed add-on size in bytes.
-    pub addon_size: Option<u64>,
-    /// Guards late install workers after cancel/update.
-    pub addon_install_generation: u64,
-    /// Cooperative cancel for the add-on copy worker.
-    pub addon_install_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// A copy worker is live.
-    pub addon_copying: bool,
-    /// The app action should continue into the CEF engine component.
-    pub addon_chain_engine: bool,
-    /// The pending app action is an update rather than a fresh install.
-    pub addon_pending_update: bool,
-    /// Action flow spanning add-on install/update and any chained engine work.
-    pub addon_pending_action: Option<crate::platform::trace::PendingAction>,
-    /// Launch flow stays open until the child sends `Ready`.
-    pub pending_launch_action: Option<crate::platform::trace::PendingAction>,
+    /// Accumulated analog scroll for the next BrowserFrame tick.
+    pub pending_scroll: (f32, f32),
+    /// Page point the pending scroll belongs to (cursor at accumulation).
+    pub pending_scroll_at: (f32, f32),
+    /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
+    /// stickless `dpad_only` mask): the Launcher bank stays parked in engine
+    /// mode so stick moves never double-fire into both cursor and nav.
+    pub dpad_stepper: NavStepper,
+    /// Browser-window pad bank: face/bumper edges + reader nav. The engine
+    /// cursor uses `dpad_stepper` and raw stick samples instead.
+    pub nav: crate::domain::pad::PadNavBank,
+    /// First fresh Browser surface attempted the persisted-strip restore.
+    /// The engine preloads the saved active URL at boot, so "session URL is
+    /// empty" is not a usable freshness test on later opens.
+    pub tabs_restored: bool,
 }
 
 use iced::Task;
-#[cfg(feature = "cef-engine")]
 use std::time::Instant;
 
 use super::Message;
 
+/// Map source-side tap actions to the Browser's semantic nav actions.
+/// Tap only: no hold actions, no history selector, no hints/status.
+fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
+    actions.iter().find_map(|action| {
+        let nav = match (action.button, action.action) {
+            (PadButton::Cross, PadButtonAction::Tap) => NavAction::Confirm,
+            (PadButton::Circle, PadButtonAction::Tap) => NavAction::Cancel,
+            (PadButton::Square, PadButtonAction::Tap) => NavAction::CycleSort,
+            (PadButton::Triangle, PadButtonAction::Tap) => NavAction::Triangle,
+            (PadButton::Create, PadButtonAction::Tap) => NavAction::ToggleControllers,
+            // L1/R1/Options semantic actions are resolved by the OS binding
+            // table, not this generic nav map.
+            (PadButton::L3, PadButtonAction::Tap) => NavAction::ToggleMagnetism,
+            _ => return None,
+        };
+        Some((action.pad.clone(), nav))
+    })
+}
+
 const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 const REPLAY_STEP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// A selector jump that neither lands nor reports a DevTools error settles as
+/// a timeout so the action cannot hang the trace or the selector state.
+const HISTORY_TRAVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Double/triple-click window and movement tolerance for page selection.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const MULTI_CLICK_SLOP: f32 = 4.0;
 
-#[cfg(debug_assertions)]
-fn browser_replay_button(name: &str) -> Option<PadButton> {
-    Some(match name {
-        "cross" => PadButton::Cross,
-        "circle" => PadButton::Circle,
-        "square" => PadButton::Square,
-        "triangle" => PadButton::Triangle,
-        "l3" => PadButton::L3,
-        "r3" => PadButton::R3,
-        "l1" => PadButton::L1,
-        "r1" => PadButton::R1,
-        "options" => PadButton::Options,
-        _ => return None,
-    })
+/// Advance the double/triple-click chain. Returns the count for this press and
+/// the stamp to store for the next one.
+fn next_click_count(
+    last: Option<(Instant, f32, f32, u8)>,
+    now: Instant,
+    x: f32,
+    y: f32,
+) -> (u8, Option<(Instant, f32, f32, u8)>) {
+    let count = match last {
+        Some((at, last_x, last_y, count))
+            if now.saturating_duration_since(at) <= MULTI_CLICK_WINDOW
+                && (x - last_x).abs() <= MULTI_CLICK_SLOP
+                && (y - last_y).abs() <= MULTI_CLICK_SLOP =>
+        {
+            count.saturating_add(1).min(3)
+        }
+        _ => 1,
+    };
+    (count, Some((now, x, y, count)))
 }
 
 impl super::App {
@@ -165,13 +212,7 @@ impl super::App {
                 Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
             ]);
         }
-        if self.home_state.busy()
-            || self.browser.addon_copying
-            || self.browser.pending_launch_action.is_some()
-        {
-            // Launch settles on the add-on's `Ready` (or `Closed`). Replay must
-            // not advance into navigate/close while the handshake is pending,
-            // or the launch would be recorded as closed-before-ready.
+        if self.pending_history_travel.is_some() || self.pending_browser_trace.is_some() {
             return Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep);
         }
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
@@ -181,12 +222,8 @@ impl super::App {
             // the plan finishes. The trace is fully written before close.
             return self.close_browser_window();
         };
-        let state = match step.app.as_str() {
-            "browser" => Some(self.browser_trace_state()),
-            "home" => Some(self.trace_home_state()),
-            _ => None,
-        };
-        if let Some(state) = state {
+        if step.app == "browser" {
+            let state = trace_browser_state(&self.browser.panel);
             let checks = crate::platform::trace::replay::check_requires(&step.requires, &state);
             if checks
                 .iter()
@@ -215,19 +252,109 @@ impl super::App {
         ])
     }
 
-    pub(crate) fn browser_trace_state(&self) -> serde_json::Value {
-        self.browser
-            .replay_state
-            .clone()
-            .unwrap_or(serde_json::Value::Null)
-    }
-
-    #[cfg(debug_assertions)]
-    fn remote_replay_step(
+    fn replay_dispatch(
         &mut self,
         step: &crate::platform::trace::replay::ReplayStep,
     ) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        if step.app == "launcher" {
+            return self.replay_launcher_action(step);
+        }
+        if step.app != "browser" {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Platform,
+                "replay.unsupported",
+            )
+            .field("app", &step.app)
+            .field("action", &step.action)
+            .emit();
+            return Task::none();
+        }
         match step.action.as_str() {
+            "navigate" => {
+                let Some(url) = step.params.get("url").and_then(serde_json::Value::as_str) else {
+                    return Task::none();
+                };
+                self.navigate_browser_to(url.to_string())
+            }
+            "click" => {
+                let x = step.params.get("x").and_then(serde_json::Value::as_f64);
+                let y = step.params.get("y").and_then(serde_json::Value::as_f64);
+                let (Some(x), Some(y)) = (x, y) else {
+                    return Task::none();
+                };
+                let tab = self.browser_tab();
+                crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                    .field("command", "ClickAt")
+                    .field("tab", tab.0)
+                    .field("x", x)
+                    .field("y", y)
+                    .field("trusted", true)
+                    .emit();
+                if let Some(engine) = &self.browser.engine {
+                    engine.send(EngineCommand::ClickAt {
+                        tab,
+                        x: x as f32,
+                        y: y as f32,
+                        target: None,
+                        trusted: true,
+                    });
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "cursor.dock" => {
+                if let Some((x, y)) = replay_point(&step.params) {
+                    let panel = &mut self.browser.panel;
+                    let id = panel
+                        .focusables
+                        .iter()
+                        .find(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+                        .map(|f| f.id);
+                    panel.cursor.attached = id;
+                    panel.cursor.x = x;
+                    panel.cursor.y = y;
+                    panel.cursor.dock_blend = if id.is_some() { 1.0 } else { 0.0 };
+                    panel.cursor.last_dock = id.and_then(|id| {
+                        panel
+                            .focusables
+                            .iter()
+                            .find(|f| f.id == id)
+                            .map(|f| (f.x, f.y, f.w, f.h))
+                    });
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "pad.tap" => {
+                let button = match step
+                    .params
+                    .get("button")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("cross") => PadButton::Cross,
+                    Some("circle") => PadButton::Circle,
+                    Some("square") => PadButton::Square,
+                    Some("triangle") => PadButton::Triangle,
+                    Some("l3") => PadButton::L3,
+                    Some("r3") => PadButton::R3,
+                    Some("l1") => PadButton::L1,
+                    Some("r1") => PadButton::R1,
+                    Some("options") => PadButton::Options,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_tap(button)
+            }
+            #[cfg(debug_assertions)]
+            "pad.dir" => {
+                let action = match step.params.get("dir").and_then(serde_json::Value::as_str) {
+                    Some("up") => NavAction::Up,
+                    Some("down") => NavAction::Down,
+                    _ => return Task::none(),
+                };
+                self.replay_pad_dir(action)
+            }
+            #[cfg(debug_assertions)]
             "osk.stick" => {
                 let x = step
                     .params
@@ -245,81 +372,157 @@ impl super::App {
                     _ => self.replay_osk_stick(pair, (0.0, 0.0)),
                 }
             }
+            #[cfg(debug_assertions)]
             "osk.open" => self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage),
+            #[cfg(debug_assertions)]
             "osk.close" => self.close_osk("replay"),
+            "history.back" | "history.forward" => {
+                let target_url = step.params.get("url").and_then(serde_json::Value::as_str);
+                let resolved = target_url.and_then(|url| {
+                    self.browser
+                        .panel
+                        .session
+                        .nav_entries()
+                        .iter()
+                        .position(|entry| entry.url == url)
+                });
+                if let Some(index) = resolved {
+                    // The recorded position moved; resolve by identity.
+                    self.on_browser_history_pick(index)
+                } else if step.action == "history.back" {
+                    self.on_browser_go_back()
+                } else {
+                    self.on_browser_go_forward()
+                }
+            }
+            #[cfg(debug_assertions)]
+            "text" => {
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str) {
+                    self.replay_type_text(text);
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
             "key" => {
                 let Some(key) = step.params.get("key").and_then(serde_json::Value::as_str) else {
                     return Task::none();
                 };
+                let modifiers = replay_modifiers(step.params.get("modifiers"));
+                // Synthetic real keyboard: close the OSK first; Escape is
+                // consumed, other keys still reach the page (hand-off).
                 let close = self.close_osk("keyboard");
                 if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
                     return close;
                 }
-                if let Some(remote) = &mut self.browser.remote {
-                    remote.send_replay("key", step.params.clone());
+                if self.launcher_state.manual_add.is_some() && !self.browser_visible {
+                    if key.eq_ignore_ascii_case("enter") {
+                        return close.chain(self.on_launcher_confirm());
+                    }
+                    if key.eq_ignore_ascii_case("escape") {
+                        return close.chain(self.cancel_manual_add());
+                    }
+                }
+                if !self.replay_press_key(key, modifiers) {
+                    if key.chars().count() == 1 {
+                        self.replay_type_text(key);
+                    } else {
+                        crate::platform::trace::event(
+                            crate::platform::trace::Lane::Platform,
+                            "replay.unsupported",
+                        )
+                        .field("app", &step.app)
+                        .field("action", &step.action)
+                        .field("key", key)
+                        .emit();
+                    }
                 }
                 close
             }
-            "ime.preedit" | "ime.commit" => {
+            #[cfg(debug_assertions)]
+            "screenshot" => {
+                self.debug_browser = true;
+                self.browser.panel.debug_overlay = false;
+                self.shoot_browser_window(true)
+            }
+            #[cfg(debug_assertions)]
+            "ime.preedit" => {
                 let close = self.close_osk("ime");
-                if let Some(remote) = &mut self.browser.remote {
-                    remote.send_replay(&step.action, step.params.clone());
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(id) = self.browser_window
+                {
+                    let task = self.on_browser_ime(
+                        id,
+                        iced::advanced::input_method::Event::Preedit(text.to_string(), None),
+                    );
+                    return close.chain(task);
                 }
                 close
             }
-            "mouse.click" | "mouse.wheel" if self.osk.state.open => self.close_osk("mouse"),
-            "pad.tap" => {
-                let button = step
-                    .params
-                    .get("button")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(browser_replay_button);
-                if let Some(button) = button
-                    && self.osk.state.open
+            #[cfg(debug_assertions)]
+            "ime.commit" => {
+                let close = self.close_osk("ime");
+                if let Some(text) = step.params.get("text").and_then(serde_json::Value::as_str)
+                    && let Some(id) = self.browser_window
                 {
-                    return self.replay_pad_tap(button);
+                    let task = self.on_browser_ime(
+                        id,
+                        iced::advanced::input_method::Event::Commit(text.to_string()),
+                    );
+                    return close.chain(task);
                 }
-                if button.is_some() {
-                    crate::platform::trace::event(
-                        crate::platform::trace::Lane::Platform,
-                        "replay.pad_tap",
-                    )
-                    .field(
-                        "button",
-                        step.params
-                            .get("button")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default(),
-                    )
-                    .emit();
+                close
+            }
+            #[cfg(debug_assertions)]
+            "mouse.click" => {
+                if self.osk.state.open {
+                    // Real mouse input dismisses the controller-only OSK; the
+                    // click does not need to reach the page.
+                    return self.close_osk("mouse");
                 }
-                if let Some(button) = button
-                    && let Some(action) = crate::app::actions::browser_action(button)
-                {
-                    let enabled = self
-                        .browser
-                        .remote_spec
-                        .as_ref()
-                        .is_some_and(|spec| spec.action_enabled(action));
-                    crate::platform::trace::event(
-                        crate::platform::trace::Lane::Platform,
-                        "app.action",
-                    )
-                    .field("app", crate::app::actions::BROWSER_APP)
-                    .field("action", action)
-                    .field("known_app", true)
-                    .field("enabled", enabled)
-                    .emit();
-                }
-                if let Some(remote) = &mut self.browser.remote {
-                    remote.send_replay(&step.action, step.params.clone());
+                if let Some((x, y)) = replay_point(&step.params) {
+                    let count = step
+                        .params
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1)
+                        .clamp(1, 3);
+                    for _ in 0..count {
+                        self.inject_browser_click(x, y, "replay");
+                    }
                 }
                 Task::none()
             }
-            "screenshot" | "text" | "navigate" | "click" | "cursor.dock" | "pad.dir"
-            | "history.back" | "history.forward" | "mouse.click" | "mouse.drag" | "mouse.wheel" => {
-                if let Some(remote) = &mut self.browser.remote {
-                    remote.send_replay(&step.action, step.params.clone());
+            #[cfg(debug_assertions)]
+            "mouse.drag" => {
+                if self.osk.state.open {
+                    return self.close_osk("mouse");
+                }
+                let x1 = step.params.get("x1").and_then(serde_json::Value::as_f64);
+                let y1 = step.params.get("y1").and_then(serde_json::Value::as_f64);
+                let x2 = step.params.get("x2").and_then(serde_json::Value::as_f64);
+                let y2 = step.params.get("y2").and_then(serde_json::Value::as_f64);
+                if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) {
+                    self.inject_browser_drag(x1 as f32, y1 as f32, x2 as f32, y2 as f32, "replay");
+                }
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "mouse.wheel" => {
+                if self.osk.state.open {
+                    return self.close_osk("mouse");
+                }
+                if let Some((x, y)) = replay_point(&step.params) {
+                    let dx = step
+                        .params
+                        .get("dx")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let dy = step
+                        .params
+                        .get("dy")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    self.inject_browser_wheel(x, y, dx as i32, dy as i32, "replay");
                 }
                 Task::none()
             }
@@ -336,178 +539,1313 @@ impl super::App {
         }
     }
 
-    #[cfg(debug_assertions)]
-    fn replay_home_action(
+    /// Open a browser navigation/history action whose outcome is settled by a
+    /// later engine event. The pre-state is captured now; the pending guard is
+    /// closed by `settle_browser_action_trace` when canonical history lands.
+    pub(crate) fn begin_browser_action_trace(
         &mut self,
-        step: &crate::platform::trace::replay::ReplayStep,
-    ) -> Task<Message> {
-        match step.action.as_str() {
-            "open" => {
-                if self.home_visible {
-                    Task::none()
-                } else {
-                    self.open_home()
-                }
-            }
-            "app.install" | "app.update" => {
-                let source = step
-                    .params
-                    .get("source")
-                    .and_then(serde_json::Value::as_str)
-                    .map(std::path::PathBuf::from);
-                let version = step
-                    .params
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
-                self.start_browser_app_install(step.action == "app.update", source, version)
-            }
-            "app.uninstall" => self.start_browser_app_uninstall(),
-            "app.launch" => {
-                let close = if self.home_visible {
-                    self.close_home()
-                } else {
-                    Task::none()
-                };
-                close.chain(self.open_browser_window())
-            }
-            "app.close" => self.close_browser_window(),
-            _ => {
-                crate::platform::trace::event(
-                    crate::platform::trace::Lane::Platform,
-                    "replay.unsupported",
-                )
-                .field("app", &step.app)
-                .field("action", &step.action)
+        action: &'static str,
+        source: &'static str,
+        requested_index: Option<usize>,
+        requested_url: Option<String>,
+    ) -> Option<crate::platform::trace::FlowId> {
+        // A new navigation/history intent supersedes any in-flight jump.
+        self.pending_history_travel = None;
+        if !crate::platform::trace::actions_enabled() {
+            return None;
+        }
+        if let Some(old) = self.pending_browser_trace.take() {
+            old.action
+                .abandon("superseded")
+                .post(trace_browser_state(&self.browser.panel))
                 .emit();
+        }
+        let replaying = crate::platform::trace::replay::replaying();
+        let source = if replaying { "replay" } else { source };
+        let source_flow = if replaying {
+            self.replay.as_ref().map(|plan| plan.flow())
+        } else {
+            None
+        };
+        let current = self.browser.panel.session.nav_current();
+        let mut builder =
+            crate::platform::trace::action(crate::platform::trace::Lane::Browser, action)
+                .app("browser")
+                .source(source)
+                .field("replay", replaying)
+                .field("source_flow", source_flow)
+                .field("requested_index", requested_index)
+                .field("requested_url", requested_url.as_deref())
+                .pre(trace_browser_state(&self.browser.panel))
+                .repro(serde_json::json!({
+                    "app": "browser",
+                    "action": action.strip_prefix("browser.").unwrap_or(action),
+                    "params": {
+                        "index": requested_index,
+                        "url": requested_url.as_deref(),
+                    },
+                }));
+        if let Some(current) = current {
+            builder = builder.require("ui.nav.current", current);
+        }
+        let guard = builder.begin();
+        let flow = guard.flow();
+        let kind = if action.starts_with("browser.history.") {
+            BrowserTraceKind::History
+        } else {
+            BrowserTraceKind::Navigate
+        };
+        self.pending_browser_trace = Some(crate::app::browser::PendingBrowserTrace {
+            action: guard.detach(),
+            kind,
+            requested_index,
+            requested_url,
+            generation: None,
+        });
+        Some(flow)
+    }
+
+    /// Start a selector jump toward an absolute session index. The engine
+    /// resolves the index to a DevTools entry id and calls
+    /// `Page.navigateToHistoryEntry`, which bypasses Chromium's Back/Forward
+    /// skippable-entry filter and keeps the forward tail.
+    pub(crate) fn start_history_travel(
+        &mut self,
+        action: &'static str,
+        source: &'static str,
+        target_index: usize,
+        target_url: Option<String>,
+    ) {
+        let Some(start_index) = self.browser.panel.session.nav_current() else {
+            self.trace_browser_noop(action, source, "history_missing");
+            return;
+        };
+        let start_url = self.browser.panel.session.url().to_string();
+        self.begin_browser_action_trace(action, source, Some(target_index), target_url.clone());
+        let tab = self.browser.panel.active_tab;
+        self.pending_history_travel = Some(crate::app::browser::PendingHistoryTravel {
+            tab,
+            target_index: Some(target_index),
+            target_url,
+            start_index: Some(start_index),
+            start_url,
+            started: Instant::now(),
+        });
+        self.send_history_index(tab, target_index);
+    }
+
+    /// A single-step action is settled once both the canonical index and the
+    /// live URL reflect the landing. CEF can report one before the other.
+    fn single_step_landed(
+        &self,
+        current: Option<usize>,
+        live_url: &str,
+        start_index: Option<usize>,
+        start_url: &str,
+    ) -> bool {
+        let Some(current) = current else {
+            return false;
+        };
+        if Some(current) == start_index {
+            return false;
+        }
+        if live_url != start_url {
+            return true;
+        }
+        self.browser
+            .panel
+            .page
+            .last_engine_history
+            .as_ref()
+            .and_then(|history| history.entries.get(current))
+            .is_some_and(|entry| entry.url == live_url)
+    }
+
+    /// L1/R1: one CEF traversal step, no index target. Chromium may skip
+    /// history-manipulation entries, so the landing index is whatever CEF
+    /// reports; chasing `current ± 1` would oscillate.
+    pub(crate) fn start_history_step(
+        &mut self,
+        action: &'static str,
+        source: &'static str,
+        back: bool,
+    ) {
+        let Some(start_index) = self.browser.panel.session.nav_current() else {
+            self.trace_browser_noop(action, source, "history_missing");
+            return;
+        };
+        let start_url = self.browser.panel.session.url().to_string();
+        let flow = self.begin_browser_action_trace(action, source, None, None);
+        let tab = self.browser.panel.active_tab;
+        self.pending_history_travel = Some(crate::app::browser::PendingHistoryTravel {
+            tab,
+            target_index: None,
+            target_url: None,
+            start_index: Some(start_index),
+            start_url,
+            started: Instant::now(),
+        });
+        self.send_history_command(flow, tab, back);
+    }
+
+    /// Advance an in-flight history action after a canonical snapshot.
+    pub(crate) fn advance_history_travel(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index, target_url, start_index, start_url)) =
+            self.pending_history_travel.as_ref().map(|pending| {
+                (
+                    pending.tab,
+                    pending.target_index,
+                    pending.target_url.clone(),
+                    pending.start_index,
+                    pending.start_url.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if pending_tab != tab {
+            return;
+        }
+        let current = self.browser.panel.session.nav_current();
+        let live_url = self.browser.panel.session.url();
+
+        let Some(target_index) = target_index else {
+            // Single CEF step: settle on any real movement, not a target.
+            if self.single_step_landed(current, live_url, start_index, &start_url) {
+                self.pending_history_travel = None;
+                self.settle_browser_action_trace("settled");
+            }
+            return;
+        };
+
+        if current == Some(target_index) {
+            // The snapshot can move the index before OnAddressChange updates
+            // the live URL. Wait for the matching URL so the trace does not
+            // settle on the previous page.
+            let expected = target_url.or_else(|| {
+                self.browser
+                    .panel
+                    .page
+                    .last_engine_history
+                    .as_ref()
+                    .and_then(|history| history.entries.get(target_index))
+                    .map(|entry| entry.url.clone())
+            });
+            if let Some(expected) = expected
+                && live_url != expected
+            {
+                return;
+            }
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("settled");
+            return;
+        }
+
+        // An exact index jump either lands on the target or leaves the index
+        // alone. A different landing means the session stack changed while
+        // the CDP request was in flight (the resolved entry id no longer maps
+        // to the picked row); load the requested URL explicitly rather than
+        // chasing a stale index.
+        if current != start_index {
+            let fallback = target_url;
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("index_mismatch");
+            if let Some(url) = fallback {
+                self.history_url_fallback(url, "index_mismatch");
+            }
+        }
+    }
+
+    /// Close a history action when the address change confirms it.
+    pub(crate) fn settle_history_travel_on_url(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index, target_url, start_index, start_url)) =
+            self.pending_history_travel.as_ref().map(|pending| {
+                (
+                    pending.tab,
+                    pending.target_index,
+                    pending.target_url.clone(),
+                    pending.start_index,
+                    pending.start_url.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if pending_tab != tab {
+            return;
+        }
+        let current = self.browser.panel.session.nav_current();
+        let live_url = self.browser.panel.session.url();
+        if target_index.is_none() {
+            if self.single_step_landed(current, live_url, start_index, &start_url) {
+                self.pending_history_travel = None;
+                self.settle_browser_action_trace("settled");
+            }
+            return;
+        }
+        if current != target_index {
+            return;
+        }
+        if let Some(expected) = target_url
+            && live_url != expected
+        {
+            return;
+        }
+        self.pending_history_travel = None;
+        self.settle_browser_action_trace("settled");
+    }
+
+    /// Redirected history entries can land on a URL different from the
+    /// recorded entry; load completion is the final authority once the index
+    /// already matches.
+    pub(crate) fn settle_history_travel_on_load(&mut self, tab: crate::browser::engine::TabId) {
+        let Some((pending_tab, target_index, start_index, start_url)) =
+            self.pending_history_travel.as_ref().map(|pending| {
+                (
+                    pending.tab,
+                    pending.target_index,
+                    pending.start_index,
+                    pending.start_url.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if pending_tab != tab {
+            return;
+        }
+        let current = self.browser.panel.session.nav_current();
+        let matched = match target_index {
+            Some(target) => current == Some(target),
+            None => self.single_step_landed(
+                current,
+                self.browser.panel.session.url(),
+                start_index,
+                &start_url,
+            ),
+        };
+        if matched {
+            self.pending_history_travel = None;
+            self.settle_browser_action_trace("settled");
+        }
+    }
+
+    /// Send the exact index jump. The next canonical snapshot settles it.
+    fn send_history_index(&mut self, tab: crate::browser::engine::TabId, target_index: usize) {
+        let flow = self
+            .pending_browser_trace
+            .as_ref()
+            .map(|pending| pending.action.flow());
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", "GoToHistoryIndex")
+                .field("tab", tab.0)
+                .field("index", target_index)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            EngineCommand::GoToHistoryIndex {
+                tab,
+                index: target_index,
+            },
+        );
+    }
+
+    /// Settle a selector jump whose DevTools round trip failed and load the
+    /// requested URL as the last resort (a new history entry; forward tail
+    /// lost, but the user's pick is honoured).
+    pub(crate) fn on_history_jump_failed(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        index: usize,
+        reason: String,
+    ) {
+        let Some(pending) = self.pending_history_travel.as_ref() else {
+            return;
+        };
+        if pending.tab != tab || pending.target_index != Some(index) {
+            return;
+        }
+        let target_url = pending.target_url.clone();
+        self.pending_history_travel = None;
+        self.settle_browser_action_trace("jump_failed");
+        if let Some(url) = target_url {
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "history.fallback",
+            )
+            .field("url", &url)
+            .field("reason", "jump_failed")
+            .field("engine_reason", reason)
+            .emit();
+            let _ = self.navigate_browser_to(url);
+        }
+    }
+
+    /// Bound a history action that never reports a landing or an error.
+    pub(crate) fn check_history_travel_timeout(&mut self) {
+        let expired = self
+            .pending_history_travel
+            .as_ref()
+            .is_some_and(|pending| pending.started.elapsed() >= HISTORY_TRAVEL_TIMEOUT);
+        if !expired {
+            return;
+        }
+        let fallback = self
+            .pending_history_travel
+            .as_ref()
+            .and_then(|pending| pending.target_url.clone());
+        self.pending_history_travel = None;
+        self.settle_browser_action_trace("timeout");
+        if let Some(url) = fallback {
+            self.history_url_fallback(url, "timeout");
+        }
+    }
+
+    fn history_url_fallback(&mut self, url: String, reason: &'static str) {
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "history.fallback")
+            .field("url", &url)
+            .field("reason", reason)
+            .emit();
+        let _ = self.navigate_browser_to(url);
+    }
+
+    fn send_history_command(
+        &mut self,
+        flow: Option<crate::platform::trace::FlowId>,
+        tab: crate::browser::engine::TabId,
+        back: bool,
+    ) {
+        if let Some(flow) = flow {
+            crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
+                .flow(flow)
+                .field("command", if back { "GoBack" } else { "GoForward" })
+                .field("tab", tab.0)
+                .field("steps", 1)
+                .emit();
+        }
+        self.send_engine_traced(
+            flow,
+            if back {
+                EngineCommand::GoBack { tab }
+            } else {
+                EngineCommand::GoForward { tab }
+            },
+        );
+    }
+
+    /// Cancel a multi-step jump. The trace is closed as abandoned so the
+    /// timeline never shows a step that was not performed.
+    pub(crate) fn cancel_history_travel(&mut self, outcome: &'static str) {
+        if self.pending_history_travel.take().is_none() {
+            return;
+        }
+        if let Some(pending) = self.pending_browser_trace.take()
+            && pending.kind == BrowserTraceKind::History
+        {
+            pending
+                .action
+                .abandon(outcome)
+                .post(trace_browser_state(&self.browser.panel))
+                .emit();
+        }
+    }
+
+    /// Send an engine command, preserving the trace flow when present.
+    pub(crate) fn send_engine_traced(
+        &self,
+        flow: Option<crate::platform::trace::FlowId>,
+        command: crate::browser::engine::EngineCommand,
+    ) {
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        if let Some(flow) = flow {
+            engine.send_traced(flow, command);
+        } else {
+            engine.send(command);
+        }
+    }
+
+    /// Record a browser action that ended before reaching the engine.
+    pub(crate) fn trace_browser_noop(
+        &mut self,
+        action: &'static str,
+        source: &'static str,
+        reason: &'static str,
+    ) {
+        if !crate::platform::trace::actions_enabled() {
+            return;
+        }
+        crate::platform::trace::action(crate::platform::trace::Lane::Browser, action)
+            .app("browser")
+            .source(source)
+            .pre(trace_browser_state(&self.browser.panel))
+            .begin()
+            .finish("noop")
+            .field("reason", reason)
+            .post(trace_browser_state(&self.browser.panel))
+            .emit();
+    }
+
+    /// Close the pending browser action with the settled UI/engine state.
+    pub(crate) fn settle_browser_action_trace(&mut self, outcome: &'static str) {
+        let Some(pending) = self.pending_browser_trace.take() else {
+            return;
+        };
+        let session = &self.browser.panel.session;
+        let actual_index = session.nav_current();
+        let actual_url = session.url().to_string();
+        let index_ok = pending
+            .requested_index
+            .is_none_or(|want| actual_index == Some(want));
+        let url_ok = pending
+            .requested_url
+            .as_deref()
+            .is_none_or(|want| actual_url == want);
+        let engine_agree = self
+            .browser
+            .panel
+            .page
+            .last_engine_history
+            .as_ref()
+            .is_some_and(|history| {
+                Some(history.current) == actual_index
+                    && history
+                        .entries
+                        .get(history.current)
+                        .map(|entry| entry.url.as_str())
+                        == Some(actual_url.as_str())
+            });
+        let matched_by =
+            if pending.requested_index.is_some() && pending.requested_index == actual_index {
+                "index"
+            } else if pending.requested_url.as_deref() == Some(actual_url.as_str()) {
+                "url"
+            } else {
+                "none"
+            };
+        pending
+            .action
+            .settle(outcome)
+            .post(trace_browser_state(&self.browser.panel))
+            .field("actual_index", actual_index)
+            .field("actual_url", &actual_url)
+            .check("requested_index", index_ok)
+            .check("requested_url", url_ok)
+            .check("ui_engine_agree", engine_agree)
+            .resolution(serde_json::json!({
+                "requested_index": pending.requested_index,
+                "actual_index": actual_index,
+                "requested_url": pending.requested_url,
+                "actual_url": actual_url,
+                "matched_by": matched_by,
+            }))
+            .emit();
+    }
+
+    /// Browser-window message router. Phase 2 is moving the reducer here; the
+    /// methods still live beside the Launcher reducer until the move completes.
+    pub(crate) fn on_browser_message(
+        &mut self,
+        message: crate::ui::browser::BrowserMessage,
+    ) -> Task<Message> {
+        use crate::ui::browser::BrowserMessage;
+        match message {
+            BrowserMessage::Back => self.on_browser_go_back(),
+            BrowserMessage::Forward => self.on_browser_go_forward(),
+            BrowserMessage::Reload => self.on_browser_reload(),
+            BrowserMessage::PagePointerMoved { x, y } => self.on_browser_page_pointer_moved(x, y),
+            BrowserMessage::PagePress => self.on_browser_page_press(),
+            BrowserMessage::PageRelease => self.on_browser_page_release(),
+            BrowserMessage::PagePointerLeft => self.on_browser_page_pointer_left(),
+            BrowserMessage::PageWheel { dx, dy } => self.on_browser_page_wheel(dx, dy),
+            BrowserMessage::Scrolled(y) => {
+                self.browser.panel.note_scrolled(y);
                 Task::none()
             }
+            #[cfg(debug_assertions)]
+            BrowserMessage::Shot(shot) => self.save_browser_shot(shot),
         }
     }
 
-    fn replay_dispatch(
-        &mut self,
-        step: &crate::platform::trace::replay::ReplayStep,
-    ) -> Task<Message> {
-        #[cfg(debug_assertions)]
-        if step.app == "launcher" {
-            return self.replay_launcher_action(step);
+    fn on_browser_page_pointer_moved(&mut self, x: f32, y: f32) -> Task<Message> {
+        if !crate::platform::debug_quiet::input_dropped() {
+            self.inject_browser_move(x, y);
         }
-        #[cfg(debug_assertions)]
-        if step.app == "home" {
-            return self.replay_home_action(step);
-        }
-        if step.app != "browser" {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Platform,
-                "replay.unsupported",
-            )
-            .field("app", &step.app)
-            .field("action", &step.action)
-            .emit();
-            return Task::none();
-        }
-        if self.browser.remote.is_none() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Platform,
-                "replay.unsupported",
-            )
-            .field("app", &step.app)
-            .field("action", &step.action)
-            .field("reason", "browser_addon_missing")
-            .emit();
-            return Task::none();
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.remote_replay_step(step)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            Task::none()
-        }
-    }
-}
-
-impl super::App {
-    /// Open the Browser add-on. There is no in-process Browser fallback: the
-    /// child process owns its window, CEF, cursor, and text session.
-    pub(crate) fn open_browser_window(&mut self) -> Task<Message> {
-        if self.browser.remote.is_some() {
-            return Task::none();
-        }
-        if !crate::app::browser_remote::remote_enabled() {
-            let message = "Browser add-on is not installed".to_string();
-            crate::platform::app_log::warn(message.clone());
-            self.browser.remote_error = Some(message);
-            return Task::none();
-        }
-        self.open_remote_browser()
+        Task::none()
     }
 
-    pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
-        self.close_remote_browser()
+    fn on_browser_page_press(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_press(x, y, "mouse");
+        Task::none()
     }
 
-    /// Browser text-session client: insert text from the system OSK.
+    fn on_browser_page_release(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_release(x, y, "mouse");
+        Task::none()
+    }
+
+    fn on_browser_page_pointer_left(&mut self) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_pointer_left(x, y, "mouse");
+        Task::none()
+    }
+
+    fn on_browser_page_wheel(&mut self, dx: i32, dy: i32) -> Task<Message> {
+        if crate::platform::debug_quiet::input_dropped() {
+            return Task::none();
+        }
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_wheel(x, y, dx, dy, "mouse");
+        Task::none()
+    }
+
+    /// Browser text-session client: insert committed text into the focused
+    /// page field through CEF's key path.
     pub(crate) fn browser_text_insert(&mut self, text: &str) {
-        if self.browser.remote.is_some() {
-            self.remote_browser_text(crate::hosted::TextAction::Insert(text.to_string()));
+        let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
+        for raw in events {
+            let _ = self.on_browser_key(raw);
         }
     }
 
     /// Browser text-session client: backspace in the focused page field.
     pub(crate) fn browser_text_backspace(&mut self) {
-        if self.browser.remote.is_some() {
-            self.remote_browser_text(crate::hosted::TextAction::Backspace);
+        if let Some(events) =
+            crate::browser::keys::synthetic_named("Backspace", iced::keyboard::Modifiers::empty())
+        {
+            for raw in events {
+                let _ = self.on_browser_key(raw);
+            }
         }
     }
 
     /// Browser text-session client: Enter in the focused page field.
     pub(crate) fn browser_text_enter(&mut self) {
-        if self.browser.remote.is_some() {
-            self.remote_browser_text(crate::hosted::TextAction::Enter);
+        if let Some(events) =
+            crate::browser::keys::synthetic_named("Enter", iced::keyboard::Modifiers::empty())
+        {
+            for raw in events {
+                let _ = self.on_browser_key(raw);
+            }
         }
     }
 
-    /// Pad tick while the Browser add-on owns the surface key set. Home/PS is
-    /// handled here; everything else is streamed to the child.
+    /// Shared page-pointer move path for hardware and replay injection.
+    fn inject_browser_move(&mut self, x: f32, y: f32) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseMove {
+                tab: self.browser_tab(),
+                x,
+                y,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// Shared page-button-down path for hardware and replay injection.
+    pub(crate) fn inject_browser_press(&mut self, x: f32, y: f32, source: &'static str) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        let count = self.next_page_click_count(x, y);
+        self.browser.panel.page_click_count = count;
+        self.browser.panel.page_mouse_down = true;
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_press")
+            .field("x", x)
+            .field("y", y)
+            .field("count", count)
+            .field("source", source)
+            .emit();
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.browser_tab(),
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: true,
+                click_count: count,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// Shared page-button-up path. Uses the count from the matching press so
+    /// Chromium sees the same click count on down and up.
+    pub(crate) fn inject_browser_release(&mut self, x: f32, y: f32, source: &'static str) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        if !self.browser.panel.page_mouse_down {
+            return;
+        }
+        self.browser.panel.page_mouse_down = false;
+        let count = self.browser.panel.page_click_count.max(1);
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.page_release",
+        )
+        .field("x", x)
+        .field("y", y)
+        .field("count", count)
+        .field("source", source)
+        .emit();
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseButton {
+                tab: self.browser_tab(),
+                x,
+                y,
+                button: crate::browser::engine::BrowserMouseButton::Left,
+                pressed: false,
+                click_count: count,
+                modifiers: self.browser.panel.page_mouse_modifiers,
+            });
+        }
+    }
+
+    /// One full trusted left click at an explicit page point.
+    #[cfg(debug_assertions)]
+    pub(crate) fn inject_browser_click(&mut self, x: f32, y: f32, source: &'static str) {
+        self.inject_browser_press(x, y, source);
+        self.inject_browser_release(x, y, source);
+    }
+
+    /// Synthetic drag: down at the start, interpolated moves with the button
+    /// flag, then up at the end. Exercises text selection without OS input.
+    #[cfg(debug_assertions)]
+    pub(crate) fn inject_browser_drag(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        source: &'static str,
+    ) {
+        self.inject_browser_press(x1, y1, source);
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            self.inject_browser_move(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        }
+        self.inject_browser_release(x2, y2, source);
+    }
+
+    /// Pointer left the page: finish any drag and clear CEF hover.
+    fn inject_browser_pointer_left(&mut self, x: f32, y: f32, source: &'static str) {
+        if self.browser.panel.page_mouse_down {
+            self.inject_browser_release(x, y, source);
+        }
+        if let Some(engine) = &self.browser.engine {
+            engine.send(EngineCommand::MouseLeave {
+                tab: self.browser_tab(),
+            });
+        }
+    }
+
+    /// Shared page-wheel path for hardware and replay injection.
+    pub(crate) fn inject_browser_wheel(
+        &mut self,
+        x: f32,
+        y: f32,
+        dx: i32,
+        dy: i32,
+        source: &'static str,
+    ) {
+        let (x, y) = self.clamp_page_mouse(x, y);
+        self.browser.panel.page_mouse_active = true;
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.page_wheel")
+            .field("x", x)
+            .field("y", y)
+            .field("dx", dx)
+            .field("dy", dy)
+            .field("source", source)
+            .emit();
+        let Some(engine) = &self.browser.engine else {
+            // Reader fallback has no CEF wheel path; invert to iced's
+            // scroll-down-positive convention.
+            let _ = self.scroll_browser(-(dy as f32));
+            return;
+        };
+        engine.send(EngineCommand::MouseWheel {
+            tab: self.browser_tab(),
+            x,
+            y,
+            dx,
+            dy,
+        });
+    }
+
+    /// Double/triple-click count for a press at `(x, y)`. Chromium treats the
+    /// second and third presses as word/paragraph selection.
+    fn next_page_click_count(&mut self, x: f32, y: f32) -> u8 {
+        let (next, stamp) =
+            next_click_count(self.browser.panel.page_last_click, Instant::now(), x, y);
+        self.browser.panel.page_last_click = stamp;
+        next
+    }
+
+    fn clamp_page_mouse(&mut self, x: f32, y: f32) -> (f32, f32) {
+        let (w, h) = self.browser.panel.viewport;
+        let x = x.clamp(0.0, (w - 1.0).max(0.0));
+        let y = y.clamp(0.0, (h - 1.0).max(0.0));
+        self.browser.panel.page_mouse = (x, y);
+        (x, y)
+    }
+
+    /// Window focus loss: finish a drag and drop keyboard modifiers so a
+    /// later page move cannot inherit a stale Shift/Ctrl state.
+    pub(crate) fn browser_pointer_focus_lost(&mut self) {
+        self.browser.panel.page_mouse_modifiers = keyboard_types::Modifiers::empty();
+        let (x, y) = self.browser.panel.page_mouse;
+        self.inject_browser_pointer_left(x, y, "unfocus");
+    }
+
+    /// Replay text injection: press+release each character through the real
+    /// browser key handler. Never touches the OS keyboard.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_type_text(&mut self, text: &str) {
+        let events = crate::browser::keys::synthetic_text(text, iced::keyboard::Modifiers::empty());
+        self.replay_raw_keys(events, "text");
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.synthetic_text",
+        )
+        .field("len", text.chars().count())
+        .emit();
+    }
+
+    /// Replay named-key tap through the real browser key handler.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_press_key(
+        &mut self,
+        name: &str,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> bool {
+        let Some(events) = crate::browser::keys::synthetic_named(name, modifiers) else {
+            return false;
+        };
+        self.replay_raw_keys(events.to_vec(), name);
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn replay_raw_keys(&mut self, events: Vec<crate::browser::keys::RawKey>, label: &str) {
+        for raw in events {
+            let _ = self.on_browser_key(raw);
+        }
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Browser,
+            "browser.synthetic_key",
+        )
+        .field("key", label)
+        .emit();
+    }
+}
+
+impl super::App {
+    /// Show the standalone Browser window (idempotent). Restores the persisted
+    /// tab strip on a fresh session, else resumes the cached page.
+    pub(crate) fn open_browser_window(&mut self) -> Task<Message> {
+        if self.browser_visible
+            && let Some(id) = self.browser_window
+        {
+            return crate::ui::layout::focus_window(id);
+        }
+        if self.browser_window.is_some() {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: browser open skipped (window still closing)",
+            );
+            return Task::none();
+        }
+        if self.browser.engine.is_none() {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: browser open skipped (engine not installed)",
+            );
+            return Task::none();
+        }
+        // Launcher and Browser are mutually exclusive: opening one dismisses
+        // the other rather than stacking two fullscreen apps.
+        let close_start = if self.launcher_visible {
+            self.close_launcher()
+        } else {
+            Task::none()
+        };
+        let cover =
+            crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+        self.browser_monitor_cover = Some(cover);
+        // A new window can land on a different monitor; the cover drives the
+        // first layout until its own resize event arrives.
+        self.browser_window_size = None;
+        self.sync_browser_viewport();
+        // Center before the first frame, not after the window has painted the
+        // previous open's cursor position.
+        self.browser.panel.cursor.reset_for_page();
+        self.browser.panel.last_sent_mouse = None;
+        self.browser_visible = true;
+        self.browser_pending_show = true;
+        let was_open = self.browser.panel.session.is_open();
+        let (id, open) = iced::window::open(iced::window::Settings {
+            size: cover.size(),
+            position: iced::window::Position::Specific(cover.origin()),
+            // Hidden until the final cover size is configured and DWM
+            // transitions are disabled; showing earlier lets Windows animate
+            // the create-time default size into the full-screen rect.
+            visible: false,
+            // The 16:9 card sits over a dimmed desktop; the root view draws
+            // the scrim on backends that can composite alpha.
+            transparent: crate::ui::chrome::transparent_windows(),
+            resizable: false,
+            decorations: false,
+            level: iced::window::Level::Normal,
+            exit_on_close_request: true,
+            platform_specific: crate::ui::layout::window_platform_specific(),
+            ..iced::window::Settings::default()
+        });
+        self.browser_window = Some(id);
+        self.arm_chord_release_latch();
+        crate::controller::hid::diag::diag_info("ui-diag: browser window open");
+        let opened = open.map(Message::BrowserOpened);
+        let opened = if was_open {
+            // Reopen after close: cached page, suspended engine.
+            self.browser.panel.session.open_surface();
+            self.resume_browser_engine();
+            opened
+        } else {
+            // Fresh surface: open the tab strip (restore) or the default page.
+            opened.chain(self.open_browser_session())
+        };
+        close_start
+            .chain(crate::ui::layout::disable_window_transitions(id))
+            .chain(opened)
+            .chain(Task::done(Message::WindowShowNow(id)))
+    }
+
+    /// Close the standalone Browser window and suspend its engine (cached
+    /// page survives for the next open).
+    pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
+        self.browser_visible = false;
+        self.browser_monitor_cover = None;
+        self.browser_window_size = None;
+        self.browser_pending_show = false;
+        self.browser_backdrop_fade = None;
+        let task = self.close_osk("browser_close");
+        let task = task.chain(self.close_browser_surface());
+        let Some(id) = self.browser_window.take() else {
+            return task;
+        };
+        crate::controller::hid::diag::diag_info("ui-diag: browser window close");
+        let close = iced::window::close(id);
+        let task = task.chain(close);
+        if self.launcher_visible
+            && let Some(start) = self.launcher_window
+        {
+            return task.chain(crate::ui::layout::focus_window(start));
+        }
+        task
+    }
+
+    pub(crate) fn on_browser_opened(&mut self, id: iced::window::Id) -> Task<Message> {
+        if self.browser_window != Some(id) {
+            return Task::none();
+        }
+        self.browser_visible = true;
+        crate::controller::hid::diag::diag_info(format!("ui-diag: browser opened id={id:?}"));
+        // The cover is logical pixels and already drives this first layout.
+        // The real size arrives through `window::resize_events()` once the
+        // fullscreen surface is configured; a one-shot `window::size()` here
+        // can race creation and report the pre-fullscreen default, which
+        // would briefly shrink the cursor space (the quarter-screen bug).
+        self.sync_browser_viewport();
+        Task::none()
+    }
+
+    /// Show the hidden Browser window after the DWM transition task has run
+    /// and the surface has had a moment to settle at the cover size. Showing
+    /// immediately lets Windows animate the create-time default size into the
+    /// fullscreen rect (the visible "scale" on open).
+    pub(crate) fn on_browser_show_now(&mut self) -> Task<Message> {
+        if !self.browser_pending_show {
+            return Task::none();
+        }
+        self.browser_pending_show = false;
+        let Some(id) = self.browser_window else {
+            return Task::none();
+        };
+        self.browser_backdrop_fade = Some(Instant::now());
+        self.sync_browser_viewport();
+        crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
+    }
+
+    pub(crate) fn on_browser_window_sized(&mut self, size: iced::Size) -> Task<Message> {
+        let size = (size.width.max(1.0), size.height.max(1.0));
+        // The Browser window is a borderless fullscreen window sized to the
+        // monitor cover. iced configures the surface once at its pre-fullscreen
+        // default (observed 1440x789) before the final resize; adopting that
+        // would briefly shrink the card, engine viewport, and cursor space.
+        // The cover is the intended size, so ignore any other size.
+        if let Some(cover) = self.browser_monitor_cover
+            && ((size.0 - cover.width).abs() > 1.0 || (size.1 - cover.height).abs() > 1.0)
+        {
+            return Task::none();
+        }
+        if self.browser_window_size == Some(size) {
+            return Task::none();
+        }
+        self.browser_window_size = Some(size);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: browser window size {:.0}x{:.0}",
+            size.0, size.1
+        ));
+        self.sync_browser_viewport();
+        Task::none()
+    }
+
+    pub(crate) fn on_browser_frame(&mut self) -> Task<Message> {
+        if !self.browser_visible {
+            return Task::none();
+        }
+        self.check_history_travel_timeout();
+        // Cursor glides and script-driven scroll still need one mouse sync
+        // per paint even when no new pad edge arrived.
+        if let Some(engine) = &self.browser.engine {
+            let (dx, dy) = std::mem::take(&mut self.browser.pending_scroll);
+            if dx != 0.0 || dy != 0.0 {
+                let (x, y) = self.browser.pending_scroll_at;
+                engine.send(EngineCommand::ScrollBy {
+                    tab: self.browser_tab(),
+                    dx,
+                    dy,
+                    x,
+                    y,
+                });
+            }
+        }
+        let sync = self.sync_browser_mouse();
+        #[cfg(debug_assertions)]
+        {
+            let shot = self.shoot_browser_window(false);
+            sync.chain(shot)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            sync
+        }
+    }
+}
+
+impl super::App {
+    /// Pad tick while the standalone Browser window is the owner. Home is
+    /// routed before this, so the browser never sees Home presses.
     pub(crate) fn on_browser_pad(
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
         tap_actions: &[PadAction],
     ) -> Task<Message> {
-        if readings.is_empty() || self.browser.remote.is_none() {
+        use crate::browser::cursor::JumpDir;
+        if readings.is_empty() {
             return Task::none();
         }
+        if readings
+            .iter()
+            .any(|reading| !crate::domain::pad::sample_nav_resting(&reading.sample))
+        {
+            // Real pad input takes pointer ownership back from the mouse.
+            self.browser.panel.page_mouse_active = false;
+        }
+        // PS is global: while Browser owns the pad it must still open Home
+        // (Home-open path routes PS to close once visible).
         if self.home_chord_fires(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: PS opens home over Browser");
             return self.toggle_home();
         }
-        self.remote_browser_pad(readings, tap_actions)
+        let now = std::time::Instant::now();
+        let engine_mode = self.browser.panel.session.has_frame();
+        // Reader fallback uses the D-pad nav bank; engine mode parks it
+        // (cursor jumps run on the dedicated stepper).
+        let allow_nav = !engine_mode;
+        let mut tick = self.browser.nav.tick(
+            readings, now, allow_nav, true, false, false, false, false, false,
+        );
+        // Source-side taps replace the old per-surface face-edge reconstruction.
+        if let Some((pad, action)) = browser_tap_action(tap_actions) {
+            tick.action = Some(action);
+            tick.action_pad = Some(pad);
+        }
+        let semantic = self.hosted_action_for_tap(tap_actions);
+        self.set_haptic_pad_from_id(
+            tick.action_pad
+                .as_ref()
+                .or(tick.cross_completed_pad.as_ref())
+                .or(tick.triangle_completed_pad.as_ref()),
+        );
+        if engine_mode {
+            self.tick_browser_cursor(readings, now);
+            if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
+                self.play_ui_cue(UiSoundKind::Nav);
+                self.browser.panel.jump_cursor(jump);
+            }
+            // R3 issue flag (R3 carries no NavAction).
+            let r3_down = readings.iter().any(|r| {
+                r.sample
+                    .held
+                    .contains(&crate::ui::launcher::gesture::GestureControl::R3)
+            });
+            let latched = std::mem::replace(&mut self.browser.panel.r3_latched, r3_down);
+            let flag = if r3_down && !latched {
+                self.flag_browser_issue(now)
+            } else {
+                Task::none()
+            };
+            let action = if let Some(invoked) = semantic {
+                self.invoke_hosted_action(invoked)
+            } else {
+                match tick.action {
+                    Some(NavAction::Up) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Up);
+                        Task::none()
+                    }
+                    Some(NavAction::Down) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Down);
+                        Task::none()
+                    }
+                    Some(NavAction::Left) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Left);
+                        Task::none()
+                    }
+                    Some(NavAction::Right) => {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.browser.panel.jump_cursor(JumpDir::Right);
+                        Task::none()
+                    }
+                    Some(NavAction::Confirm) => self.click_browser_cursor(),
+                    // Escape does not close the Browser; Home/PS is the only
+                    // close path.
+                    Some(NavAction::Cancel) => self.browser_cancel(),
+                    Some(NavAction::ToggleMagnetism) => {
+                        self.play_ui_cue(UiSoundKind::Action);
+                        let cursor = &mut self.browser.panel.cursor;
+                        cursor.magnet = !cursor.magnet;
+                        if !cursor.magnet {
+                            cursor.attached = None;
+                            cursor.no_dock = None;
+                        }
+                        crate::platform::app_log::info(format!(
+                            "ui-diag: browser magnet {}",
+                            if cursor.magnet { "on" } else { "off" }
+                        ));
+                        Task::none()
+                    }
+                    _ => Task::none(),
+                }
+            };
+            let sync = self.sync_browser_mouse();
+            Task::batch(vec![flag, action, sync])
+        } else {
+            // Reader fallback: D-pad scrolls text, Cross restores the page.
+            if let Some(invoked) = semantic {
+                return self.invoke_hosted_action(invoked);
+            }
+            match tick.action {
+                Some(NavAction::Up) | Some(NavAction::Left) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
+                }
+                Some(NavAction::Down) | Some(NavAction::Right) => {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
+                }
+                Some(NavAction::Confirm) => self.on_browser_go_default(),
+                Some(NavAction::Cancel) => self.browser_cancel(),
+                _ => Task::none(),
+            }
+        }
+    }
+
+    /// Escape no longer closes the Browser; Home/PS is the only close path.
+    pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
+        Task::none()
+    }
+
+    /// Platform IME events for the page. These become CEF
+    /// composition/commit calls.
+    pub(crate) fn on_browser_ime(
+        &mut self,
+        id: iced::window::Id,
+        event: iced::advanced::input_method::Event,
+    ) -> Task<Message> {
+        use iced::advanced::input_method::Event;
+        if Some(id) != self.browser_window || !self.browser_visible {
+            return Task::none();
+        }
+        let tab = self.browser_tab();
+        let Some(engine) = &self.browser.engine else {
+            return Task::none();
+        };
+        match event {
+            Event::Opened => {}
+            Event::Closed => {
+                engine.send(EngineCommand::ImeCancelComposition { tab });
+            }
+            Event::Preedit(text, _) => {
+                crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.ime")
+                    .field("kind", "preedit")
+                    .field("len", text.chars().count())
+                    .emit();
+                if text.is_empty() {
+                    engine.send(EngineCommand::ImeCancelComposition { tab });
+                } else {
+                    engine.send(EngineCommand::ImeSetComposition { tab, text });
+                }
+            }
+            Event::Commit(text) => {
+                crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.ime")
+                    .field("kind", "commit")
+                    .field("len", text.chars().count())
+                    .emit();
+                if text.is_empty() {
+                    engine.send(EngineCommand::ImeFinishComposition { tab });
+                } else {
+                    // CEF's windowless commit path is unreliable on Windows;
+                    // stage the committed text as a composition and finish it,
+                    // which inserts the same text through the stable path.
+                    engine.send(EngineCommand::ImeSetComposition {
+                        tab,
+                        text: text.clone(),
+                    });
+                    engine.send(EngineCommand::ImeFinishComposition { tab });
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Keyboard while the standalone Browser window has focus.
+    pub(crate) fn on_browser_key(&mut self, raw: crate::browser::keys::RawKey) -> Task<Message> {
+        use crate::ui::browser::BrowserMessage;
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        self.browser.panel.page_mouse_modifiers =
+            crate::browser::keys::engine_modifiers(&raw.modifiers);
+        if matches!(raw.key, Key::Named(Named::Escape)) {
+            if !raw.pressed {
+                return Task::none();
+            }
+            return self.browser_cancel();
+        }
+        if raw.pressed {
+            if raw.modifiers.control()
+                && let Key::Character(text) = &raw.key
+                && text.to_lowercase().as_str() == "r"
+            {
+                return self.on_browser_message(BrowserMessage::Reload);
+            }
+            if raw.modifiers.alt() {
+                match &raw.key {
+                    Key::Named(Named::ArrowLeft) => {
+                        return self.on_browser_message(BrowserMessage::Back);
+                    }
+                    Key::Named(Named::ArrowRight) => {
+                        return self.on_browser_message(BrowserMessage::Forward);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if self.browser.engine.is_some() {
+            if let Some(engine) = &self.browser.engine {
+                let tab = self.browser_tab();
+                engine.send(crate::browser::engine::EngineCommand::Key(
+                    crate::browser::engine::TabKey {
+                        tab,
+                        event: crate::browser::keys::map_event(&raw),
+                    },
+                ));
+            }
+            return Task::none();
+        }
+        // Reader fallback keyboard.
+        if !raw.pressed {
+            return Task::none();
+        }
+        match raw.key {
+            Key::Named(Named::ArrowUp) => {
+                self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
+            }
+            Key::Named(Named::ArrowDown) => {
+                self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
+            }
+            Key::Named(Named::Enter) => self.on_browser_go_default(),
+            _ => Task::none(),
+        }
     }
 }
 
 impl super::App {
-    /// Re-check the add-on executable and the optional engine package.
-    /// The shell never spawns CEF; the add-on process owns the engine. The
-    /// install/uninstall UI stays keyed to the engine directory, while the
-    /// launch gate additionally requires the add-on executable.
+    /// Re-check the optional engine package and spawn CEF if it appeared
+    /// (Store install completed while the app stayed open, dev download, or a
+    /// portable sidecar placed next to the exe).
     #[cfg(feature = "cef-engine")]
     pub(crate) fn refresh_engine_status(&mut self) {
-        self.browser.engine_managed = false;
-        self.browser.engine_status = match crate::browser::cef_backend::resolve_engine_dir() {
-            Some(path) => {
-                self.browser.engine_managed = crate::browser::cef_backend::engine_is_managed(&path);
-                EngineStatus::Ready(path)
+        if self.browser.engine.is_some() {
+            self.browser.engine_available = true;
+            // The engine may already be attached at boot (sidecar/package);
+            // managed state still has to be derived from the loaded path.
+            if let Some(dir) = crate::browser::cef_backend::loaded_engine_dir() {
+                self.browser.engine_managed = crate::browser::cef_backend::engine_is_managed(&dir);
             }
-            None => EngineStatus::Missing,
+            return;
+        }
+        let Some(path) = crate::browser::cef_backend::resolve_engine_dir() else {
+            self.browser.engine_status = EngineStatus::Missing;
+            self.browser.engine_managed = false;
+            return;
         };
+        self.browser.engine_managed = crate::browser::cef_backend::engine_is_managed(&path);
+        let (w, h) = self
+            .browser_monitor_cover
+            .map(|c| (c.width, c.height))
+            .unwrap_or((1920.0, 1080.0));
+        let (page_w, page_h) = crate::ui::browser::view::fullscreen_layout(w, h);
+        if let Some(engine) =
+            crate::browser::cef_backend::spawn_engine(&crate::browser::tabs::boot_url(), {
+                (page_w.max(1.0) as u32, page_h.max(1.0) as u32)
+            })
+        {
+            self.browser.engine = Some(engine);
+            self.browser.engine_available = true;
+            self.browser.engine_status = EngineStatus::Ready(path);
+            crate::platform::app_log::info("cef: engine attached after install");
+        } else {
+            self.browser.engine_status =
+                EngineStatus::Failed("Browser engine could not be initialized".to_string());
+        }
     }
 
     #[cfg(not(feature = "cef-engine"))]
     pub(crate) fn refresh_engine_status(&mut self) {
         self.browser.engine_status = EngineStatus::Missing;
+        self.browser.engine_available = false;
         self.browser.engine_managed = false;
     }
 
@@ -540,14 +1878,6 @@ impl super::App {
         self.browser.engine_install_previous = Some(self.browser.engine_status.clone());
         self.browser.engine_status = EngineStatus::Installing;
         self.browser.engine_rate = None;
-        if let Some(flow) = self.pending_app_flow() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Home,
-                "browser.engine.install.start",
-            )
-            .flow(flow)
-            .emit();
-        }
         self.home_state.set_installing(true);
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
@@ -621,35 +1951,28 @@ impl super::App {
             );
             return Task::none();
         }
-        let local =
-            crate::browser::engine_install::active_local_dir(&crate::persist::paths::data_dir());
-        if local.as_deref() != Some(path.as_path()) {
-            let message = "Browser engine is supplied by the build or a package".to_string();
-            self.home_state.install_done(false, Some(message));
-            return Task::none();
-        }
         let close_browser = if self.browser_visible {
             self.close_browser_window()
         } else {
             Task::none()
         };
         self.browser.engine_status = EngineStatus::Uninstalling;
-        if let Some(flow) = self.pending_app_flow() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Home,
-                "browser.engine.uninstall.start",
-            )
-            .flow(flow)
-            .emit();
-        }
         self.home_state.set_uninstalling();
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
         let generation = self.browser.engine_install_generation;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if let Some(engine) = self.browser.engine.take() {
+            engine.send(EngineCommand::Shutdown { done: done_tx });
+        }
         self.browser.engine_available = false;
         let uninstall = Task::perform(
             async move {
                 super::spawn_blocking(move || {
+                    // Let the engine worker close its browsers before the
+                    // pointer is dropped. The DLL stays mapped either way;
+                    // the directory itself is deferred to next boot.
+                    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
                     // Keep the inline meter visible long enough to read.
                     std::thread::sleep(std::time::Duration::from_millis(600));
                     crate::browser::engine_install::uninstall_local(&path)
@@ -846,17 +2169,6 @@ impl super::App {
         let rate = self.note_engine_rate(&progress);
         let mut mapped = home_install_progress(progress);
         mapped.rate_bps = rate;
-        if let Some(flow) = self.pending_app_flow() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Home,
-                "browser.engine.install.phase",
-            )
-            .flow(flow)
-            .field("phase", mapped.label())
-            .field("bytes_done", mapped.bytes_done)
-            .field("bytes_total", mapped.bytes_total)
-            .emit();
-        }
         self.home_state.set_install_progress(mapped);
         Task::none()
     }
@@ -915,34 +2227,43 @@ impl super::App {
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
         self.browser.engine_rate = None;
-        let (success, cancelled, error) = match &outcome {
-            EngineInstallOutcome::Installed(_) => (true, false, None),
-            EngineInstallOutcome::Cancelled => (false, true, None),
-            EngineInstallOutcome::Failed(err) => (false, false, Some(err.clone())),
-        };
         match outcome {
             EngineInstallOutcome::Installed(path) => {
                 self.browser.engine_install_previous = None;
-                self.browser.engine_status = EngineStatus::Ready(path);
+                self.browser.engine_status = EngineStatus::Ready(path.clone());
                 self.browser.engine_available = true;
                 self.browser.engine_managed = false;
-                // A running add-on keeps its loaded CEF until it is relaunched.
-                self.browser.engine_restart_required = self.browser.remote.is_some();
-                self.home_state.install_done(true, None);
-                crate::platform::app_log::info(format!(
-                    "cef: BrowserEngine install complete{}",
-                    if self.browser.engine_restart_required {
-                        " (restart required)"
-                    } else {
-                        ""
-                    }
-                ));
+                if self.browser.engine.is_some() {
+                    // Update: CEF is process-global, so the old runtime stays
+                    // loaded until restart. The new directory is selected by
+                    // the pointer on the next boot.
+                    self.browser.engine_restart_required =
+                        crate::browser::cef_backend::loaded_engine_dir().as_deref()
+                            != Some(path.as_path());
+                } else {
+                    self.refresh_engine_status();
+                }
+                if self.browser.engine.is_some() {
+                    self.home_state.install_done(true, None);
+                    crate::platform::app_log::info(format!(
+                        "cef: BrowserEngine install complete{}",
+                        if self.browser.engine_restart_required {
+                            " (restart required)"
+                        } else {
+                            ""
+                        }
+                    ));
+                } else {
+                    let msg = "Browser engine installed but failed to start".to_string();
+                    self.browser.engine_status = EngineStatus::Failed(msg.clone());
+                    self.home_state.install_done(false, Some(msg));
+                }
             }
             EngineInstallOutcome::Cancelled => {
                 let previous = self.browser.engine_install_previous.take();
                 let ready = previous.as_ref().is_some_and(EngineStatus::is_ready);
                 self.browser.engine_status = previous.unwrap_or(EngineStatus::Missing);
-                self.browser.engine_available = crate::app::browser_remote::addon_available();
+                self.browser.engine_available = self.browser.engine.is_some();
                 self.home_state.install_cancelled(ready);
                 crate::platform::app_log::info("cef: BrowserEngine install cancelled");
             }
@@ -959,19 +2280,6 @@ impl super::App {
             }
         }
         self.sync_home_engine_info();
-        if let Some(flow) = self.pending_app_flow() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Home,
-                "browser.engine.install.done",
-            )
-            .flow(flow)
-            .field("success", success)
-            .field("cancelled", cancelled)
-            .emit();
-        }
-        if self.browser.addon_pending_action.is_some() {
-            self.finish_app_after_engine_install(success, cancelled, error.as_deref());
-        }
         Task::none()
     }
 
@@ -988,7 +2296,7 @@ impl super::App {
         }
         self.browser.engine_install_generation =
             self.browser.engine_install_generation.wrapping_add(1);
-        match &result {
+        match result {
             Ok(()) => {
                 self.browser.engine_status = EngineStatus::Missing;
                 self.browser.engine_available = false;
@@ -1000,26 +2308,10 @@ impl super::App {
             Err(err) => {
                 crate::platform::app_log::warn(format!("cef: uninstall failed: {err}"));
                 self.browser.engine_status = EngineStatus::Failed(err.clone());
-                self.home_state.uninstall_done(Some(err.clone()));
+                self.home_state.uninstall_done(Some(err));
             }
         }
         self.sync_home_engine_info();
-        if let Some(flow) = self.pending_app_flow() {
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Home,
-                "browser.engine.uninstall.done",
-            )
-            .flow(flow)
-            .field("success", result.is_ok())
-            .emit();
-        }
-        if self.browser.addon_pending_action.is_some() {
-            let result = match &result {
-                Ok(()) => Ok(()),
-                Err(err) => Err(err.clone()),
-            };
-            self.finish_app_after_engine_uninstall(&result);
-        }
         Task::none()
     }
 
@@ -1080,10 +2372,38 @@ fn home_install_progress(
     }
 }
 
+/// Replay key modifiers from a JSON array (`["ctrl","shift"]`). The keys are
+/// only constructible by the debug replay driver.
+#[cfg(debug_assertions)]
+fn replay_modifiers(value: Option<&serde_json::Value>) -> iced::keyboard::Modifiers {
+    use iced::keyboard::Modifiers;
+    let mut modifiers = Modifiers::empty();
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return modifiers;
+    };
+    for item in items {
+        match item.as_str() {
+            Some("ctrl" | "control") => modifiers |= Modifiers::CTRL,
+            Some("shift") => modifiers |= Modifiers::SHIFT,
+            Some("alt") => modifiers |= Modifiers::ALT,
+            Some("meta" | "logo" | "super") => modifiers |= Modifiers::LOGO,
+            _ => {}
+        }
+    }
+    modifiers
+}
+
+/// Replay page-local point (`{"x":..,"y":..}`).
+#[cfg(debug_assertions)]
+fn replay_point(params: &serde_json::Value) -> Option<(f32, f32)> {
+    let x = params.get("x")?.as_f64()? as f32;
+    let y = params.get("y")?.as_f64()? as f32;
+    Some((x, y))
+}
+
 /// Bounded browser state for action traces. Includes the UI stack, the last
 /// raw engine history, CEF's back/forward flags, and the selector list so a
 /// picked index can always be resolved back to an actual URL/title.
-#[cfg_attr(not(feature = "cef-engine"), allow(dead_code))]
 pub(crate) fn trace_browser_state(
     panel: &crate::ui::browser::state::BrowserPanel,
 ) -> serde_json::Value {
@@ -1164,6 +2484,23 @@ pub(crate) fn trace_browser_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::pad::PadButtonAction;
+
+    fn tap(button: PadButton) -> PadAction {
+        PadAction {
+            pad: PadId("hid:a".into()),
+            button,
+            action: PadButtonAction::Tap,
+        }
+    }
+
+    fn hold(button: PadButton) -> PadAction {
+        PadAction {
+            pad: PadId("hid:a".into()),
+            button,
+            action: PadButtonAction::Hold,
+        }
+    }
 
     #[test]
     fn trace_state_exposes_nav_entries() {
@@ -1194,5 +2531,87 @@ mod tests {
         assert_eq!(state["ui"]["nav"]["entries"][0]["url"], "https://a.test/");
         assert!(state["ui"].get("selector").is_none());
         assert!(state["ui"].get("url_editing").is_none());
+    }
+
+    #[test]
+    fn browser_taps_map_to_generic_nav_actions() {
+        for (button, expected) in [
+            (PadButton::Cross, NavAction::Confirm),
+            (PadButton::Circle, NavAction::Cancel),
+            (PadButton::Triangle, NavAction::Triangle),
+            (PadButton::L3, NavAction::ToggleMagnetism),
+            (PadButton::Create, NavAction::ToggleControllers),
+        ] {
+            assert_eq!(
+                browser_tap_action(&[tap(button)]).map(|(_, action)| action),
+                Some(expected)
+            );
+        }
+        // Semantic bindings (L1/R1/Options) are resolved by the OS action
+        // table, not this generic map.
+        for button in [PadButton::L1, PadButton::R1, PadButton::Options] {
+            assert!(browser_tap_action(&[tap(button)]).is_none());
+        }
+        // Tap only: holds never invoke actions.
+        assert!(browser_tap_action(&[hold(PadButton::L1)]).is_none());
+        assert!(browser_tap_action(&[hold(PadButton::R1)]).is_none());
+        assert!(browser_tap_action(&[tap(PadButton::R3)]).is_none());
+        assert!(browser_tap_action(&[hold(PadButton::Cross)]).is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn replay_input_helpers_parse_points_and_modifiers() {
+        assert_eq!(
+            replay_point(&serde_json::json!({"x": 12.5, "y": 40})),
+            Some((12.5, 40.0))
+        );
+        assert_eq!(replay_point(&serde_json::json!({"x": 1})), None);
+        let modifiers = replay_modifiers(Some(&serde_json::json!(["ctrl", "shift", "bogus"])));
+        assert!(modifiers.control());
+        assert!(modifiers.shift());
+        assert!(!modifiers.alt());
+    }
+
+    #[test]
+    fn click_chain_counts_double_triple_and_resets() {
+        let now = Instant::now();
+        let (first, stamp) = next_click_count(None, now, 10.0, 20.0);
+        assert_eq!(first, 1);
+        let (second, stamp) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(100),
+            11.0,
+            20.0,
+        );
+        assert_eq!(second, 2);
+        let (third, stamp) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(200),
+            10.0,
+            20.0,
+        );
+        assert_eq!(third, 3);
+        let (capped, _) = next_click_count(
+            stamp,
+            now + std::time::Duration::from_millis(300),
+            10.0,
+            20.0,
+        );
+        assert_eq!(capped, 3);
+        let (moved, _) = next_click_count(
+            Some((now, 10.0, 20.0, 1)),
+            now + std::time::Duration::from_millis(100),
+            20.0,
+            20.0,
+        );
+        assert_eq!(moved, 1);
+        let (late, _) = next_click_count(
+            Some((now, 10.0, 20.0, 1)),
+            now + std::time::Duration::from_millis(600),
+            10.0,
+            20.0,
+        );
+        assert_eq!(late, 1);
     }
 }

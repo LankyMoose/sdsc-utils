@@ -3,7 +3,7 @@
 //! Unpackaged/dev builds use this module: download a zipped CEF runtime from
 //! the configured DLC feed (`SDSC_CEF_DLC_MANIFEST_URL`, or the older
 //! `SDSC_CEF_DLC_URL` + `SDSC_CEF_DLC_SHA256` pair), verify it, and install it
-//! into a versioned directory under `%APPDATA%/sdsc-utils`.
+//! into a versioned directory under `%LOCALAPPDATA%/sdsc-utils`.
 //!
 //! A running CEF maps `libcef.dll` and cannot have its directory replaced.
 //! Every install therefore lands in a fresh `cef-engine-<stamp>` folder and

@@ -1,8 +1,8 @@
-//! Browser add-on panel state and window view.
+//! Browser app UI state and (later) its standalone window view.
 //!
-//! These types are rendered by `sdsc-browser`, not the main shell; the child
-//! owns the page surface, cursor, and text session. See
-//! `notes/browser-app-split.md`.
+//! Phase 0 of Home pivot keeps rendering inside Launcher; only the state moved
+//! here so it no longer belongs to `LauncherState`. See
+//! `notes/browser-Home-pivot.md`.
 
 pub mod state;
 pub mod view;

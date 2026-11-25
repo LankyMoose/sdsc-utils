@@ -52,30 +52,12 @@ uses the same publisher identity.
   (`<MainPackage>` + `<OptionalPackages><Package .../></OptionalPackages>`);
   `Add-AppxPackage` cannot install an optional package as an unrelated app.
 - **Dev/unpackaged:** set `SDSC_CEF_DLC_URL` + `SDSC_CEF_DLC_SHA256`; Home
-  catalog Install button downloads the zip, verifies SHA-256, extracts a
-  versioned directory under `%APPDATA%\sdsc-utils`, and starts CEF without a
-  restart.
+  catalog Install button downloads the zip, verifies SHA-256, extracts to
+  `%LOCALAPPDATA%\sdsc-utils\cef-engine`, and starts CEF without a restart.
 
 Engine resolver order: `CEF_PATH` → `cef\` next to the exe → the
-`BrowserEngine` package's `cef\` directory → the local store under
-`%APPDATA%\sdsc-utils` → debug build `OUT_DIR`. A directory only counts as
-installed when `libcef.dll`, `icudtl.dat`, `resources.pak`, and
-`locales/en-US.pak` exist.
-
-## Browser add-on package
-
-The Browser is a separate `sdsc-browser.exe`, not an in-process module. The
-main MSIX must ship it next to `sdsc-utils.exe` (both use the same package
-identity); Home's local `<data>\browser-addon\` install is the
-unpackaged/portable path only. Runtime precedence is package sidecar →
-Home-installed copy → development sidecar, so a local copy cannot shadow the
-Store build.
-
-Both processes share `%APPDATA%\sdsc-utils` (the host passes it in
-`Hello.data_dir`) so prefs, tabs, bookmarks, and the CEF profile stay put. The
-Store package must disable file-system write virtualization for that directory
-(`unvirtualizedResources` + `desktop6:FileSystemWriteVirtualization`). The
-add-on is unreleased, so there is no pre-existing Browser data to import.
+`BrowserEngine` package's `cef\` directory → `%LOCALAPPDATA%\sdsc-utils\cef-engine` → debug build `OUT_DIR`. A directory only counts as installed when
+`libcef.dll`, `icudtl.dat`, `resources.pak`, and `locales/en-US.pak` exist.
 
 ## Store submission
 

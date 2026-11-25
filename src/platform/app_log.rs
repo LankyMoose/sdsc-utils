@@ -282,10 +282,6 @@ fn log_file_path(file_name: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os("SDSC_DATA_DIR") {
         return PathBuf::from(dir).join(file_name);
     }
-    // Hosted add-on: log beside the host's data directory.
-    if let Some(dir) = crate::persist::paths::data_dir_override() {
-        return dir.join(file_name);
-    }
 
     #[cfg(windows)]
     {

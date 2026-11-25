@@ -5,36 +5,12 @@ use crate::{AppError, AppResult};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 
-/// Host-provided data directory (the `Hello.data_dir` contract for hosted
-/// apps). Set once, before any path-dependent work.
-static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
-/// Pin the process to the host's data directory.
-///
-/// The add-on receives this in `Hello`; honoring it keeps prefs, tabs,
-/// bookmarks, and the CEF profile in the same place as the main app even when
-/// the two processes have different package identities. Returns false when an
-/// override was already set (first writer wins, so a process cannot be moved
-/// after it starts reading files).
-pub fn set_data_dir_override(dir: PathBuf) -> bool {
-    DATA_DIR_OVERRIDE.set(dir).is_ok()
-}
-
-/// The host-provided directory, when one was pinned.
-pub fn data_dir_override() -> Option<PathBuf> {
-    DATA_DIR_OVERRIDE.get().cloned()
-}
-
-/// Directory for prefs, controllers, analytics, logs, and the Browser add-on.
+/// Directory for prefs, controllers, analytics (and on Windows, the log file).
 pub fn data_dir() -> PathBuf {
     // Replay/QA sandbox override. Must be checked before platform defaults.
     if let Some(dir) = std::env::var_os("SDSC_DATA_DIR") {
         return PathBuf::from(dir);
-    }
-    if let Some(dir) = DATA_DIR_OVERRIDE.get() {
-        return dir.clone();
     }
 
     #[cfg(windows)]

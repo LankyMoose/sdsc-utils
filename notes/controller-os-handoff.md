@@ -1,22 +1,18 @@
 # Controller OS handoff: Browser app, hosted UI contract, system OSK
 
 **Status:** Phases A–C implemented on `browser/main` (Browser v0, system OSK,
-hosted contract v0 + Launcher Settings proof). Phase D split and local app lifecycle landed:
-protocol crate, `sdsc-browser` add-on, host supervisor, remote replay,
-in-process Browser removal, and Home-driven add-on install/launch/update/
-uninstall with traced/replayable flows. Remaining D3 work is MSIX/Store
-packaging and related-set policy. There is no data migration: the Browser
-add-on and engine are unreleased, so the shared data path is the contract from
-the first shipped build.
-Phase E (chrome redesign) remains open.
+hosted contract v0 + Launcher Settings proof). Phase D (the `sdsc-browser`
+add-on process split) was implemented and then **reverted**: the Browser is
+in-process again, and the optional CEF engine DLC is the only optional payload.
+Phase E (chrome redesign) remains open. See
+[single-process-browser.md](single-process-browser.md).
 **Scope:** controller-OS architecture, Browser v0 chrome removal, system OSK,
-hosted app/action contract, Browser app split/packaging.
+hosted app/action contract; the app-process split is historical.
 **Supersedes:** the browser-coupled OSK plan in
 [browser-osk.md](browser-osk.md) and the OSK/popup/address/tab-UI parts of
-[browser-embedding.md](browser-embedding.md). It also revises the ownership and
-packaging direction in [browser-home-pivot.md](browser-home-pivot.md): the
-Browser is intended to become its own optional app, not merely a CEF engine
-DLC inside the main binary.
+[browser-embedding.md](browser-embedding.md). It also revised the ownership and
+packaging direction in [browser-home-pivot.md](browser-home-pivot.md); that
+separate-app split was reverted in favour of the single-process Browser.
 
 Read this whole note before touching the Browser UI, the OSK, the pad routing,
 or the MSIX packaging.
@@ -35,8 +31,10 @@ or the MSIX packaging.
 4. **Define contract v0**: manifest + surface + actions + text session +
    lifecycle. The Browser spec is tiny. Do not build a general UI toolkit or
    the Browser app split in the first pass.
-5. The Browser-as-optional-app packaging/input split is a later phase; settle
-   IPC/HID/overlay/package decisions before touching it.
+5. The Browser stays **in-process**. A separate `sdsc-browser` add-on process
+   (stdio protocol, Home install/update, remote input/text) was implemented and
+   then reverted; do not reintroduce it without a committed packaging
+   requirement. The optional CEF engine DLC remains.
 
 ---
 
@@ -72,7 +70,7 @@ The main app is a **virtual OS / shell for controllers**.
 | Notifications | Toasts |
 | App catalog / package manager | Home apps, DLC install, Browser tile |
 | System apps | Launcher, Settings, popup |
-| User apps | Browser add-on (first external app) |
+| User apps | Browser (in-process managed app; optional CEF engine DLC) |
 | System overlays | Home, toasts, **OSK** |
 
 Consequences:
@@ -87,10 +85,11 @@ Consequences:
 - Page-specific interaction stays in the app. The OS must not try to model
   page targets/docking.
 
-The target product model is **Browser as an optional add-on with its own
-executable/package** (UI + CEF engine), not the current engine-only optional
-package. The first implementation can be transitional/in-process; the app
-split is a later phase.
+The Browser is a managed app conceptually, but it runs **in-process** with the
+shell. A separate `sdsc-browser` executable/package was trialled and reverted;
+the optional CEF engine DLC is the only optional payload. The app/OS boundary
+(actions, text session, lifecycle) is still useful, but it is a module
+boundary, not an IPC boundary.
 
 ---
 
@@ -561,6 +560,13 @@ This is the critical boundary:
 
 ## 8. Browser app split and packaging
 
+> **Reverted (2026-11-26).** The D2 add-on process (`sdsc-browser`), the
+> `browser-protocol` transport crate, Home add-on install/update, remote
+> OSK/text bridging, and the remote QA scripts were removed. The Browser
+> window, CEF engine, cursor, and text session are in-process again; the
+> optional `BrowserEngine` DLC is unchanged. The material below is retained as
+> design history only. See [single-process-browser.md](single-process-browser.md).
+
 The current packaging is **not** the target:
 
 - Main MSIX ships `sdsc-utils.exe` with the Browser UI.
@@ -660,16 +666,15 @@ packaging decisions are settled. Do not attempt the full split in the first PR.
 - Implement the OS action mapping table for back/forward/reload.
 - Transitional in-process Browser host of the contract; no UI widgets yet.
 
-### Phase D — Browser app split/packaging
+### Phase D — Browser app split/packaging (reverted)
 
-- [x] Settle IPC/input/overlay/packaging decisions.
-- [x] Split Browser into its own executable/add-on; main app keeps OS/shell/OSK.
-- [x] Remove the in-process Browser window/CEF path; replay now targets the add-on.
-- [x] Home install/launch/update flow for the add-on app itself (local source
-  package; engine component chained when missing/updatable).
-- [x] Shared `Hello.data_dir`, protocol-checked add-on metadata, and
-  package-owned add-on precedence.
-- [ ] MSIX/Store packaging and related-set policy.
+- ~~Settle IPC/input/overlay/packaging decisions.~~
+- ~~Split Browser into its own executable/add-on; main app keeps OS/shell/OSK.~~
+- ~~Home install/launch/update flow.~~
+- ~~Remove Browser UI/CEF from the main binary; tree-shake.~~
+- **Reverted 2026-11-26:** the split's cold launch, CEF lifecycle, IPC input
+  queue, and add-on install/versioning cost more than the unlanded packaging
+  benefit. Keep the Browser in-process; the engine DLC is the optional payload.
 
 ### Phase E — Future redesign
 
@@ -742,8 +747,8 @@ Likely new modules:
   imports.
 - `src/app/osk.rs` — system OSK session/input/output/overlay lifecycle.
 - `src/app/actions.rs` or equivalent — semantic action manifest/mapping.
-- Phase D: app protocol crate (workspace/path dependency), Browser add-on
-  executable/package.
+- ~~Phase D: app protocol crate + Browser add-on executable/package.~~
+  Removed in the single-process migration.
 
 Docs to update during implementation:
 

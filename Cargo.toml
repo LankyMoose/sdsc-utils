@@ -14,11 +14,6 @@ categories = ["hardware-support", "gui"]
 build = "build.rs"
 default-run = "sdsc-utils"
 
-[workspace]
-members = ["crates/browser-protocol"]
-default-members = [".", "crates/browser-protocol"]
-resolver = "3"
-
 [lib]
 name = "sdsc_utils"
 path = "src/lib.rs"
@@ -30,10 +25,6 @@ path = "src/bin/sdsc-utils.rs"
 [[bin]]
 name = "gen_msix_logos"
 path = "src/bin/gen_msix_logos.rs"
-
-[[bin]]
-name = "sdsc-browser"
-path = "src/bin/sdsc-browser.rs"
 
 [features]
 # Single executable with CEF OSR in-process. `--no-default-features` is the
@@ -109,7 +100,6 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 single-instance = "0.3.3"
 notify-rust = "4"
 ureq = { version = "3", features = ["rustls"] }
-sdsc-browser-protocol = { path = "crates/browser-protocol" }
 
 [build-dependencies]
 ico = "0.4"

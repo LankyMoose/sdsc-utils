@@ -47,16 +47,10 @@ impl App {
         if self.osk.state.open {
             if self.osk.state.target != Some(target) {
                 self.osk.state.target = Some(target);
-                if target == OskTarget::BrowserPage {
-                    self.remote_browser_osk(true);
-                }
             }
             return self.show_osk_window();
         }
         self.osk.state.open(target);
-        if target == OskTarget::BrowserPage {
-            self.remote_browser_osk(true);
-        }
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.open")
             .field("target", target.label())
             .field("mode", self.osk.state.mode.label())
@@ -123,11 +117,7 @@ impl App {
         if !self.osk.state.open {
             return Task::none();
         }
-        let browser_page = self.osk.state.target == Some(OskTarget::BrowserPage);
         self.osk.state.close();
-        if browser_page {
-            self.remote_browser_osk(false);
-        }
         self.osk.r2_latched = false;
         self.osk.l3_latched = false;
         self.osk.r3_latched = false;
@@ -141,6 +131,14 @@ impl App {
         // Hide, don't destroy: the overlay stays warm for the next text field,
         // and keyboard focus never left the host app in the first place.
         window::set_mode(id, window::Mode::Hidden)
+    }
+
+    /// Close only when the OSK is currently targeting `target` (e.g. the page
+    /// text session blurred).
+    pub(crate) fn close_osk_if_target(&mut self, target: OskTarget, reason: &'static str) {
+        if self.osk.state.open && self.osk.state.target == Some(target) {
+            let _ = self.close_osk(reason);
+        }
     }
 
     pub(crate) fn set_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
@@ -175,7 +173,7 @@ impl App {
         if escape {
             return close;
         }
-        close.chain(self.on_shell_key(id, raw))
+        close.chain(self.on_browser_raw_key(id, raw))
     }
 
     /// Pad tick while the OSK is open. The system owns the pad before the host

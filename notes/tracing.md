@@ -111,16 +111,8 @@ sdsc-utils --trace-replay <session-id-or-dir> --flow 42
 ```
 
 The replay driver supports browser `navigate`, `history.back`,
-`history.forward`, `history.open`, `history.pick`, and `history.cancel`, Home
-app lifecycle steps, plus synthetic input steps for automation:
-
-- `home.open` — reveal the PS Home overlay.
-- `home.app.install` / `home.app.update` — install/update the Browser add-on;
-  optional `source` and `version` params select a deterministic QA package.
-- `home.app.uninstall` — remove the installed add-on (and a locally installed
-  engine component).
-- `home.app.launch` / `home.app.close` — launch from Home and close the
-  add-on through the OS lifecycle.
+`history.forward`, `history.open`, `history.pick`, and `history.cancel`, plus
+synthetic input steps for automation:
 
 - `text` — `{"text": "hello"}` presses/releases each character.
 - `key` — `{"key": "Enter", "modifiers": ["ctrl"]}` taps one named key.
@@ -149,7 +141,7 @@ session. Targets resolve by URL first, then index (`pass_resolved` semantics).
 State mismatches are logged as `replay.mismatch` and replay continues
 best-effort; the trace records both the mismatch and the final landing.
 
-When the plan ends (`replay.done`), the driver closes the Browser add-on
+When the plan ends (`replay.done`), the driver closes the Browser window
 immediately so automated runs do not leave UI on the secondary display.
 Quiet sessions also suppress the tray-startup toast and controller auto-open
 Home.
@@ -165,9 +157,7 @@ cannot see. `python scripts/qa_browser_actions.py` fires L1/R1/Options and
 checks `app.action` enabled-state/back/forward/reload. `python
 scripts/qa_browser_osk.py` exercises the system OSK in Quadrant and Grid modes
 (first Cross open, split-stick typing, keyboard/mouse close). `python
-`python scripts/qa_browser_app.py` drives install → launch → update → launch
-→ uninstall through Home, with source/version params and action/phase/manifest
-assertions. `python scripts/qa_launcher_osk.py` is the non-browser proof: Add shortcut Title/
+scripts/qa_launcher_osk.py` is the non-browser proof: Add shortcut Title/
 Arguments editing and the Enter save path.
 
 ## Adding instrumentation
@@ -229,12 +219,6 @@ Rules:
 - `engine.popup.request` records a canceled native popup and the URL the shell
   opens as a tab; `browser.popup_open` marks the tab creation. `engine.ime`
   and `browser.ime` record composition text length (never the text).
-- Browser app lifecycle lives in the `home` lane:
-  `home.app.install`/`update`/`uninstall`/`launch` actions and outcomes,
-  `browser.addon.install.phase`, `browser.addon.ready`,
-  `browser.engine.*`, plus `browser_addon`/`browser_addon_launch` manifest
-  snapshots. Replay `requires` use paths such as `addon.installed`,
-  `addon.version`, and `app.ready`.
 - `actions.jsonl` is only for user-visible intents and their outcomes.
 - Lane detail goes in the owning lane; never dump whole app state.
 - Snapshots are bounded and semantic (no DOM, frames, or raw HID reports).
