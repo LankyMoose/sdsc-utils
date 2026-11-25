@@ -14,6 +14,11 @@ categories = ["hardware-support", "gui"]
 build = "build.rs"
 default-run = "sdsc-utils"
 
+[workspace]
+members = ["crates/browser-protocol"]
+default-members = [".", "crates/browser-protocol"]
+resolver = "3"
+
 [lib]
 name = "sdsc_utils"
 path = "src/lib.rs"
@@ -100,6 +105,7 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 single-instance = "0.3.3"
 notify-rust = "4"
 ureq = { version = "3", features = ["rustls"] }
+sdsc-browser-protocol = { path = "crates/browser-protocol" }
 
 [build-dependencies]
 ico = "0.4"

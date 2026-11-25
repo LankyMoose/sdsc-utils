@@ -4903,6 +4903,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdsc-browser-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sdsc-utils"
 version = "1.7.3"
 dependencies = [
@@ -4923,6 +4931,7 @@ dependencies = [
  "rfd",
  "rodio",
  "rustls",
+ "sdsc-browser-protocol",
  "serde",
  "serde_json",
  "sha2",

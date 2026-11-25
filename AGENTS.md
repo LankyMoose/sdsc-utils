@@ -26,7 +26,7 @@
 
 ## Project structure
 
-- **Single package, no workspace.** Root `Cargo.toml` is one crate (`sdsc-utils`): a library (`src/lib.rs`, crate name `sdsc_utils`) plus two binaries in `src/bin/`.
+- **Workspace with one root package.** Root `Cargo.toml` is the `sdsc-utils` crate (library + two binaries in `src/bin/`); `crates/browser-protocol/` is the shared versioned host ↔ Browser contract (serde + framing, no UI deps).
 - **`src/`** — everything lives here; see [Directory ownership](#directory-ownership) below.
 - **`build.rs`** — rasterizes the DualSense SVG and embeds the `.ico` into the Windows .exe
 - **`notes/`** — topic handoffs for agents (index: `notes/README.md`). Read the matching note before touching a do-not-regress area.
@@ -99,7 +99,8 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 |---|---|
 | `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, pad/key/`BrowserMessage` routing), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
 | `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture; no reader fallback |
-| `src/hosted/` | Hosted app contract v0: manifest, native surface, semantic actions, text session, OS-owned lifecycle (no widget toolkit) |
+| `src/hosted/` | Re-export of the shared hosted-app contract v0 (manifest/native surface/actions/text session/lifecycle); canonical types live in `crates/browser-protocol/` |
+| `crates/browser-protocol/` | Versioned wire protocol + contract crate: messages, framing, in-process channel, no UI/CEF deps |
 | `src/ui/osk/` | System controller keyboard: Quadrant core/layouts + Grid fallback; no Browser imports |
 | `src/app/actions.rs` | OS-owned semantic action bindings (Browser L1/R1/Options) + `ActionInvoked` path |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Launcher-open policy; emits `SessionEffect`s the UI applies |
@@ -139,7 +140,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Shared face-button hints / rings** → `src/ui/face/` (`mod.rs` widgets, `ring.rs` SVG rings); used by Launcher, Launcher Settings, and Home controller dock rows
 - **Shared UI sounds / haptics** → `src/app/feedback.rs` (global cue + pref application), `src/platform/ui_sound.rs` (audio worker); Home Settings owns the controls
 - **Launcher / fullscreen game console** → `src/ui/launcher/` (UI), `src/games/` (Steam scan, launch); behavior → `notes/launcher-immersive.md`
-- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (page surface state; dormant tab data) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state/text session); system OSK → `src/ui/osk/` + `src/app/osk.rs`; semantic actions → `src/app/actions.rs`; hosted contract → `src/hosted/`; Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; CEF API map → `notes/cef-api.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
+- **Browser (CEF)** → `src/browser/` (engine seam, `cef_backend.rs`, DOM/cursor, nav helpers) + `src/ui/browser/state.rs` (page surface state; dormant tab data) + `src/ui/launcher/browser_frame.rs` (texture) + `src/app/browser.rs` (top-level state/text session); system OSK → `src/ui/osk/` + `src/app/osk.rs`; semantic actions → `src/app/actions.rs`; hosted contract → `src/hosted/` + `crates/browser-protocol/`; Home → `src/ui/home/` + `src/app/home.rs`; contracts → `notes/browser-embedding.md`; CEF API map → `notes/cef-api.md`; Home/CEF pivot plan → `notes/browser-home-pivot.md`
 - **Toasts** → `src/ui/toast/` (state machine in `machine.rs`); z-order / remount → `notes/windows-toast.md`
 - **Persisted state (prefs/controllers/analytics)** → `src/persist/`
 - **Single instance, tray lifecycle, crash-restart** → `src/bin/sdsc-utils.rs`, `src/platform/crash_restart.rs`
