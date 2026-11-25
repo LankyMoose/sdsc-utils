@@ -1,16 +1,21 @@
 //! Standalone Browser window rendering.
 //!
-//! v0 is chrome-less: the window renders the CEF page surface plus the pad
-//! cursor and the controller text keyboard. The panel state lives in
-//! `ui::browser::state`; this module owns the page/cursor composition and the
-//! browser-facing message vocabulary.
+//! v0 has one header row (Back / URL / Forward) above the CEF page surface,
+//! plus the pad cursor and the system controller keyboard. The panel state
+//! lives in `ui::browser::state`; this module owns the header/page/cursor
+//! composition and the browser-facing message vocabulary.
 
 use crate::browser::engine::BrowserCursor;
-use crate::ui::browser::state::BrowserPanel;
-use crate::ui::theme;
+use crate::ui::browser::state::{
+    BROWSER_HEADER_GAP, BROWSER_HEADER_H, BROWSER_HEADER_PAD, BROWSER_HEADER_RULE,
+    BROWSER_HEADER_TOTAL, BROWSER_URL_BAR_H, BROWSER_URL_BAR_PAD, BROWSER_URL_GAP,
+    BROWSER_URL_ICON, BrowserPanel, browser_header_layout, browser_url_text_budget, display_url,
+};
+use crate::ui::face::{FaceButton, RingStyle, face_glyph, hint_text_capsule};
+use crate::ui::{svg_icon, text_fit, theme};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, text};
-use iced::{Element, Fill, Length};
+use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Padding};
 
 /// Everything the standalone Browser window can ask the shell/engine to do.
 #[derive(Debug, Clone)]
@@ -202,6 +207,163 @@ fn browser_cursor_overlay<'a>(
         .into()
 }
 
+fn header_icon(icon: &'static str, size: f32, color: Color) -> Element<'static, BrowserMessage> {
+    svg(svg::Handle::from_memory(icon.as_bytes()))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |_theme, _status| svg::Style { color: Some(color) })
+        .into()
+}
+
+/// Controller capsule + label using the shared action-hint furniture.
+fn bumper_hint(
+    capsule: &'static str,
+    label: &'static str,
+    pressed: bool,
+    enabled: bool,
+) -> Element<'static, BrowserMessage> {
+    let alpha = if enabled { 1.0 } else { 0.4 };
+    let glyph = hint_text_capsule(
+        text(capsule)
+            .size(12.0)
+            .font(Font::MONOSPACE)
+            .color(theme::scale_alpha(theme::ACCENT, alpha)),
+        10.0,
+        1.0,
+        pressed && enabled,
+        0.0,
+        true,
+        alpha,
+    );
+    row![
+        glyph,
+        text(label)
+            .size(14.0)
+            .color(theme::scale_alpha(theme::MUTED, alpha)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Shared Triangle face glyph; lives inside the URL well, anchored right.
+fn triangle_prompt(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
+    let style = if panel.triangle_held {
+        RingStyle::Pressed
+    } else {
+        RingStyle::Idle
+    };
+    face_glyph(FaceButton::Triangle, style, 0.0, true, 1.0)
+}
+
+/// URL well: globe + single-line URL + right-anchored Triangle prompt.
+fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessage> {
+    let editing = panel.url_editing;
+    let budget = browser_url_text_budget(url_w, editing);
+    let value = if editing {
+        // Keep the caret end visible: the draft grows at the end, so truncate
+        // from the start rather than hiding newly typed characters.
+        let text_budget = (budget - 8.0).max(0.0);
+        let tail = text_fit::ellipsize_start_to_width(panel.url_draft.as_str(), 14.0, text_budget);
+        format!("{tail}|")
+    } else {
+        text_fit::ellipsize_to_width(display_url(panel.session.url()), 14.0, budget)
+    };
+    let mut content = row![
+        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED),
+        text(value)
+            .size(14.0)
+            .wrapping(Wrapping::None)
+            .color(theme::INK),
+    ]
+    .spacing(BROWSER_URL_GAP)
+    .align_y(Alignment::Center);
+    if editing {
+        content = content.push(space().width(Fill));
+    } else {
+        content = content
+            .push(space().width(Fill))
+            .push(triangle_prompt(panel));
+    }
+    container(content)
+        .width(Length::Fixed(url_w))
+        .height(Length::Fixed(BROWSER_URL_BAR_H))
+        .padding(Padding {
+            top: 0.0,
+            right: BROWSER_URL_BAR_PAD,
+            bottom: 0.0,
+            left: BROWSER_URL_BAR_PAD,
+        })
+        .align_y(Alignment::Center)
+        .style(theme::browser_url_bar(editing))
+        .into()
+}
+
+/// One-row Browser header: Back (L1) · URL well · Forward (R1).
+fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessage> {
+    let content_w = (page_w - 2.0 * BROWSER_HEADER_PAD).max(1.0);
+    let layout = browser_header_layout(content_w);
+    let back_enabled = panel.can_go_back();
+    let forward_enabled = panel.can_go_forward();
+    let back = row![
+        header_icon(
+            svg_icon::CHEVRON_LEFT_SVG,
+            18.0,
+            if back_enabled {
+                theme::MUTED
+            } else {
+                theme::DIM
+            },
+        ),
+        bumper_hint("L1", "Back", panel.l1_held, back_enabled),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let forward = row![
+        bumper_hint("R1", "Forward", panel.r1_held, forward_enabled),
+        header_icon(
+            svg_icon::CHEVRON_RIGHT_SVG,
+            18.0,
+            if forward_enabled {
+                theme::MUTED
+            } else {
+                theme::DIM
+            },
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let content = row![
+        container(back)
+            .width(Length::Fixed(layout.side_w))
+            .align_x(Alignment::Start),
+        browser_url_bar(panel, layout.url_w),
+        container(forward)
+            .width(Length::Fixed(layout.side_w))
+            .align_x(Alignment::End),
+    ]
+    .spacing(BROWSER_HEADER_GAP)
+    .align_y(Alignment::Center);
+    let row = container(content)
+        .width(Length::Fixed(page_w))
+        .height(Length::Fixed(BROWSER_HEADER_H))
+        .padding(Padding {
+            top: 0.0,
+            right: BROWSER_HEADER_PAD,
+            bottom: 0.0,
+            left: BROWSER_HEADER_PAD,
+        })
+        .align_y(Alignment::Center);
+    let rule = container(space())
+        .width(Length::Fixed(page_w))
+        .height(Length::Fixed(BROWSER_HEADER_RULE))
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(theme::LINE)),
+            ..container::Style::default()
+        });
+    column![row, rule].width(Length::Fixed(page_w)).into()
+}
+
 /// Page surface: live engine pixels when a frame is present, text otherwise.
 /// The engine image is a fixed size (`page_w`) so the virtual cursor maps 1:1;
 /// pad scroll routes to the engine in that mode, so no scrollable wraps the
@@ -267,23 +429,26 @@ pub fn browser_page_view(
     .into()
 }
 
-/// Browser surface: one 1:1 page card. The caller sizes the page to 16:9;
-/// the engine viewport is resized to the same numbers, so cursor coordinates
-/// are card pixels.
+/// Browser surface: one header row above the 1:1 page card. The caller sizes
+/// the page to the engine viewport; cursor coordinates remain page-local.
 pub fn browser_view<'a>(
     panel: &'a BrowserPanel,
     engine_available: bool,
     page_w: f32,
     page_h: f32,
 ) -> Element<'a, BrowserMessage> {
-    stack![
+    let page = stack![
         browser_page_view(panel, engine_available, page_w, page_h),
         browser_cursor_overlay(panel, page_w, page_h),
     ]
     .width(Length::Fixed(page_w))
     .height(Length::Fixed(page_h))
-    .clip(true)
-    .into()
+    .clip(true);
+    column![browser_header(panel, page_w), page]
+        .width(Length::Fixed(page_w))
+        .height(Length::Fixed(BROWSER_HEADER_TOTAL + page_h))
+        .clip(true)
+        .into()
 }
 
 /// Standalone Browser card geometry: 16:9, height-driven, with a 50px
@@ -341,18 +506,22 @@ pub fn root_view(
     let cursor = iced::Rectangle::new(
         iced::Point::new(
             card_x + crate::ui::browser::state::BROWSER_CARD_PAD + mouse_x,
-            card_y + crate::ui::browser::state::BROWSER_CARD_PAD + mouse_y,
+            card_y + crate::ui::browser::state::BROWSER_CARD_PAD + BROWSER_HEADER_TOTAL + mouse_y,
         ),
         iced::Size::new(1.0, 1.0),
     );
-    let ime_enabled = !crate::platform::debug_quiet::input_dropped() && panel.session.has_frame();
+    let ime_enabled = !crate::platform::debug_quiet::input_dropped()
+        && !panel.url_editing
+        && panel.session.has_frame();
     crate::ui::input_method::ime_bridge(surface, ime_enabled, cursor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::browser::state::{BROWSER_CARD_PAD, BROWSER_OUTER_MARGIN, browser_layout};
+    use crate::ui::browser::state::{
+        BROWSER_CARD_PAD, BROWSER_HEADER_TOTAL, BROWSER_OUTER_MARGIN, browser_layout,
+    };
 
     #[test]
     fn browser_layout_is_16_9_and_height_driven() {
@@ -365,7 +534,10 @@ mod tests {
         );
         assert_eq!(l.card_h, 980.0, "50px top/bottom breather (height - 100)");
         assert_eq!(l.card_w, l.page_w + 2.0 * BROWSER_CARD_PAD);
-        assert_eq!(l.card_h, l.page_h + 2.0 * BROWSER_CARD_PAD);
+        assert_eq!(
+            l.card_h,
+            l.page_h + 2.0 * BROWSER_CARD_PAD + BROWSER_HEADER_TOTAL
+        );
         assert!(l.page_w > 1600.0, "height-driven width");
         // Narrow stage: width clamps and the card keeps 16:9.
         let n = browser_layout(800.0, 1200.0);

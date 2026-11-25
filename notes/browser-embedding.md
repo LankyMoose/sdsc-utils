@@ -8,11 +8,12 @@ reader fallback are deleted. The pivot plan and remaining phases live in
 window, the engine worker, DOM targets, or the CEF packaging path. For a
 capability/API lookup, start with [cef-api.md](cef-api.md).
 
-> **Ownership update:** the Browser is moving to a chrome-less optional app
-> with a system OSK and hosted UI/action contract. The CEF engine, page input,
-> cursor, DOM, and frame-slot contracts here still apply. The OSK/popup/
-> address/tab-UI parts are superseded by
-> [controller-os-handoff.md](controller-os-handoff.md).
+> **Ownership update:** the Browser is an in-process managed app (the
+> `sdsc-browser` process split was reverted; see
+> [single-process-browser.md](single-process-browser.md)), with a system OSK
+> and hosted UI/action contract. v0.1 has one header row — Back/L1 · URL well
+> (Triangle edits) · Forward/R1 — above the page. The CEF engine, page input,
+> cursor, DOM, and frame-slot contracts here still apply.
 
 ## Decision
 
@@ -66,9 +67,12 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   `resolve_navigate_target`).
 - `src/browser/keys.rs` — iced → engine keyboard mapping.
 - `src/ui/browser/state.rs` / `view.rs` — panel state + standalone-window
-  rendering/chrome and `BrowserMessage`.
+  rendering and `BrowserMessage`. The header is one row inside the 16:9 card:
+  Back/L1 · URL well · Forward/R1. `BrowserPanel` owns the URL draft/edit
+  state; the page starts below a 44px row + 1px rule.
 - `src/app/browser.rs` — top-level `BrowserAppState`, window lifecycle,
-  pad/key routing, `BrowserMessage` reducer.
+  pad/key routing, URL editor (`OskTarget::BrowserUrl`), and `BrowserMessage`
+  reducer.
 
 ## Current input/UX contract (pad)
 
@@ -121,7 +125,8 @@ meters still use the legacy per-surface bank.
 - Left stick moves the cursor with velocity + friction; magnet docks on
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
 - D-pad jumps spatially between page focusables (vertical cone, horizontal
-  row-locked); there is no browser header to cross in v0.
+  row-locked); the cursor stays page-local and does not dock to the header in
+  v0.
 - R2 turbo doubles cursor acceleration/cap and scroll speed while held and
   disables docking; release re-snaps in place.
 - Right stick scrolls only while the cursor is over the page. Scroll
@@ -134,7 +139,9 @@ meters still use the legacy per-surface bank.
   Browser — Home/PS is the only close path.
 - Real keyboard input goes to the page as `RAWKEYDOWN` + `CHAR` + `KEYUP`
   (text needs the separate `CHAR` leg). `Ctrl+R` and `Alt+Left`/`Alt+Right`
-  stay app shortcuts; there is no address field or Ctrl+L entry in v0.
+  stay app shortcuts; while the URL well is editing, printable keys/backspace/
+  Enter/Escape route to the draft instead of CEF. There is still no Ctrl+L
+  shortcut.
 - Real page mouse supports left click, double/triple-click word/paragraph
   selection, drag selection, and native CEF wheel (lines × 120); CEF cursor
   shapes drive the OS cursor over the page. Right/middle click and a custom
@@ -144,10 +151,12 @@ meters still use the legacy per-surface bank.
   `browser.popup_denied`.
 - The system controller keyboard (Quadrant default, Grid fallback) is a
   topmost no-activate overlay owned by the main app. Cross on a page text
-  field is the only opener; focus/autofocus never opens it. Real
-  mouse/keyboard/IME/touch closes it, and keyboard keys hand off to the page
-  (Escape consumed). Page IME still flows through `ime_bridge` and CEF
-  composition calls. See [controller-os-handoff.md](controller-os-handoff.md).
+  field opens it for `OskTarget::BrowserPage`; Triangle in the URL well opens
+  it for `OskTarget::BrowserUrl`. Focus/autofocus never opens it. Real
+  mouse/IME/touch closes it (a closing mouse/pad/Home path cancels URL
+  editing); keyboard keys hand off to the focused host (Escape consumed).
+  Page IME still flows through `ime_bridge` and CEF composition calls. See
+  [controller-os-handoff.md](controller-os-handoff.md).
 - Automated sessions set `SDSC_DEBUG_INPUT=0`, which locks real pad,
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also
   suppress the startup toast and controller auto-open Home. Replay drives the
@@ -155,11 +164,13 @@ meters still use the legacy per-surface bank.
   `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.stick`
   steps and closes the Browser window at `replay.done`; never use OS input
   injection for QA and do not leave test windows on screen.
-- v0 is single-tab and chrome-less. Tab/session/bookmark backends and the
-  exact DevTools history-jump path stay dormant for the redesign; no tab
-  strip, address, bookmark/history UI, or status chrome is rendered. The
-  last page persists to `tabs.json` and is restored on open (crash-restart
-  boots use the default page).
+- v0 is single-tab with one header row (Back/L1 · URL well · Forward/R1).
+  The URL well ellipsizes long URLs at the end; while editing it shows the
+  draft tail (leading ellipsis) so the caret stays visible. Tab/session/
+  bookmark backends and the exact DevTools history-jump path stay dormant for
+  the redesign; no tab strip, bookmark/history UI, or status chrome is
+  rendered. The last page persists to `tabs.json` and is restored on open
+  (crash-restart boots use the default page).
 - The saved page is not written until the first Browser open has restored
   it. The engine preloads the saved active URL at boot and its early
   `TitleChanged`/`UrlChanged` events used to persist a one-tab file before

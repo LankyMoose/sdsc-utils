@@ -352,6 +352,21 @@ pub fn status_overlay(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Browser URL well: the single header input surface. Idle keeps a hairline;
+/// editing pins the border to the accent.
+pub fn browser_url_bar(editing: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(alpha(INK, 0.06))),
+        text_color: Some(INK),
+        border: Border {
+            color: if editing { ACCENT } else { LINE },
+            width: 1.0,
+            radius: radius::SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Raised surface without a border (list rows, headers).
 pub fn surface(_theme: &Theme) -> container::Style {
     container::Style {

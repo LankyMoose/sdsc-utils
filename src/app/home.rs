@@ -243,6 +243,8 @@ impl App {
             height: 1080.0,
         });
         let close_osk = self.close_osk("home");
+        // Home suspends the Browser; never leave a URL edit armed underneath.
+        self.browser.panel.cancel_url_edit();
         // The backdrop always covers the monitor; the card scales/centers
         // inside it. On an opaque backend the scrim blends over the opaque
         // clear color instead of the desktop.

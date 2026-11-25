@@ -117,7 +117,14 @@ impl App {
         if !self.osk.state.open {
             return Task::none();
         }
+        let target = self.osk.state.target;
         self.osk.state.close();
+        // Hardware/IME handoff keeps the URL editor alive: the key that closed
+        // the OSK is about to be handled as URL text. Every other close path
+        // (mouse, pad, Home, Browser close) cancels the edit.
+        if target == Some(OskTarget::BrowserUrl) && !matches!(reason, "keyboard" | "ime") {
+            self.browser.panel.cancel_url_edit();
+        }
         self.osk.r2_latched = false;
         self.osk.l3_latched = false;
         self.osk.r3_latched = false;
@@ -130,7 +137,11 @@ impl App {
         };
         // Hide, don't destroy: the overlay stays warm for the next text field,
         // and keyboard focus never left the host app in the first place.
-        window::set_mode(id, window::Mode::Hidden)
+        let hide = window::set_mode(id, window::Mode::Hidden);
+        if target == Some(OskTarget::BrowserUrl) {
+            return hide.chain(self.invalidate_browser_window());
+        }
+        hide
     }
 
     /// Close only when the OSK is currently targeting `target` (e.g. the page
@@ -169,7 +180,15 @@ impl App {
             raw.key,
             iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
         );
-        let close = self.close_osk("keyboard");
+        // Escape while the URL well owns the keyboard cancels the edit, not
+        // just the overlay; page-text OSK keeps the existing consume-and-close
+        // hand-off.
+        let reason = if escape && self.browser.panel.url_editing {
+            "url_cancel"
+        } else {
+            "keyboard"
+        };
+        let close = self.close_osk(reason);
         if escape {
             return close;
         }
@@ -305,6 +324,10 @@ impl App {
             .emit();
         match target {
             Some(OskTarget::BrowserPage) => self.browser_text_insert(text),
+            Some(OskTarget::BrowserUrl) => {
+                self.browser.panel.url_edit_insert(text);
+                return self.invalidate_browser_window();
+            }
             Some(OskTarget::LauncherManualTitle) => {
                 if let Some(draft) = self.launcher_state.manual_add.as_mut() {
                     draft.title.push_str(text);
@@ -327,6 +350,10 @@ impl App {
             .emit();
         match target {
             Some(OskTarget::BrowserPage) => self.browser_text_backspace(),
+            Some(OskTarget::BrowserUrl) => {
+                self.browser.panel.url_edit_backspace();
+                return self.invalidate_browser_window();
+            }
             Some(OskTarget::LauncherManualTitle) => {
                 if let Some(draft) = self.launcher_state.manual_add.as_mut() {
                     draft.title.pop();
@@ -352,6 +379,7 @@ impl App {
                 self.browser_text_enter();
                 Task::none()
             }
+            Some(OskTarget::BrowserUrl) => self.commit_browser_url_edit(),
             Some(OskTarget::LauncherManualTitle) | Some(OskTarget::LauncherManualArgs) => {
                 self.confirm_manual_add()
             }

@@ -19,8 +19,9 @@ implemented and then reverted in full:
   QA scripts;
 - restored the in-process Browser window, CEF engine ownership, pad routing,
   cursor, text session, and replay from the pre-split tree;
-- kept the chrome-less v0 Browser, system OSK, hosted contract/action bindings,
-  Home overlay, CEF engine DLC, and in-process replay/tracing.
+- kept the single-tab Browser (now with a one-row Back/URL/Forward header),
+  system OSK, hosted contract/action bindings, Home overlay, CEF engine DLC,
+  and in-process replay/tracing.
 
 ## Why it was reverted
 

@@ -1,11 +1,34 @@
 //! Browser app state: page state, cursor, text keyboard, and dormant tab data.
 //!
-//! v0 is chrome-less: one page surface, no tab strip/toolbar/address/status.
-//! Tab/session/bookmark backends stay available for the future contract work,
-//! but the panel only ever renders and drives the live page.
+//! v0 has a single header row (Back / URL / Forward). There is no tab strip,
+//! bookmark bar, history selector, or status chrome; tab/session/bookmark
+//! backends stay available for future contract work.
 
 use std::collections::HashMap;
 use std::time::Instant;
+
+/// Header row height, excluding the hairline rule below it.
+pub const BROWSER_HEADER_H: f32 = 44.0;
+/// Hairline under the header row.
+pub const BROWSER_HEADER_RULE: f32 = 1.0;
+/// Total header stack consumed above the page.
+pub const BROWSER_HEADER_TOTAL: f32 = BROWSER_HEADER_H + BROWSER_HEADER_RULE;
+/// Horizontal inset for header content against the card page width.
+pub const BROWSER_HEADER_PAD: f32 = 12.0;
+/// Fixed Back/Forward group width before narrow-stage clamping.
+pub const BROWSER_HEADER_SIDE_W: f32 = 190.0;
+/// Gap between the Back group, URL bar, and Forward group.
+pub const BROWSER_HEADER_GAP: f32 = 16.0;
+/// URL well height; matches the shared 32px action-hint slot with border room.
+pub const BROWSER_URL_BAR_H: f32 = 34.0;
+/// URL well horizontal padding.
+pub const BROWSER_URL_BAR_PAD: f32 = 10.0;
+/// Globe icon size inside the URL well.
+pub const BROWSER_URL_ICON: f32 = 16.0;
+/// Gap between items inside the URL well.
+pub const BROWSER_URL_GAP: f32 = 8.0;
+/// Shared action-hint slot (`face::HOLD_RING_SIZE`); kept local to the pure layout.
+pub const BROWSER_HINT_SLOT: f32 = 32.0;
 
 /// Last canonical history snapshot reported by the engine, kept alongside the
 /// UI's projection so traces can expose disagreement.
@@ -150,6 +173,16 @@ pub struct BrowserPanel {
     /// Chrome-style bookmarks (disk-persisted, dormant in v0). Kept as data
     /// for the future contract; no UI, bindings, or favicon chrome.
     pub bookmarks: Vec<crate::browser::bookmarks::Bookmark>,
+    /// Controller hint press state for the header row.
+    pub l1_held: bool,
+    pub r1_held: bool,
+    pub triangle_held: bool,
+    /// URL well editing state. Panel-level, not per-tab: the URL belongs to
+    /// the app chrome, while page state belongs to the active tab.
+    pub url_editing: bool,
+    pub url_draft: String,
+    /// First typed character replaces the prefilled URL (select-all semantics).
+    pub url_replace_on_type: bool,
 }
 
 impl std::ops::Deref for BrowserPanel {
@@ -200,6 +233,12 @@ impl Default for BrowserPanel {
             dom_reseed_pending: false,
             debug_overlay: false,
             bookmarks: Vec::new(),
+            l1_held: false,
+            r1_held: false,
+            triangle_held: false,
+            url_editing: false,
+            url_draft: String::new(),
+            url_replace_on_type: false,
         }
     }
 }
@@ -363,6 +402,53 @@ impl BrowserPanel {
         // Drop the analog clock so reopening never applies a huge first dt.
         self.analog_at = None;
         self.scroll_axis = None;
+        self.cancel_url_edit();
+        self.l1_held = false;
+        self.r1_held = false;
+        self.triangle_held = false;
+    }
+
+    /// Begin editing the URL. The current page URL is prefilled; the first
+    /// typed character replaces it so the controller keyboard does not need
+    /// select-all.
+    pub fn start_url_edit(&mut self) {
+        self.url_editing = true;
+        self.url_draft = self.page.session.url().to_string();
+        self.url_replace_on_type = true;
+    }
+
+    /// Clear URL editing state without touching the OSK (the caller owns that).
+    pub fn cancel_url_edit(&mut self) {
+        self.url_editing = false;
+        self.url_draft.clear();
+        self.url_replace_on_type = false;
+    }
+
+    /// Append committed text to the URL draft, replacing the prefilled URL on
+    /// the first edit.
+    pub fn url_edit_insert(&mut self, text: &str) {
+        if !self.url_editing {
+            return;
+        }
+        if self.url_replace_on_type {
+            self.url_draft.clear();
+            self.url_replace_on_type = false;
+        }
+        self.url_draft.push_str(text);
+    }
+
+    /// Backspace in the URL draft. Backspace on the prefilled selection clears
+    /// it, matching a text field with all text selected.
+    pub fn url_edit_backspace(&mut self) {
+        if !self.url_editing {
+            return;
+        }
+        if self.url_replace_on_type {
+            self.url_draft.clear();
+            self.url_replace_on_type = false;
+            return;
+        }
+        self.url_draft.pop();
     }
 
     pub fn note_scrolled(&mut self, y: f32) {
@@ -489,8 +575,8 @@ impl BrowserPanel {
 }
 
 /// Browser popup geometry: the card itself is 16:9, sized from the
-/// available viewport height (clamped by width). The page surface fills the
-/// card (no browser chrome).
+/// available viewport height (clamped by width). The header row sits above
+/// the page surface inside the card.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrowserLayout {
     pub page_w: f32,
@@ -509,13 +595,60 @@ pub fn browser_layout(stage_w: f32, stage_h: f32) -> BrowserLayout {
         card_h = card_w * 9.0 / 16.0;
     }
     let page_w = (card_w - 2.0 * BROWSER_CARD_PAD).max(1.0);
-    let page_h = (card_h - 2.0 * BROWSER_CARD_PAD).max(1.0);
+    let page_h = (card_h - 2.0 * BROWSER_CARD_PAD - BROWSER_HEADER_TOTAL).max(1.0);
     BrowserLayout {
         page_w: page_w.round(),
         page_h: page_h.round(),
         card_w: card_w.round(),
         card_h: card_h.round(),
     }
+}
+
+/// Horizontal split for the one-row header.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrowserHeaderLayout {
+    /// Width of each Back/Forward group (they are symmetric).
+    pub side_w: f32,
+    /// Width of the URL well between the groups.
+    pub url_w: f32,
+}
+
+/// Split `content_w` into equal Back/Forward groups plus the URL well.
+///
+/// Sides are the preferred 190px when there is room, clamped so the URL keeps
+/// at least 160px on narrow stages. The three pieces plus two gaps always sum
+/// to `content_w`, so the URL well is exactly centred.
+pub fn browser_header_layout(content_w: f32) -> BrowserHeaderLayout {
+    let content_w = content_w.max(1.0);
+    let min_url_w = 160.0_f32.min(content_w * 0.5);
+    let max_side = ((content_w - 2.0 * BROWSER_HEADER_GAP - min_url_w) * 0.5).max(0.0);
+    let side_w = BROWSER_HEADER_SIDE_W.min(max_side);
+    let url_w = (content_w - 2.0 * side_w - 2.0 * BROWSER_HEADER_GAP).max(1.0);
+    BrowserHeaderLayout { side_w, url_w }
+}
+
+/// URL text budget inside the well: subtract padding, globe, gaps, and the
+/// right-anchored triangle hint slot. Extra pixels keep text off the border.
+pub fn browser_url_text_budget(url_w: f32, editing: bool) -> f32 {
+    let mut reserved = 2.0 * BROWSER_URL_BAR_PAD + BROWSER_URL_ICON + BROWSER_URL_GAP + 2.0;
+    if !editing {
+        reserved += BROWSER_URL_GAP + BROWSER_HINT_SLOT;
+    }
+    (url_w - reserved).max(0.0)
+}
+
+/// Human-facing URL in the header: drop the scheme and turn the blank/default
+/// document into a stable label. The full URL is preserved for editing.
+pub fn display_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed == crate::browser::BLANK_PAGE_URL {
+        return "Start page".to_string();
+    }
+    trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// Outer breather against the screen edge: 50px per side (height - 100).
@@ -696,5 +829,71 @@ mod tests {
         assert!(panel.drop_stored(second));
         assert!(panel.stored.is_empty());
         assert!(!panel.drop_stored(crate::browser::engine::TabId::BOOT));
+    }
+
+    #[test]
+    fn header_sits_inside_the_16_9_card() {
+        let l = browser_layout(1920.0, 1080.0);
+        assert_eq!(l.card_h, 980.0);
+        assert_eq!(
+            l.page_h + 2.0 * BROWSER_CARD_PAD + BROWSER_HEADER_TOTAL,
+            l.card_h
+        );
+        assert_eq!(l.page_w + 2.0 * BROWSER_CARD_PAD, l.card_w);
+    }
+
+    #[test]
+    fn header_groups_and_url_fill_the_content_width() {
+        let content_w = 1710.0;
+        let h = browser_header_layout(content_w);
+        assert_eq!(
+            h.side_w * 2.0 + h.url_w + 2.0 * BROWSER_HEADER_GAP,
+            content_w
+        );
+        assert!(h.url_w >= 160.0);
+
+        // Narrow stage: sides clamp so the URL keeps its minimum.
+        let narrow = browser_header_layout(500.0);
+        assert!(narrow.side_w * 2.0 + narrow.url_w + 2.0 * BROWSER_HEADER_GAP == 500.0);
+        assert!(narrow.url_w >= 160.0);
+    }
+
+    #[test]
+    fn url_budget_reserves_the_triangle_slot_when_idle() {
+        let idle = browser_url_text_budget(600.0, false);
+        let editing = browser_url_text_budget(600.0, true);
+        assert_eq!(
+            editing - idle,
+            BROWSER_URL_GAP + BROWSER_HINT_SLOT,
+            "editing hides the triangle and reclaims its slot"
+        );
+        assert!(idle > 0.0);
+    }
+
+    #[test]
+    fn display_url_strips_scheme_and_labels_blank() {
+        assert_eq!(display_url("https://example.com/a"), "example.com/a");
+        assert_eq!(display_url("http://example.com/a"), "example.com/a");
+        assert_eq!(display_url("example.com/a"), "example.com/a");
+        assert_eq!(display_url(""), "Start page");
+        assert_eq!(display_url(crate::browser::BLANK_PAGE_URL), "Start page");
+    }
+
+    #[test]
+    fn url_edit_replaces_prefill_then_backspaces() {
+        let mut panel = BrowserPanel::default();
+        panel.session.begin_load("https://a.test/".to_string());
+        panel.start_url_edit();
+        assert_eq!(panel.url_draft, "https://a.test/");
+        assert!(panel.url_replace_on_type);
+        panel.url_edit_insert("example.com");
+        assert_eq!(panel.url_draft, "example.com");
+        panel.url_edit_insert("/path");
+        assert_eq!(panel.url_draft, "example.com/path");
+        panel.url_edit_backspace();
+        assert_eq!(panel.url_draft, "example.com/pat");
+        panel.cancel_url_edit();
+        assert!(!panel.url_editing);
+        assert!(panel.url_draft.is_empty());
     }
 }

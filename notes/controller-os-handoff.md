@@ -14,6 +14,15 @@ hosted app/action contract; the app-process split is historical.
 packaging direction in [browser-home-pivot.md](browser-home-pivot.md); that
 separate-app split was reverted in favour of the single-process Browser.
 
+> **v0.1 header update (2026-11-26):** the Browser now has one header row —
+> Back/L1 · URL well (Triangle edits) · Forward/R1 — inside the 16:9 card.
+> Triangle opens the system OSK with `OskTarget::BrowserUrl`; long URLs use a
+> trailing ellipsis before the right-anchored Triangle prompt, and editing
+> shows the draft tail with a leading ellipsis. The page shrinks by 45px.
+> Tabs, bookmarks, history UI, and status chrome remain absent. The
+> "no address/Triangle→URL removed" lines below describe the original v0 and
+> are superseded by this row.
+
 Read this whole note before touching the Browser UI, the OSK, the pad routing,
 or the MSIX packaging.
 
@@ -130,7 +139,8 @@ Do not re-litigate these unless the user explicitly changes them.
     page/app), except Escape, which is consumed.
 - **F6 is removed** as an OSK shortcut.
 - **Square no longer opens the OSK.**
-- **Triangle no longer opens URL editing.** There is no address entry in v0.
+- **Triangle no longer opens URL editing** in the original v0; superseded by
+  the v0.1 header row (Triangle edits the URL well through the system OSK).
 - OSK keys and its control bar are **not mouse-clickable**; real mouse input
   dismisses the OSK.
 - The OSK mode is a **system setting**: Quadrant default, Grid fallback.
@@ -163,7 +173,8 @@ Do not re-litigate these unless the user explicitly changes them.
 - **Restore the last page** on open.
 - **Popups denied entirely.** `window.open` / `target=_blank` does nothing; no
   new tabs, no popup-as-tab.
-- **No address entry.**
+- **One URL well** with the Triangle edit prompt (v0.1); no separate address
+  toolbar or Go button.
 - **No tabs UI or tab bindings.**
 - **No bookmarks/history UI or bindings.**
 - **No status chrome** (no loading/error/title strip).
@@ -172,8 +183,8 @@ Do not re-litigate these unless the user explicitly changes them.
 - Keep back/forward/reload actions.
 - Keep backends: tabs, session history, bookmarks, history data, exact
   DevTools history-jump code (dormant until the redesign).
-- The Browser is **chrome-less, not UI-less**: it still owns the page surface
-  and page-specific pointer/cursor behavior.
+- The Browser is **page-surface-first, not UI-less**: it owns the page surface,
+  page-specific pointer/cursor behavior, and the one header row.
 
 ### Hosted app UI contract
 
@@ -546,8 +557,9 @@ This is the critical boundary:
 
 ### Navigation/edge cases
 
-- No address entry. Navigation is via page links, page search fields, and
-  back/forward/reload actions.
+- The original v0 has no address entry. The v0.1 header adds one URL well
+  (Triangle edits); navigation otherwise remains page links, page search
+  fields, and back/forward/reload.
 - Restore last page on open; back/forward history should make it recoverable.
 - Page errors have no custom status chrome; the page surface is whatever CEF
   renders (error page/blank).
@@ -765,11 +777,13 @@ Docs to update during implementation:
 - Page cursor/docking/D-pad jumps stay in the Browser app; do not move them to
   the OS or drop them with chrome.
 - OSK is a system input method; never move it back into the Browser app.
-- Cross is the only OSK opener; first Cross on a text field.
-- Real mouse/keyboard/IME/touch closes the OSK; keyboard key hand-off.
-- F6, Square-open, Triangle→URL are removed.
+- Cross opens the OSK for page text; Triangle opens it for the URL well.
+- Real mouse/keyboard/IME/touch closes the OSK; keyboard key hand-off. A
+  mouse/pad/Home close cancels URL editing; keyboard/IME hand-off keeps it.
+- F6 and Square-open are removed; Triangle is the URL editor.
 - No OSK mouse key clicks.
-- No browser chrome, tabs UI, address, bookmarks/history UI, or status chrome.
+- No tab strip, bookmark/history UI, or status chrome. The single header row
+  (Back/URL/Forward) is the only Browser chrome.
 - Single tab v0; popups denied.
 - L1/R1/Options actions; tap only; no hold/history selector/hints.
 - Home/PS is the only Browser close path.

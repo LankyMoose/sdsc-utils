@@ -19,6 +19,7 @@ use quadrant::{Half, HalfView, Layer, QuadrantKeyboard};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OskTarget {
     BrowserPage,
+    BrowserUrl,
     LauncherManualTitle,
     LauncherManualArgs,
 }
@@ -27,6 +28,7 @@ impl OskTarget {
     pub fn label(self) -> &'static str {
         match self {
             Self::BrowserPage => "Browser page",
+            Self::BrowserUrl => "Browser URL",
             Self::LauncherManualTitle => "Shortcut title",
             Self::LauncherManualArgs => "Shortcut arguments",
         }

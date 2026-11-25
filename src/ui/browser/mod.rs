@@ -1,8 +1,8 @@
-//! Browser app UI state and (later) its standalone window view.
+//! Browser app UI state and its standalone window view.
 //!
-//! Phase 0 of Home pivot keeps rendering inside Launcher; only the state moved
-//! here so it no longer belongs to `LauncherState`. See
-//! `notes/browser-Home-pivot.md`.
+//! v0 has one header row (Back / URL / Forward) above the page. See
+//! `notes/browser-embedding.md` for the engine/cursor contract and
+//! `notes/browser-home-pivot.md` for window ownership.
 
 pub mod state;
 pub mod view;

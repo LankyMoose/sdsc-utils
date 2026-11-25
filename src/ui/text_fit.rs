@@ -1,4 +1,4 @@
-//! Pixel-aware single-line truncation (End ellipsis) for browser chrome.
+//! Pixel-aware single-line truncation (end/start ellipsis) for browser chrome.
 //!
 //! Renders nothing itself: it measures with cosmic-text 0.19 (system sans,
 //! matching the stock iced text stack) and returns a pre-truncated string
@@ -85,6 +85,39 @@ pub fn ellipsize_to_width(s: impl AsRef<str>, font_px: f32, max_width_px: f32) -
     chars[..lo].iter().collect::<String>() + ELLIPSIS
 }
 
+/// Truncate from the start, keeping the tail and a leading "…". Used by the
+/// URL editor so the caret end of the draft stays visible while typing.
+pub fn ellipsize_start_to_width(s: impl AsRef<str>, font_px: f32, max_width_px: f32) -> String {
+    let s = s.as_ref();
+    if max_width_px <= 0.0 || s.is_empty() {
+        return String::new();
+    }
+    let budget = (max_width_px - SAFETY_PX).max(0.0);
+    if text_width_px(s, font_px) <= budget {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if text_width_px(ELLIPSIS, font_px) > budget {
+        return String::new();
+    }
+    // Binary search over char count: "…" + longest suffix that fits.
+    let chars: Vec<char> = s.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let start = chars.len() - mid;
+        let candidate: String = ELLIPSIS.to_string() + &chars[start..].iter().collect::<String>();
+        if text_width_px(&candidate, font_px) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let start = chars.len() - lo;
+    ELLIPSIS.to_string() + &chars[start..].iter().collect::<String>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +151,24 @@ mod tests {
         let out = ellipsize_to_width(s, 13.0, 60.0);
         assert!(out.is_char_boundary(out.len()));
         assert!(text_width_px(&out, 13.0) <= 60.0);
+    }
+
+    #[test]
+    fn start_truncation_keeps_the_tail() {
+        let long = "https://www.example.com/some/very/long/page/title/that/overflows";
+        let out = ellipsize_start_to_width(long, 13.0, 120.0);
+        assert!(out.starts_with('…'), "got {out:?}");
+        assert!(out.len() < long.len());
+        assert!(text_width_px(&out, 13.0) <= 120.0);
+        let tail = out.trim_start_matches('…');
+        assert!(long.ends_with(tail));
+    }
+
+    #[test]
+    fn start_truncation_fitting_text_passes_through() {
+        assert_eq!(ellipsize_start_to_width("short", 13.0, 400.0), "short");
+        assert_eq!(ellipsize_start_to_width("", 13.0, 400.0), "");
+        assert_eq!(ellipsize_start_to_width("hello", 13.0, 0.0), "");
     }
 
     #[test]

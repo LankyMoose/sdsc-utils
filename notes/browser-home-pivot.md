@@ -15,10 +15,11 @@ overlay, app selection, the engine backend, or MSIX packaging.
 > again, and the optional CEF engine DLC is the only optional payload. See
 > [single-process-browser.md](single-process-browser.md).
 >
-> **v0 update (Phases A–C landed):** the in-process Browser is chrome-less
-> and single-tab (page surface + cursor + page text only); the OSK is system
-> owned; L1/R1/Options map to semantic back/forward/reload; popups are denied.
-> The app split below (Phase D) was reverted; keep the Browser in-process.
+> **v0 update (Phases A–C landed, v0.1 header):** the in-process Browser is
+> single-tab with one header row — Back/L1 · URL well (Triangle edits) ·
+> Forward/R1 — above the page cursor/text surface. The OSK is system owned;
+> L1/R1/Options map to semantic back/forward/reload; popups are denied. The app
+> split below (Phase D) was reverted; keep the Browser in-process.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
@@ -73,9 +74,9 @@ half-measures, no `fetch.rs` text fallback).
   best-effort. Auto-open behavior (toast-first latch, USB scope, `AfterToast`
   settle, PS-chord suppression, `WindowClosed` retry) moves from Launcher to Home;
   pref key migrates (`Never`/`Bluetooth`/`Any`, default `Any`).
-- **Browser window:** fullscreen immersive, own tab strip + toolbar +
-  bookmarks + page + status strip (current geometry, minus the Launcher
-  wash/card surround).
+- **Browser window:** fullscreen immersive. v0.1 renders one header row
+  (Back/L1 · URL well · Forward/R1) above the page; the tab strip/toolbar/
+  bookmarks/status strip remain the future target, not current geometry.
 
 ## Target shape
 
@@ -132,8 +133,8 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    window close/suspend/focus return. Home is routed before Browser; Browser
    before Launcher. The live window renders a **16:9 card**, height-driven at
    `window height - 100px` (50px breather per side), centered on the monitor
-   with the tab/toolbar/bookmark header inside it; `browser_layout` is the
-   single geometry source for both the card and the engine viewport.
+   with the one-row header inside it; `browser_layout` is the single geometry
+   source for both the card and the engine viewport.
 3. **CEF backend behind the existing `EngineCommand`/`EngineEvent` seam. —
    landed (dev).** `src/browser/cef_backend.rs` owns CEF init + a worker;
    `FrameSlot` and the custom shader pipeline are reused (the frame texture

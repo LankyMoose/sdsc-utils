@@ -1,10 +1,9 @@
 //! Top-level Browser app state.
 //!
-//! Phase 0 of Home pivot lifts the browser out of `LauncherState`: the panel,
-//! engine handle, capability flag, and browser-only D-pad stepper live here so
-//! the browser no longer disappears when the Launcher is not the owner.
-//! Behavior is unchanged — Launcher still renders the panel until the standalone
-//! Browser window lands. See `notes/browser-Home-pivot.md`.
+//! Owns the standalone Browser window: panel, engine handle, capability flag,
+//! pad/key routing, URL editor, and the browser-only D-pad stepper. The window
+//! renders a one-row header (Back / URL / Forward) above the CEF page; see
+//! `notes/browser-embedding.md` for the engine/cursor contract.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
 use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadId};
@@ -409,9 +408,16 @@ impl super::App {
                 };
                 let modifiers = replay_modifiers(step.params.get("modifiers"));
                 // Synthetic real keyboard: close the OSK first; Escape is
-                // consumed, other keys still reach the page (hand-off).
-                let close = self.close_osk("keyboard");
-                if matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc") {
+                // consumed, other keys still reach the page (hand-off). An
+                // Escape that cancels URL editing is not a plain hand-off.
+                let escape = matches!(key.to_ascii_lowercase().as_str(), "escape" | "esc");
+                let reason = if escape && self.browser.panel.url_editing {
+                    "url_cancel"
+                } else {
+                    "keyboard"
+                };
+                let close = self.close_osk(reason);
+                if escape {
                     return close;
                 }
                 if self.launcher_state.manual_add.is_some() && !self.browser_visible {
@@ -1072,6 +1078,9 @@ impl super::App {
     }
 
     fn on_browser_page_pointer_moved(&mut self, x: f32, y: f32) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.cancel_browser_url_edit();
+        }
         if !crate::platform::debug_quiet::input_dropped() {
             self.inject_browser_move(x, y);
         }
@@ -1079,6 +1088,9 @@ impl super::App {
     }
 
     fn on_browser_page_press(&mut self) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.cancel_browser_url_edit();
+        }
         if crate::platform::debug_quiet::input_dropped() {
             return Task::none();
         }
@@ -1106,6 +1118,9 @@ impl super::App {
     }
 
     fn on_browser_page_wheel(&mut self, dx: i32, dy: i32) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.cancel_browser_url_edit();
+        }
         if crate::platform::debug_quiet::input_dropped() {
             return Task::none();
         }
@@ -1357,7 +1372,7 @@ impl super::App {
 
 impl super::App {
     /// Show the standalone Browser window (idempotent). Restores the persisted
-    /// tab strip on a fresh session, else resumes the cached page.
+    /// saved page on a fresh session, else resumes the cached page.
     pub(crate) fn open_browser_window(&mut self) -> Task<Message> {
         if self.browser_visible
             && let Some(id) = self.browser_window
@@ -1394,6 +1409,9 @@ impl super::App {
         // A new window can land on a different monitor; the cover drives the
         // first layout until its own resize event arrives.
         self.browser_window_size = None;
+        self.browser.panel.l1_held = false;
+        self.browser.panel.r1_held = false;
+        self.browser.panel.triangle_held = false;
         self.sync_browser_viewport();
         // Center before the first frame, not after the window has painted the
         // previous open's cursor position.
@@ -1429,7 +1447,7 @@ impl super::App {
             self.resume_browser_engine();
             opened
         } else {
-            // Fresh surface: open the tab strip (restore) or the default page.
+            // Fresh surface: restore the saved page or open the default page.
             opened.chain(self.open_browser_session())
         };
         close_start
@@ -1560,6 +1578,9 @@ impl super::App {
         tap_actions: &[PadAction],
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
+        self.browser.panel.l1_held = readings.iter().any(|reading| reading.sample.l1);
+        self.browser.panel.r1_held = readings.iter().any(|reading| reading.sample.r1);
+        self.browser.panel.triangle_held = readings.iter().any(|reading| reading.sample.triangle);
         if readings.is_empty() {
             return Task::none();
         }
@@ -1639,6 +1660,9 @@ impl super::App {
                         Task::none()
                     }
                     Some(NavAction::Confirm) => self.click_browser_cursor(),
+                    // Triangle is the URL editor; page navigation itself
+                    // never uses it.
+                    Some(NavAction::Triangle) => self.on_browser_url_edit(),
                     // Escape does not close the Browser; Home/PS is the only
                     // close path.
                     Some(NavAction::Cancel) => self.browser_cancel(),
@@ -1676,6 +1700,7 @@ impl super::App {
                     self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
                 Some(NavAction::Confirm) => self.on_browser_go_default(),
+                Some(NavAction::Triangle) => self.on_browser_url_edit(),
                 Some(NavAction::Cancel) => self.browser_cancel(),
                 _ => Task::none(),
             }
@@ -1684,7 +1709,84 @@ impl super::App {
 
     /// Escape no longer closes the Browser; Home/PS is the only close path.
     pub(crate) fn browser_cancel(&mut self) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.cancel_browser_url_edit();
+        }
         Task::none()
+    }
+
+    /// Open the URL editor (Triangle). If already editing, commit instead.
+    pub(crate) fn on_browser_url_edit(&mut self) -> Task<Message> {
+        if self.browser.panel.url_editing {
+            return self.commit_browser_url_edit();
+        }
+        self.browser.panel.start_url_edit();
+        self.request_osk_open(crate::ui::osk::OskTarget::BrowserUrl)
+    }
+
+    /// Commit the URL draft through the same navigate funnel as page links.
+    pub(crate) fn commit_browser_url_edit(&mut self) -> Task<Message> {
+        if !self.browser.panel.url_editing {
+            return Task::none();
+        }
+        let draft = self.browser.panel.url_draft.trim().to_string();
+        self.browser.panel.cancel_url_edit();
+        let close = if self.osk.state.open
+            && self.osk.state.target == Some(crate::ui::osk::OskTarget::BrowserUrl)
+        {
+            self.close_osk("url_commit")
+        } else {
+            Task::none()
+        };
+        let redraw = self.invalidate_browser_window();
+        if draft.is_empty() {
+            return close.chain(redraw);
+        }
+        close.chain(self.navigate_browser_to(draft)).chain(redraw)
+    }
+
+    /// Cancel URL editing and dismiss the OSK when it belongs to the URL well.
+    pub(crate) fn cancel_browser_url_edit(&mut self) -> Task<Message> {
+        if self.osk.state.open
+            && self.osk.state.target == Some(crate::ui::osk::OskTarget::BrowserUrl)
+        {
+            return self.close_osk("url_cancel");
+        }
+        self.browser.panel.cancel_url_edit();
+        self.invalidate_browser_window()
+    }
+
+    /// Force the Browser window to redraw after header-only state changes.
+    /// The debug replay `text` path drops returned tasks, but the OSK/hardware
+    /// editing paths chain this so the URL draft is visible as it grows.
+    pub(crate) fn invalidate_browser_window(&self) -> Task<Message> {
+        self.browser_window
+            .map(crate::ui::layout::invalidate_window)
+            .unwrap_or_else(Task::none)
+    }
+
+    /// Hardware-keyboard editing of the URL draft. The system keyboard feeds
+    /// the same state through `apply_osk_*`; neither path reaches CEF while
+    /// the URL well owns text.
+    fn on_browser_url_key(&mut self, raw: crate::browser::keys::RawKey) -> Task<Message> {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+        if !raw.pressed || raw.modifiers.control() || raw.modifiers.alt() {
+            return Task::none();
+        }
+        match &raw.key {
+            Key::Character(value) => {
+                self.browser.panel.url_edit_insert(value);
+                self.invalidate_browser_window()
+            }
+            Key::Named(Named::Backspace) => {
+                self.browser.panel.url_edit_backspace();
+                self.invalidate_browser_window()
+            }
+            Key::Named(Named::Enter) => self.commit_browser_url_edit(),
+            Key::Named(Named::Escape) => self.cancel_browser_url_edit(),
+            _ => Task::none(),
+        }
     }
 
     /// Platform IME events for the page. These become CEF
@@ -1696,6 +1798,9 @@ impl super::App {
     ) -> Task<Message> {
         use iced::advanced::input_method::Event;
         if Some(id) != self.browser_window || !self.browser_visible {
+            return Task::none();
+        }
+        if self.browser.panel.url_editing {
             return Task::none();
         }
         let tab = self.browser_tab();
@@ -1747,6 +1852,9 @@ impl super::App {
         use iced::keyboard::key::Named;
         self.browser.panel.page_mouse_modifiers =
             crate::browser::keys::engine_modifiers(&raw.modifiers);
+        if self.browser.panel.url_editing {
+            return self.on_browser_url_key(raw);
+        }
         if matches!(raw.key, Key::Named(Named::Escape)) {
             if !raw.pressed {
                 return Task::none();
