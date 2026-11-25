@@ -118,6 +118,8 @@ def main() -> int:
     # contract and keeps the script safe if replay behavior changes.
     env["SDSC_DEBUG_QUIET"] = "1"
     env["SDSC_DEBUG_INPUT"] = "0"
+    # Replay QA still targets the transitional in-process Browser.
+    env["SDSC_BROWSER_REMOTE"] = "0"
     print(f"session={session}")
     print(f"exe={exe}")
     proc = subprocess.Popen(

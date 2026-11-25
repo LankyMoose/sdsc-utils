@@ -132,6 +132,8 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
     env = os.environ.copy()
     env["SDSC_DEBUG_QUIET"] = "1"
     env["SDSC_DEBUG_INPUT"] = "0"
+    # Replay QA still targets the transitional in-process Browser.
+    env["SDSC_BROWSER_REMOTE"] = "0"
     env["SDSC_OSK_MODE"] = mode
     print(f"session={session}")
     proc = subprocess.Popen(

@@ -145,6 +145,8 @@ def main() -> int:
     env = os.environ.copy()
     env["SDSC_DEBUG_QUIET"] = "1"
     env["SDSC_DEBUG_INPUT"] = "0"
+    # Replay QA still targets the transitional in-process Browser.
+    env["SDSC_BROWSER_REMOTE"] = "0"
     print(f"session={session}")
     proc = subprocess.Popen(
         [str(exe), "--trace-replay", str(session), "--flow", "1"],

@@ -14,7 +14,24 @@ use std::sync::mpsc::Receiver;
 use super::{App, Message};
 
 pub fn remote_enabled() -> bool {
-    std::env::var_os("SDSC_BROWSER_REMOTE").is_some()
+    match std::env::var("SDSC_BROWSER_REMOTE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => addon_path().is_some(),
+    }
+}
+
+fn addon_path() -> Option<std::path::PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "sdsc-browser.exe"
+    } else {
+        "sdsc-browser"
+    };
+    let path = current.with_file_name(name);
+    path.is_file().then_some(path)
 }
 
 pub struct BrowserRemote {
@@ -27,16 +44,9 @@ pub struct BrowserRemote {
 
 impl BrowserRemote {
     pub fn spawn() -> Result<Self, String> {
-        let current = std::env::current_exe().map_err(|err| err.to_string())?;
-        let name = if cfg!(windows) {
-            "sdsc-browser.exe"
-        } else {
-            "sdsc-browser"
-        };
-        let exe = current.with_file_name(name);
-        if !exe.is_file() {
-            return Err(format!("browser add-on not found: {}", exe.display()));
-        }
+        let exe = addon_path().ok_or_else(|| {
+            "browser add-on executable not found next to the main app".to_string()
+        })?;
         let mut child = Command::new(&exe)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -299,6 +309,18 @@ impl App {
     pub(crate) fn remote_browser_osk(&mut self, open: bool) {
         if let Some(remote) = &mut self.browser.remote {
             remote.send(HostMessage::OskState { open });
+        }
+    }
+
+    pub(crate) fn remote_browser_pause(&mut self) {
+        if let Some(remote) = &mut self.browser.remote {
+            remote.send(HostMessage::Lifecycle(LifecycleCommand::Pause));
+        }
+    }
+
+    pub(crate) fn remote_browser_resume(&mut self) {
+        if let Some(remote) = &mut self.browser.remote {
+            remote.send(HostMessage::Lifecycle(LifecycleCommand::Resume));
         }
     }
 }

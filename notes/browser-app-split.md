@@ -2,7 +2,7 @@
 
 **Decision:** the Browser becomes a separate optional process/executable
 (`sdsc-browser`), not a DLL/module. Main app remains the OS/shell.
-**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`6e1a201`/`6e8fbd3`: `src/bin/sdsc-browser.rs` + `src/browser/server.rs`). D2b host supervisor landed behind `SDSC_BROWSER_REMOTE=1` (`src/app/browser_remote.rs`); main still defaults to the in-process Browser. Remove the in-process default and package next.
+**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`6e1a201`/`6e8fbd3`: `src/bin/sdsc-browser.rs` + `src/browser/server.rs`). D2b/D2c host supervisor + OSK real-input bridge landed. The main app now prefers the add-on when `sdsc-browser` sits next to it; `SDSC_BROWSER_REMOTE=0` keeps the in-process fallback for replay QA. Full in-process removal and packaging next.
 
 ## Transport
 

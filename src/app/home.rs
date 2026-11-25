@@ -243,6 +243,7 @@ impl App {
             height: 1080.0,
         });
         let close_osk = self.close_osk("home");
+        self.remote_browser_pause();
         // The backdrop always covers the monitor; the card scales/centers
         // inside it. On an opaque backend the scrim blends over the opaque
         // clear color instead of the desktop.
@@ -341,6 +342,7 @@ impl App {
         let task = window::close(id).chain(self.rehost_toast_after_composite());
         if self.browser_visible {
             if self.browser.remote.is_some() {
+                self.remote_browser_resume();
                 self.remote_browser_focus();
             } else if let Some(browser) = self.browser_window {
                 return task.chain(focus_window(browser));
