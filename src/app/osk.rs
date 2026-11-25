@@ -143,14 +143,6 @@ impl App {
         window::set_mode(id, window::Mode::Hidden)
     }
 
-    /// Close only when the OSK is currently targeting `target` (e.g. the page
-    /// text session blurred).
-    pub(crate) fn close_osk_if_target(&mut self, target: OskTarget, reason: &'static str) {
-        if self.osk.state.open && self.osk.state.target == Some(target) {
-            let _ = self.close_osk(reason);
-        }
-    }
-
     pub(crate) fn set_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
         self.osk.state.set_mode(mode);
         if let Some(id) = self.osk.window {
@@ -183,7 +175,7 @@ impl App {
         if escape {
             return close;
         }
-        close.chain(self.on_browser_raw_key(id, raw))
+        close.chain(self.on_shell_key(id, raw))
     }
 
     /// Pad tick while the OSK is open. The system owns the pad before the host

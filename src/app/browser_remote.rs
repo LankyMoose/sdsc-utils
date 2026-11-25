@@ -27,11 +27,6 @@ pub(crate) fn addon_available() -> bool {
     addon_path().is_some()
 }
 
-#[cfg(feature = "cef-engine")]
-pub(crate) fn addon_path_for_status() -> Option<std::path::PathBuf> {
-    addon_path()
-}
-
 fn addon_path() -> Option<std::path::PathBuf> {
     let name = if cfg!(windows) {
         "sdsc-browser.exe"
@@ -57,6 +52,7 @@ pub struct BrowserRemote {
     events: Receiver<BrowserEvent>,
     pub last_error: Option<String>,
     seq: u64,
+    #[cfg(debug_assertions)]
     replay_seq: u64,
 }
 
@@ -96,6 +92,7 @@ impl BrowserRemote {
             events,
             last_error: None,
             seq: 0,
+            #[cfg(debug_assertions)]
             replay_seq: 0,
         })
     }
@@ -122,6 +119,7 @@ impl BrowserRemote {
         self.send(HostMessage::Input(edge));
     }
 
+    #[cfg(debug_assertions)]
     pub fn send_replay(&mut self, action: &str, params: serde_json::Value) {
         self.replay_seq = self.replay_seq.wrapping_add(1);
         self.send(HostMessage::Replay {
@@ -235,7 +233,6 @@ impl App {
             Ok(remote) => {
                 self.browser.remote = Some(remote);
                 self.browser_visible = true;
-                self.browser_pending_show = false;
                 let _ = self.home_apps.open(crate::app::home::AppId::Browser);
                 crate::controller::hid::diag::diag_info("ui-diag: browser add-on process open");
                 Task::none()
@@ -254,7 +251,6 @@ impl App {
             self.browser.remote_spec = None;
         }
         self.browser_visible = false;
-        self.browser_pending_show = false;
         let _ = self.home_apps.close(crate::app::home::AppId::Browser);
         crate::controller::hid::diag::diag_info("ui-diag: browser add-on process close");
         self.close_osk("browser_close")
@@ -340,10 +336,8 @@ impl App {
                 .field("known_app", true)
                 .field("enabled", enabled)
                 .emit();
-            if enabled {
-                if let Some(remote) = &mut self.browser.remote {
-                    remote.send(HostMessage::Action(invoked));
-                }
+            if enabled && let Some(remote) = &mut self.browser.remote {
+                remote.send(HostMessage::Action(invoked));
             }
             return Task::none();
         }

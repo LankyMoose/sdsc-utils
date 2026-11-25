@@ -14,10 +14,11 @@ overlay, app selection, the engine backend, or MSIX packaging.
 > CEF/Home/DLC history here remains useful, but the packaging/ownership plan
 > is revised by [controller-os-handoff.md](controller-os-handoff.md).
 >
-> **v0 update (Phases A–C landed):** the in-process Browser is chrome-less
-> and single-tab (page surface + cursor + page text only); the OSK is system
-> owned; L1/R1/Options map to semantic back/forward/reload; popups are denied.
-> The app split/packaging below (Phase D) remains future work.
+> **v0 update (Phases A–D process split landed):** the Browser is chrome-less,
+> single-tab, and runs in the `sdsc-browser` add-on (window + CEF + page
+> surface + cursor + text session). The OSK is system owned;
+> L1/R1/Options map to semantic back/forward/reload; popups are denied. The
+> in-process Browser window path is removed. MSIX/Store packaging remains.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 

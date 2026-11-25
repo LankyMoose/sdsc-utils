@@ -1,8 +1,10 @@
 # Controller OS handoff: Browser app, hosted UI contract, system OSK
 
 **Status:** Phases A–C implemented on `browser/main` (Browser v0, system OSK,
-hosted contract v0 + Launcher Settings proof). Phase D started: D1 protocol
-crate landed (`crates/browser-protocol/`); process split/packaging remain.
+hosted contract v0 + Launcher Settings proof). Phase D process split landed:
+protocol crate, `sdsc-browser` add-on, host supervisor, remote replay, and
+removal of the in-process Browser window/CEF path. Remaining D3 work is
+MSIX/Store packaging, add-on update/related-set policy, and data migration.
 Phase E (chrome redesign) remains open.
 **Scope:** controller-OS architecture, Browser v0 chrome removal, system OSK,
 hosted app/action contract, Browser app split/packaging.
@@ -657,10 +659,11 @@ packaging decisions are settled. Do not attempt the full split in the first PR.
 
 ### Phase D — Browser app split/packaging
 
-- Settle IPC/input/overlay/packaging decisions.
-- Split Browser into its own executable/add-on; main app keeps OS/shell/OSK.
-- Home install/launch/update flow.
-- Remove Browser UI/CEF from the main binary; tree-shake.
+- [x] Settle IPC/input/overlay/packaging decisions.
+- [x] Split Browser into its own executable/add-on; main app keeps OS/shell/OSK.
+- [x] Remove the in-process Browser window/CEF path; replay now targets the add-on.
+- [ ] Home install/launch/update flow for the add-on app itself.
+- [ ] MSIX/Store packaging, related-set policy, and data migration.
 
 ### Phase E — Future redesign
 

@@ -2,7 +2,14 @@
 
 **Decision:** the Browser becomes a separate optional process/executable
 (`sdsc-browser`), not a DLL/module. Main app remains the OS/shell.
-**Status:** D1 protocol crate landed (`6e1a201`). D2a Browser add-on process landed (`6e1a201`/`6e8fbd3`: `src/bin/sdsc-browser.rs` + `src/browser/server.rs`). D2b/D2c host supervisor + OSK real-input bridge landed. The main app prefers `sdsc-browser` next to the exe, then `<data>/browser-addon/` (local install via `scripts/install_browser_addon.py`); `SDSC_BROWSER_REMOTE=0` keeps the in-process fallback for replay QA. Full in-process removal and MSIX/Store packaging remain.
+**Status:** D1 protocol crate (`6e1a201`), D2 add-on process + host supervisor
+(`6e8fbd3`..`cb5b2d4`), D2e remote replay (`fc1a3e3`), and D2f in-process
+removal are landed. `sdsc-browser` owns its window/CEF/cursor/text session;
+the main app owns Home/PS, HID, system OSK, lifecycle, and the engine package.
+The add-on is resolved next to the main exe, then
+`<data>/browser-addon/` (install via `scripts/install_browser_addon.py`).
+There is no in-process Browser fallback; `SDSC_BROWSER_REMOTE=0` disables the
+Browser for automation. MSIX/Store packaging remains D3.
 
 ## Transport
 
@@ -47,9 +54,18 @@ implement the same message directions.
 2. Host supervisor: spawn/connect, hello handshake, stdin/stdout reader/writer
    threads, exit/crash handling, pause/resume/focus messages.
 3. Main integration: Home Browser tile launches the process; track visibility;
-   remove the in-process Browser window path when the add-on is present.
+   pause/resume it around Home.
 4. Stream HID edges/actions; route OSK text/hand-off; apply action state.
-5. QA: existing replay stays in-process until a cross-process replay driver is
-   designed; add a protocol/server smoke test that launches a fake child.
-6. Packaging (D3): local add-on + data migration first; MSIX/Store related-set
-   decision after the process path works.
+5. Replay is forwarded to the add-on (`HostMessage::Replay`) and answered with
+   `BrowserEvent::ReplayState`; all browser QA scripts run against the child.
+6. Packaging (D3): local add-on install landed; MSIX/Store related-set policy
+   and data migration remain.
+
+## What was removed
+
+The main app no longer creates a Browser window, spawns CEF, owns a
+`BrowserPanel`, subscribes to engine events, or routes page keyboard/mouse/IME.
+Those paths now live only in `src/browser/server.rs` and the `sdsc-browser`
+binary. Shell keyboard routing is `Message::ShellKey`; the Browser window
+receives its own physical input. Diagnostics screenshots are replay-driven in
+the add-on (`HostMessage::Replay` action `screenshot`).

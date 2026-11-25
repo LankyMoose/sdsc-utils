@@ -365,11 +365,6 @@ impl App {
         if let Some(id) = self.configure_window {
             return focus_window(id);
         }
-        if self.browser_visible
-            && let Some(id) = self.browser_window
-        {
-            return focus_window(id);
-        }
         if self.launcher_visible
             && let Some(id) = self.launcher_window
         {

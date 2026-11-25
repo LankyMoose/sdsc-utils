@@ -41,6 +41,17 @@ def recv(proc: subprocess.Popen) -> dict | None:
     return json.loads(proc.stdout.read(size))
 
 
+def recv_until(proc: subprocess.Popen, kind: str, timeout: float = 10.0) -> dict | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        event = recv(proc)
+        if event is None:
+            return None
+        if event.get("kind") == kind:
+            return event
+    return None
+
+
 def protocol_check(exe: Path, data_dir: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["SDSC_DEBUG_QUIET"] = "1"
@@ -68,11 +79,46 @@ def protocol_check(exe: Path, data_dir: Path) -> tuple[bool, str]:
         if not ready or ready.get("kind") != "ready":
             return False, f"browser did not return Ready: {ready!r}"
         send(proc, {"kind": "lifecycle", "pause": None})
+        paused = recv_until(proc, "lifecycle")
+        if not paused or paused.get("paused") != None:
+            return False, f"browser did not report Paused: {paused!r}"
         send(proc, {"kind": "lifecycle", "resume": None})
+        resumed = recv_until(proc, "lifecycle")
+        if not resumed or resumed.get("running") != None:
+            return False, f"browser did not report Running: {resumed!r}"
+
+        page = data_dir / "remote.html"
+        page.write_text("<title>remote qa</title><h1>remote</h1>", encoding="utf-8")
+        send(
+            proc,
+            {
+                "kind": "replay",
+                "id": 1,
+                "action": "navigate",
+                "params": {"url": page.as_uri()},
+            },
+        )
+        state = recv_until(proc, "replay_state")
+        if not state or not str(state.get("state", {}).get("ui", {}).get("url", "")).endswith(
+            "/remote.html"
+        ):
+            return False, f"replay navigate did not reach the add-on: {state!r}"
+        send(proc, {"kind": "text", "insert": "ok"})
+        send(
+            proc,
+            {
+                "kind": "action",
+                "app": "browser",
+                "action": "reload",
+            },
+        )
         send(proc, {"kind": "lifecycle", "shutdown": None})
         proc.wait(timeout=15)
         if proc.returncode != 0:
             return False, f"browser exited {proc.returncode}"
+        tabs = data_dir / "tabs.json"
+        if not tabs.is_file() or "remote.html" not in tabs.read_text(encoding="utf-8"):
+            return False, "browser did not persist the replayed page"
         return True, "protocol ok"
     finally:
         if proc.poll() is None:
@@ -170,6 +216,46 @@ def host_check(main: Path, data_dir: Path) -> tuple[bool, str]:
             proc.kill()
 
 
+def home_check(main: Path, data_dir: Path) -> tuple[bool, str]:
+    env = os.environ.copy()
+    env["SDSC_DEBUG_OPEN"] = "browser,home"
+    env["SDSC_DEBUG_QUIET"] = "1"
+    env["SDSC_DEBUG_INPUT"] = "0"
+    env["SDSC_DATA_DIR"] = str(data_dir)
+    env.pop("SDSC_BROWSER_REMOTE", None)
+    proc = subprocess.Popen(
+        [str(main)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        log = data_dir / "app.log"
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+            if (
+                "browser add-on process open" in text
+                and "browser add-on lifecycle Paused" in text
+            ):
+                return True, "Home paused the Browser add-on"
+            if proc.poll() is not None:
+                return False, f"main app exited {proc.returncode}"
+            time.sleep(0.5)
+        return False, "Home did not pause the add-on"
+    finally:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def main() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -191,6 +277,12 @@ def main() -> int:
     data.mkdir(parents=True, exist_ok=True)
     ok, message = host_check(main_exe, data)
     print(f"host: {message}")
+    if not ok:
+        return 1
+    data = base / "home"
+    data.mkdir(parents=True, exist_ok=True)
+    ok, message = home_check(main_exe, data)
+    print(f"home: {message}")
     return 0 if ok else 1
 
 

@@ -260,7 +260,7 @@ impl App {
         self.sync_home_settings();
         self.home_state.on_open(
             self.session.prefs.home_enabled,
-            self.browser.engine_status.is_ready(),
+            self.browser.engine_available && self.browser.engine_status.is_ready(),
         );
         // `on_open` resets transient screens; engine info and settings are
         // persistent shell state, so re-apply them after the reset.
@@ -341,12 +341,8 @@ impl App {
         };
         let task = window::close(id).chain(self.rehost_toast_after_composite());
         if self.browser_visible {
-            if self.browser.remote.is_some() {
-                self.remote_browser_resume();
-                self.remote_browser_focus();
-            } else if let Some(browser) = self.browser_window {
-                return task.chain(focus_window(browser));
-            }
+            self.remote_browser_resume();
+            self.remote_browser_focus();
         }
         if self.launcher_visible
             && let Some(start) = self.launcher_window
@@ -821,9 +817,9 @@ impl App {
                 self.close_home().chain(self.open_launcher())
             }
             home_view::HomeTile::Browser => {
-                if self.browser.engine.is_none() {
+                if !self.browser.engine_available || !self.browser.engine_status.is_ready() {
                     crate::controller::hid::diag::diag_info(
-                        "ui-diag: home Browser requested but engine not installed",
+                        "ui-diag: home Browser requested but add-on not installed",
                     );
                     self.home_state.open_apps_menu(0);
                     return Task::none();
