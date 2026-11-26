@@ -132,6 +132,19 @@ impl InputHub {
         }
     }
 
+    /// Latest preferred reading for pull-model consumers (cursor, holds).
+    ///
+    /// The snapshot is published by the worker at report rate regardless of
+    /// whether an edge subscription is active. `max_age` treats a stalled or
+    /// disconnected worker as neutral so a stale held stick cannot steer.
+    pub fn latest_reading(&self, max_age: Duration) -> Option<NavReading> {
+        let guard = self.snapshot.lock().ok()?;
+        if guard.published_at.elapsed() > max_age {
+            return None;
+        }
+        preferred_reading(&guard.readings).cloned()
+    }
+
     /// Install the iced-side sender so the worker can push edges (subscription start).
     pub fn bind(&self, tx: iced::futures::channel::mpsc::Sender<InputEdge>) {
         if let Ok(mut guard) = self.edge_tx.lock() {
@@ -1361,6 +1374,10 @@ pub struct HoldTracker {
     holding: bool,
     /// After cancel (e.g. Circle), ignore this press until release.
     suppress_until_release: bool,
+    /// Release stamp for wall-clock decay. Progress is pulled from this, so a
+    /// stopped pad edge stream cannot freeze the ring or make the next edge
+    /// subtract the whole gap in one step.
+    released_at: Option<Instant>,
 }
 
 const BUTTON_HOLD: Duration = Duration::from_secs(1);
@@ -1393,16 +1410,23 @@ impl HoldTracker {
             self.charge = 0.0;
             self.last_tick = None;
             self.holding = false;
+            self.released_at = None;
             return (0.0, false);
         }
 
-        let dt = self
-            .last_tick
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0);
-        self.last_tick = Some(now);
-
         if held {
+            // Re-press during decay: materialize the wall-clock pose before
+            // adding new charge, so a brief tap resumes from where the ring
+            // actually is instead of from the stale release value.
+            if self.released_at.is_some() {
+                self.charge = hold_ease_out_inv(self.progress_at(now));
+                self.released_at = None;
+            }
+            let dt = self
+                .last_tick
+                .map(|t| now.saturating_duration_since(t).as_secs_f32())
+                .unwrap_or(0.0);
+            self.last_tick = Some(now);
             self.holding = true;
             self.charge = (self.charge + dt / BUTTON_HOLD.as_secs_f32()).min(1.0);
             return (hold_ease_out(self.charge), false);
@@ -1412,24 +1436,59 @@ impl HoldTracker {
         if self.charge >= 1.0 {
             self.charge = 0.0;
             self.last_tick = None;
+            self.released_at = None;
             return (0.0, true);
         }
 
         if self.charge <= 0.0 {
             self.charge = 0.0;
             self.last_tick = None;
+            self.released_at = None;
             return (0.0, false);
         }
 
-        let mut progress = hold_ease_out(self.charge);
-        progress = (progress - dt / BUTTON_DECAY.as_secs_f32()).max(0.0);
+        // First release stamps the decay start; later samples (or frame
+        // polls) read the same stamp instead of integrating per-message dt.
+        if self.released_at.is_none() {
+            self.released_at = Some(now);
+            self.last_tick = None;
+        }
+        let progress = self.progress_at(now);
         if progress <= 0.0 {
             self.charge = 0.0;
             self.last_tick = None;
-            return (0.0, false);
+            self.released_at = None;
         }
-        self.charge = hold_ease_out_inv(progress);
         (progress, false)
+    }
+
+    /// Current ring fill without mutating the tracker. Decay is derived from
+    /// the release stamp, so this is safe to call from a window frame clock
+    /// even when no pad edges are arriving.
+    pub fn progress_at(&self, now: Instant) -> f32 {
+        if self.suppress_until_release || self.charge <= 0.0 {
+            return 0.0;
+        }
+        let base = hold_ease_out(self.charge);
+        if self.holding {
+            return base;
+        }
+        let Some(released_at) = self.released_at else {
+            return base;
+        };
+        let elapsed = now.saturating_duration_since(released_at).as_secs_f32();
+        (base - elapsed / BUTTON_DECAY.as_secs_f32()).max(0.0)
+    }
+
+    /// True while charging or while released progress is still decaying.
+    pub fn is_animating(&self, now: Instant) -> bool {
+        self.holding || self.progress_at(now) > 0.0
+    }
+
+    /// True while this tracker still owns charge (including a decay that has
+    /// reached zero but has not yet been reaped by an update).
+    pub fn is_tracking(&self) -> bool {
+        self.holding || self.charge > 0.0
     }
 
     /// True while the button is held and charging or full (not decaying, not suppressed).
@@ -1443,6 +1502,7 @@ impl HoldTracker {
         self.last_tick = None;
         self.holding = false;
         self.suppress_until_release = true;
+        self.released_at = None;
     }
 
     pub fn reset(&mut self) {
@@ -2072,6 +2132,29 @@ impl NavBank {
         }
     }
 
+    /// Wall-clock hold progress across every live pad, without mutating the
+    /// trackers. Surfaces pull this from their frame clock so release decay
+    /// continues after the pad edge stream goes quiet.
+    pub fn hold_progress(&self, now: Instant) -> (f32, f32) {
+        self.slots
+            .values()
+            .fold((0.0, 0.0), |(cross, triangle), slot| {
+                (
+                    cross.max(slot.cross_hold.progress_at(now)),
+                    triangle.max(slot.triangle_hold.progress_at(now)),
+                )
+            })
+    }
+
+    /// True while any pad still owns hold charge (including a decay that has
+    /// reached zero). Frame clocks use this to avoid overwriting keyboard
+    /// hold progress owned by the same surface.
+    pub fn has_hold_activity(&self) -> bool {
+        self.slots
+            .values()
+            .any(|slot| slot.cross_hold.is_tracking() || slot.triangle_hold.is_tracking())
+    }
+
     /// Sync presence, update every pad's edge/hold state, emit at most one action.
     ///
     /// `allow_nav_move` gates D-pad/stick repeats (false while chrome animates).
@@ -2139,7 +2222,7 @@ impl NavBank {
                     result.cross_completed = true;
                     result.cross_completed_pad = Some(reading.id.clone());
                 }
-                slot.triangle_hold.reset();
+                slot.triangle_hold.cancel();
 
                 let stick_interrupt = reading.sample.dpad_up
                     || reading.sample.dpad_down
@@ -2187,11 +2270,11 @@ impl NavBank {
                     result.cross_completed_pad = None;
                 }
             } else {
-                slot.cross_hold.reset();
+                slot.cross_hold.cancel();
             }
 
             let hold_owned = if hold_cross_close {
-                slot.triangle_hold.reset();
+                slot.triangle_hold.cancel();
                 Some(HoldOwner::Cross)
             } else if hold_triangle_power {
                 let (t_progress, t_completed) =
@@ -2205,7 +2288,7 @@ impl NavBank {
                 }
                 Some(HoldOwner::Triangle)
             } else {
-                slot.triangle_hold.reset();
+                slot.triangle_hold.cancel();
                 None
             };
 
@@ -3126,6 +3209,30 @@ mod tests {
     }
 
     #[test]
+    fn input_hub_latest_reading_honors_age() {
+        let hub = InputHub::new();
+        hub.publish(
+            vec![reading(
+                "hid:pad1",
+                PadSample {
+                    lstick_x: -0.95,
+                    ..Default::default()
+                },
+            )],
+            SnapshotReason::Sample,
+        );
+        let latest = hub
+            .latest_reading(Duration::from_millis(200))
+            .expect("fresh snapshot");
+        assert_eq!(latest.sample.lstick_x, -0.95);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            hub.latest_reading(Duration::from_millis(1)).is_none(),
+            "a stale snapshot must be treated as neutral"
+        );
+    }
+
+    #[test]
     fn input_hub_push_edge_without_listener_is_noop() {
         let hub = InputHub::new();
         let edge = InputEdge::from_snapshot(
@@ -3587,6 +3694,38 @@ mod tests {
     }
 
     #[test]
+    fn hold_decay_is_pulled_from_wall_clock_without_edges() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let _ = hold.update(true, t0 + Duration::from_millis(400));
+        let (p_rel, _) = hold.update(false, t0 + Duration::from_millis(400));
+        assert!(p_rel > 0.5);
+        // No further update calls: the ring pose must still decay.
+        let p_mid = hold.progress_at(t0 + Duration::from_millis(700));
+        assert!(p_mid < p_rel && p_mid > 0.0, "mid decay={p_mid}");
+        let p_end = hold.progress_at(t0 + Duration::from_millis(2000));
+        assert_eq!(p_end, 0.0, "decay completes on the wall clock");
+        assert!(!hold.is_animating(t0 + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn hold_repress_mid_decay_resumes_from_drawn_pose() {
+        let mut hold = HoldTracker::default();
+        let t0 = Instant::now();
+        let _ = hold.update(true, t0);
+        let (p_held, _) = hold.update(true, t0 + Duration::from_millis(500));
+        let (_, _) = hold.update(false, t0 + Duration::from_millis(500));
+        let p_mid = hold.progress_at(t0 + Duration::from_millis(800));
+        assert!(p_mid < p_held && p_mid > 0.0);
+        let (p_press, _) = hold.update(true, t0 + Duration::from_millis(800));
+        assert!(
+            (p_press - p_mid).abs() < 0.001,
+            "re-press resumes from the visible pose"
+        );
+    }
+
+    #[test]
     fn hold_partial_presses_stack_to_completion() {
         let mut hold = HoldTracker::default();
         let t0 = Instant::now();
@@ -3732,6 +3871,72 @@ mod tests {
             "progress decays over time"
         );
         assert!(tick_later.action.is_none());
+    }
+
+    #[test]
+    fn nav_bank_hold_progress_decays_after_edges_stop() {
+        let mut bank = PadNavBank::default();
+        bank.prepare_on_open(true);
+        let t0 = Instant::now();
+        let cross = PadSample {
+            cross: true,
+            held: [GestureControl::Cross].into_iter().collect(),
+            ..Default::default()
+        };
+        let _ = bank.tick(
+            &[reading("a", PadSample::default())],
+            t0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        let tick_held = bank.tick(
+            &[reading("a", cross.clone())],
+            t0 + Duration::from_millis(100),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(tick_held.cross_progress, 0.0, "first press just arms");
+        let tick_held = bank.tick(
+            &[reading("a", cross)],
+            t0 + Duration::from_millis(300),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(tick_held.cross_progress > 0.0);
+        let _ = bank.tick(
+            &[reading("a", PadSample::default())],
+            t0 + Duration::from_millis(400),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        let (released, _) = bank.hold_progress(t0 + Duration::from_millis(400));
+        assert!(released > 0.0);
+        // No further tick calls: the frame clock still sees decay.
+        let (later, _) = bank.hold_progress(t0 + Duration::from_millis(900));
+        assert!(later < released && later > 0.0, "later={later}");
+        assert!(bank.has_hold_activity());
+        let (done, _) = bank.hold_progress(t0 + Duration::from_millis(2500));
+        assert_eq!(done, 0.0);
     }
 
     #[test]

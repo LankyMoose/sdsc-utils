@@ -26,7 +26,7 @@ pub struct BackdropArt<Message, Theme = iced::Theme, Renderer = iced::Renderer> 
     /// Pull-model ken-burns: draw-time pose from `started + base_ms`.
     animate: bool,
     reduced_motion: bool,
-    started: iced::time::Instant,
+    timeline: crate::ui::motion::Timeline,
     base_ms: u64,
     /// Animated opacity curve; `None` uses the captured `opacity`.
     fade: Option<ArtFade>,
@@ -52,7 +52,7 @@ pub fn backdrop_art<Message, Theme, Renderer>(
         oy_norm,
         animate: false,
         reduced_motion: false,
-        started: iced::time::Instant::now(),
+        timeline: crate::ui::motion::Timeline::since(iced::time::Instant::now()),
         base_ms: 0,
         fade: None,
         width: Length::Fill,
@@ -86,7 +86,7 @@ pub fn backdrop_art_animated<Message, Theme, Renderer>(
         oy_norm,
         animate: true,
         reduced_motion,
-        started,
+        timeline: crate::ui::motion::Timeline::since(started),
         base_ms,
         fade,
         width: Length::Fill,
@@ -134,13 +134,15 @@ where
         _viewport: &Rectangle,
     ) {
         if self.animate {
-            let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
+            let elapsed = self.base_ms
+                + self
+                    .timeline
+                    .elapsed(iced::time::Instant::now())
+                    .as_millis() as u64;
             let fade_active =
                 self.fade.is_some() && elapsed < crate::ui::launcher::mode::ART_FADE_MS;
             if !self.reduced_motion || fade_active {
-                shell.request_redraw_at(
-                    iced::time::Instant::now() + iced::time::Duration::from_millis(16),
-                );
+                crate::ui::pull::FrameDemand::next(iced::time::Instant::now()).request(shell);
             }
         }
     }
@@ -167,7 +169,11 @@ where
             .measure_image(&self.handle)
             .map(|s| Size::new(s.width as f32, s.height as f32))
             .unwrap_or(Size::new(1.0, 1.0));
-        let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
+        let elapsed = self.base_ms
+            + self
+                .timeline
+                .elapsed(iced::time::Instant::now())
+                .as_millis() as u64;
         let (scale, ox_norm, oy_norm) = if self.animate && !self.reduced_motion {
             use crate::ui::launcher::mode::{backdrop_pose_offset, backdrop_pose_scale};
             use crate::ui::motion::{movement_offset, movement_scale};

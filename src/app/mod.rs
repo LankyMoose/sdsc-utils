@@ -226,6 +226,8 @@ pub enum Message {
     HomeProgressTick,
     /// 60Hz tick while a Home controller card expands/collapses on focus.
     HomeControllerTick,
+    /// 60Hz tick while a Home hold ring is charging/decaying.
+    HomeFrame,
     /// A window resized (logical size). The browser and Home consume this;
     /// the event is authoritative for their final full-cover size.
     WindowSized(window::Id, iced::Size),
@@ -393,6 +395,7 @@ impl Message {
             | Message::EngineInfoSize { .. }
             | Message::HomeProgressTick
             | Message::HomeControllerTick
+            | Message::HomeFrame
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellFadeTick
@@ -540,7 +543,7 @@ impl Message {
             Message::EngineInstallProgress { .. }
             | Message::EngineManifestReady { .. }
             | Message::EngineUninstallDone { .. } => false,
-            Message::HomeProgressTick | Message::HomeControllerTick => false,
+            Message::HomeProgressTick | Message::HomeControllerTick | Message::HomeFrame => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
             #[cfg(debug_assertions)]
@@ -1622,6 +1625,9 @@ impl App {
         if self.home_visible && self.home_state.controller_anim_needs_frames() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeControllerTick));
         }
+        if self.home_visible && self.home_state.hold_animating(Instant::now()) {
+            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeFrame));
+        }
 
         if self.popup_state.identify_flash_active()
             || self.home_state.identify_flash_active()
@@ -1688,7 +1694,14 @@ impl App {
                 iced::time::every(Duration::from_millis(500)).map(|_| Message::LauncherIdleTick),
             );
         }
-        if self.browser_visible && self.browser.needs_frames() {
+        let browser_pad_active = !self.home_visible
+            && !self.launcher_visible
+            && !self.osk.state.open
+            && self
+                .input_hub
+                .latest_reading(Duration::from_millis(200))
+                .is_some_and(|reading| crate::app::browser::browser_stick_active(&reading.sample));
+        if self.browser_visible && (self.browser.needs_frames() || browser_pad_active) {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::BrowserFrame));
         }
         // A history jump that never reports a landing/error must still settle.
@@ -2137,6 +2150,7 @@ impl App {
                 self.home_state.tick_controller_anim(Instant::now());
                 Task::none()
             }
+            Message::HomeFrame => self.on_home_frame(),
             Message::WindowSized(id, size) => {
                 if self.browser_window == Some(id) {
                     self.on_browser_window_sized(size)
@@ -2617,6 +2631,17 @@ impl App {
             .sync_perf_throttle(self.session.prefs.perf_throttle_immersive);
         let was_cold = self.launcher_state.cold_load_active;
         self.launcher_state.tick_anim(now);
+        // Holds are wall-clock state: keep the displayed ring decaying after
+        // the pad edge stream quietens (the release tail ends long before the
+        // 1.5s decay). Only pull while a ring is already visible so an
+        // explicit mode reset in the pad handler is never resurrected.
+        if (self.launcher_state.cross_progress > 0.0 || self.launcher_state.triangle_progress > 0.0)
+            && self.pad_nav.has_hold_activity()
+        {
+            let (cross, triangle) = self.pad_nav.hold_progress(now);
+            self.launcher_state.cross_progress = cross;
+            self.launcher_state.triangle_progress = triangle;
+        }
         let task = if was_cold && !self.launcher_state.cold_load_active {
             self.note_cold_load_finished()
         } else {
@@ -3412,6 +3437,7 @@ fn redraw_message_source(message: &Message) -> crate::platform::redraw_stats::Me
         Message::IdentifyFrame => Source::IdentifyFrame,
         Message::HomeProgressTick => Source::HomeProgress,
         Message::HomeControllerTick => Source::HomeController,
+        Message::HomeFrame => Source::Home,
         Message::ShellFadeTick => Source::ShellFade,
         Message::UtilityAmbientTick => Source::UtilityAmbient,
         Message::EmulatorCommitTick => Source::EmulatorCommit,

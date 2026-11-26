@@ -407,12 +407,11 @@ impl<Message> iced::widget::shader::Program<Message> for BrowserFrameProgram {
         // loop while mounted (no per-frame engine messages or view
         // rebuilds). A new generation presents immediately; otherwise the
         // loop polls again next frame period.
+        let now = iced::time::Instant::now();
         if self.slot.generation() != state.last_seen.load(std::sync::atomic::Ordering::SeqCst) {
-            Some(iced::widget::Action::request_redraw())
+            crate::ui::pull::FrameDemand::Now.into_program()
         } else {
-            Some(iced::widget::Action::request_redraw_at(
-                iced::time::Instant::now() + iced::time::Duration::from_millis(16),
-            ))
+            crate::ui::pull::FrameDemand::next(now).into_program()
         }
     }
 

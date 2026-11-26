@@ -794,41 +794,10 @@ impl App {
         Task::none()
     }
 
-    /// Per-poll analog layer for the engine browser: left stick moves the
-    /// virtual cursor (magnetic snap), right stick scrolls. Runs on pad edges
-    /// and on the Browser wall clock; neutral ticks let friction and docking
-    /// settle even after the pad stream stops.
-    pub(crate) fn tick_browser_cursor(
-        &mut self,
-        readings: &[launcher_input::NavReading],
-        now: Instant,
-    ) {
-        let Some(reading) = launcher_input::preferred_reading(readings) else {
-            return;
-        };
-        let sample = reading.sample.clone();
-        self.browser.last_pad_sample = sample.clone();
-        self.browser.last_pad_at = Some(now);
-        self.advance_browser_cursor(&sample, now);
-    }
-
-    /// Analog sample the Browser wall clock should integrate: the last pad
-    /// state while it is fresh, neutral once the stream has been quiet past
-    /// the release grace. Prevents a disconnected/held stick from steering
-    /// through the frame clock forever.
-    pub(crate) fn browser_frame_sample(&self, now: Instant) -> crate::domain::pad::PadSample {
-        if self.browser.last_pad_at.is_some_and(|t| {
-            now.saturating_duration_since(t) <= std::time::Duration::from_millis(100)
-        }) {
-            self.browser.last_pad_sample.clone()
-        } else {
-            crate::domain::pad::PadSample::default()
-        }
-    }
-
     /// Integrate one analog sample into the cursor/scroll state. The Browser
-    /// frame clock feeds a neutral sample while `needs_frames()` is true, so
-    /// glide/decay no longer depends on a 250Hz neutral pad stream.
+    /// frame clock is the sole integrator: it pulls the latest HID snapshot,
+    /// so a held stick keeps moving even when no pad edge or page pixel
+    /// changed this frame.
     pub(crate) fn advance_browser_cursor(
         &mut self,
         sample: &crate::domain::pad::PadSample,
@@ -1242,7 +1211,7 @@ impl App {
     }
 
     /// Pad/keyboard body scroll. Engine mode scrolls Chromium at the cursor
-    /// point (`tick_browser_cursor` handles analog scroll); this path covers
+    /// point (`on_browser_frame` handles analog scroll); this path covers
     /// explicit D-pad/keys.
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
         if self.browser.panel.session.has_frame() {
@@ -2763,6 +2732,14 @@ impl App {
         if let Some((pad, action)) = launcher_tap_action(tap_actions) {
             tick.action = Some(action);
             tick.action_pad = Some(pad);
+        }
+        // A release that ended an owned Cross hold is not also a Confirm. The
+        // hold owns the press from the first charged frame; otherwise a
+        // partial "Close game" hold would launch/confirm on release.
+        if hold_cross_close && tick.cross_progress > 0.0 && tick.action == Some(NavAction::Confirm)
+        {
+            tick.action = None;
+            tick.action_pad = None;
         }
         if let Some(diag) = &tick.diag {
             self.log_start_nav_diag(diag, readings.len());

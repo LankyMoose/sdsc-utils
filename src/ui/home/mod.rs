@@ -1370,6 +1370,27 @@ impl State {
 
         tap.or(message)
     }
+
+    /// True while the Triangle power hold is charging or its release decay /
+    /// armed chase still needs frames. Gates the Home hold clock.
+    pub fn hold_animating(&self, now: Instant) -> bool {
+        self.triangle_hold.is_animating(now) || self.triangle_armed_t > 0.001
+    }
+
+    /// Pull the hold pose from wall time. Called by the Home frame clock while
+    /// no pad edges are arriving, so release decay no longer freezes at the
+    /// end of the 140ms neutral tail.
+    pub fn advance_hold(&mut self, now: Instant) {
+        let progress = self.triangle_hold.progress_at(now);
+        self.triangle_progress = progress;
+        let dt = self
+            .hint_anim_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.05);
+        self.hint_anim_at = Some(now);
+        approach_hint_anim(&mut self.triangle_armed_t, progress >= 1.0, dt);
+    }
 }
 
 /// Render Home shell. The window root is transparent; the centered card

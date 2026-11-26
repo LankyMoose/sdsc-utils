@@ -227,7 +227,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Offset<'_, Messag
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
-            cursor,
+            Offset::child_cursor(self.offset_y, cursor),
             viewport,
             renderer,
         )

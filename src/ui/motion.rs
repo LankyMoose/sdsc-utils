@@ -16,7 +16,7 @@
 //! other OS has no equivalent probe and reports animations off (documented in
 //! `notes/ui-refresh.md`), so `System` means reduced motion there.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::persist::prefs::ReducedMotion;
 
@@ -37,6 +37,86 @@ pub const SLOW_MS: u64 = 450;
 /// stays clear briefly, then fades in behind it.
 pub const SHELL_BACKDROP_DELAY: Duration = Duration::from_millis(140);
 pub const SHELL_BACKDROP_FADE: Duration = Duration::from_millis(220);
+
+/// One wall-clock animation segment. Pose is derived from `started`; callers
+/// never accumulate per-message `dt`, so a stalled loop resumes at the true
+/// time instead of replaying or skipping the curve.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeline {
+    started: Instant,
+    duration: Duration,
+    paused_at: Option<Instant>,
+    paused_total: Duration,
+}
+
+impl Timeline {
+    pub fn new(started: Instant, duration: Duration) -> Self {
+        Self {
+            started,
+            duration,
+            paused_at: None,
+            paused_total: Duration::ZERO,
+        }
+    }
+
+    /// Open-ended timeline (only [`Self::elapsed`] is meaningful).
+    pub fn since(started: Instant) -> Self {
+        Self::new(started, Duration::ZERO)
+    }
+
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        let paused_now = self
+            .paused_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or_default();
+        now.saturating_duration_since(self.started)
+            .saturating_sub(self.paused_total)
+            .saturating_sub(paused_now)
+    }
+
+    pub fn progress(&self, now: Instant) -> f32 {
+        progress_linear(
+            self.elapsed(now).as_millis() as u64,
+            self.duration.as_millis() as u64,
+        )
+    }
+
+    pub fn is_done(&self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    pub fn pause(&mut self, now: Instant) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(now);
+        }
+    }
+
+    pub fn resume(&mut self, now: Instant) {
+        if let Some(at) = self.paused_at.take() {
+            self.paused_total = self
+                .paused_total
+                .saturating_add(now.saturating_duration_since(at));
+        }
+    }
+}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Self::since(Instant::now())
+    }
+}
 
 /// Backdrop alpha for a shell opened at `started`: 0 during the delay, then
 /// an eased fade to `target`. Opacity is never gated by reduced motion.
@@ -210,6 +290,19 @@ mod tests {
         assert_eq!(progress, 1.0);
         let (_, progress, _) = advance_capped(Duration::ZERO, MAX_FRAME_DT, Duration::ZERO);
         assert_eq!(progress, 1.0);
+    }
+
+    #[test]
+    fn timeline_derives_pose_and_excludes_pauses() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new(t0, Duration::from_secs(1));
+        assert_eq!(timeline.progress(t0), 0.0);
+        assert!((timeline.progress(t0 + Duration::from_millis(500)) - 0.5).abs() < 0.001);
+        timeline.pause(t0 + Duration::from_millis(500));
+        assert!((timeline.progress(t0 + Duration::from_secs(2)) - 0.5).abs() < 0.001);
+        timeline.resume(t0 + Duration::from_secs(2));
+        assert!((timeline.progress(t0 + Duration::from_millis(2500)) - 1.0).abs() < 0.001);
+        assert!(timeline.is_done(t0 + Duration::from_secs(3)));
     }
 
     #[test]

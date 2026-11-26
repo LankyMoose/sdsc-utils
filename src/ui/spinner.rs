@@ -27,13 +27,13 @@ struct SpinnerProgram {
 
 #[derive(Debug)]
 struct SpinnerState {
-    epoch: Instant,
+    timeline: crate::ui::motion::Timeline,
 }
 
 impl Default for SpinnerState {
     fn default() -> Self {
         Self {
-            epoch: Instant::now(),
+            timeline: crate::ui::motion::Timeline::since(Instant::now()),
         }
     }
 }
@@ -48,9 +48,7 @@ impl<Message> canvas::Program<Message> for SpinnerProgram {
         _bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        Some(canvas::Action::request_redraw_at(
-            Instant::now() + std::time::Duration::from_millis(16),
-        ))
+        crate::ui::pull::FrameDemand::next(Instant::now()).into_canvas()
     }
 
     fn draw(
@@ -64,7 +62,7 @@ impl<Message> canvas::Program<Message> for SpinnerProgram {
         let mut frame = Frame::new(renderer, Size::new(self.size, self.size));
         let radius = (self.size * 0.5 - 1.5).max(1.0);
         let center = Point::new(self.size * 0.5, self.size * 0.5);
-        let elapsed = state.epoch.elapsed().as_secs_f32();
+        let elapsed = state.timeline.elapsed(Instant::now()).as_secs_f32();
         let start = Radians((elapsed / PERIOD).fract() * std::f32::consts::TAU);
         let path = Path::new(|builder| {
             builder.arc(canvas::path::Arc {

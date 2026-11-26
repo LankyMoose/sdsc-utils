@@ -317,18 +317,23 @@ pub fn invalidate_toast<Message: Send + 'static>(id: window::Id) -> Task<Message
     invalidate_window(id)
 }
 
+/// Fixed toast HWND size. One source for creation and remount: the union
+/// box must survive the generation remount or the card is clipped.
+pub fn toast_window_size() -> Size {
+    Size::new(toast_view::WIDTH, toast_view::WINDOW_HEIGHT)
+}
+
 /// Nudge toast size by ±1px so wgpu rebuilds the surface for a new message.
+/// Height stays at the union size (create and remount must agree).
 pub fn remount_toast_surface<Message: Send + 'static>(
     id: window::Id,
     generation: u64,
 ) -> Task<Message> {
-    let width = crate::ui::toast::view::WIDTH
-        + if generation.is_multiple_of(2) {
-            0.0
-        } else {
-            1.0
-        };
-    window::resize(id, Size::new(width, crate::ui::toast::view::HEIGHT))
+    let mut size = toast_window_size();
+    if !generation.is_multiple_of(2) {
+        size.width += 1.0;
+    }
+    window::resize(id, size)
 }
 
 /// Hide the overlay toast without going through iced `set_mode(Hidden)`.
@@ -694,6 +699,11 @@ mod tests {
         assert!(y + h >= top.target_y + toast_view::HEIGHT);
         for placement in [bottom, top] {
             let (y, h) = toast_window_geometry(placement);
+            assert_eq!(
+                h,
+                toast_window_size().height,
+                "remount must preserve the union height"
+            );
             for step in 0..=10 {
                 let progress = step as f32 / 10.0;
                 let card_y = slide_y(placement, progress, false);

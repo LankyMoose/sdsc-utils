@@ -270,7 +270,7 @@ impl OskSurface<'_> {
                 .iter()
                 .any(|reading| !crate::domain::pad::sample_nav_resting(&reading.sample))
         {
-            shell.request_redraw_at(Instant::now() + std::time::Duration::from_millis(16));
+            crate::ui::pull::FrameDemand::next(Instant::now()).request(shell);
         }
     }
 }

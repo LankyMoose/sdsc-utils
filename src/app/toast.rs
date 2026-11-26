@@ -19,7 +19,7 @@ use crate::ui::toast::ToastMessage;
 use crate::ui::toast::machine::{self as toast_machine, Effect as ToastEffect};
 use crate::ui::toast::view as toast_view;
 use iced::widget::Float;
-use iced::{Element, Point, Size, Task, Vector, window};
+use iced::{Element, Point, Task, Vector, window};
 use std::time::{Duration, Instant};
 
 impl App {
@@ -130,7 +130,7 @@ impl App {
 
     pub(crate) fn create_toast_window(&mut self) -> (window::Id, Task<window::Id>) {
         let (id, open) = window::open(window::Settings {
-            size: Size::new(toast_view::WIDTH, toast_view::WINDOW_HEIGHT),
+            size: crate::ui::layout::toast_window_size(),
             position: window::Position::Default,
             visible: false,
             resizable: false,

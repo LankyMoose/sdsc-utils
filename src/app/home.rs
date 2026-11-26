@@ -919,6 +919,16 @@ impl App {
         task
     }
 
+    /// Home hold clock: pull the Triangle power ring from wall time while the
+    /// pad edge stream is quiet. No-op when the Home overlay is closed.
+    pub(crate) fn on_home_frame(&mut self) -> Task<Message> {
+        if !self.home_visible {
+            return Task::none();
+        }
+        self.home_state.advance_hold(Instant::now());
+        Task::none()
+    }
+
     /// Keyboard while Home window has focus.
     pub(crate) fn on_home_key(&mut self, raw: RawKey) -> Task<Message> {
         if !raw.pressed || self.home_closing() {

@@ -502,9 +502,11 @@ impl<Message> shader::Program<Message> for AmbientProgram {
             state.time += ambient_dt_for_elapsed(now.saturating_duration_since(last));
         }
         state.last = Some(now);
-        Some(iced::widget::Action::request_redraw_at(
-            now + Duration::from_millis(16),
-        ))
+        Some(
+            crate::ui::pull::FrameDemand::next(now)
+                .into_program()
+                .expect("display-rate demand"),
+        )
     }
 
     fn draw(

@@ -140,9 +140,6 @@ pub struct BrowserAppState {
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
     pub tabs_restored: bool,
-    /// Latest analog sample seen on a pad edge (for the Browser wall clock).
-    pub last_pad_sample: crate::domain::pad::PadSample,
-    pub last_pad_at: Option<Instant>,
 }
 
 impl BrowserAppState {
@@ -165,6 +162,15 @@ use iced::Task;
 use std::time::Instant;
 
 use super::Message;
+
+/// True when a pad sample has a live analog cursor/scroll axis. Face buttons
+/// do not need the Browser cursor clock; their actions run immediately.
+pub(crate) fn browser_stick_active(sample: &crate::domain::pad::PadSample) -> bool {
+    sample.lstick_x != 0.0
+        || sample.lstick_y != 0.0
+        || sample.rstick_x != 0.0
+        || sample.rstick_y != 0.0
+}
 
 /// Map source-side tap actions to the Browser's semantic nav actions.
 /// Tap only: no hold actions, no history selector, no hints/status.
@@ -1610,14 +1616,23 @@ impl super::App {
     }
 
     pub(crate) fn on_browser_frame(&mut self) -> Task<Message> {
-        if !self.browser_visible {
+        if !self.browser_visible
+            || self.home_visible
+            || self.launcher_visible
+            || self.osk.state.open
+        {
             return Task::none();
         }
-        // Wall clock, not pad stream: friction, D-pad flights, and dock morphs
-        // settle even after the HID edges stop. History timeout and debug
-        // shots have their own timers now.
+        // One integrator, one clock. The cursor advances from the latest HID
+        // snapshot at the Browser frame rate instead of splitting integration
+        // between PadInput edges and a stale-sample fallback. This keeps a
+        // held stick moving even when page pixels are static.
         let now = Instant::now();
-        let sample = self.browser_frame_sample(now);
+        let sample = self
+            .input_hub
+            .latest_reading(std::time::Duration::from_millis(200))
+            .map(|reading| reading.sample)
+            .unwrap_or_default();
         self.advance_browser_cursor(&sample, now);
         // Cursor glides and script-driven scroll still need one mouse sync
         // per paint even when no new pad edge arrived.
@@ -1687,7 +1702,6 @@ impl super::App {
                 .or(tick.triangle_completed_pad.as_ref()),
         );
         if engine_mode {
-            self.tick_browser_cursor(readings, now);
             if let Some((jump, pad)) = self.poll_browser_dpad_jump(readings, now) {
                 self.set_haptic_pad_from_id(Some(&pad));
                 self.play_ui_cue(UiSoundKind::Nav);
@@ -2700,6 +2714,24 @@ mod tests {
             button,
             action: PadButtonAction::Hold,
         }
+    }
+
+    #[test]
+    fn only_stick_axes_need_the_browser_cursor_clock() {
+        use crate::domain::pad::PadSample;
+        assert!(!browser_stick_active(&PadSample::default()));
+        assert!(!browser_stick_active(&PadSample {
+            cross: true,
+            ..Default::default()
+        }));
+        assert!(browser_stick_active(&PadSample {
+            lstick_x: -0.95,
+            ..Default::default()
+        }));
+        assert!(browser_stick_active(&PadSample {
+            rstick_y: 0.5,
+            ..Default::default()
+        }));
     }
 
     #[test]
