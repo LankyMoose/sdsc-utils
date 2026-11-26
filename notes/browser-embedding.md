@@ -153,7 +153,7 @@ meters still use the legacy per-surface bank.
 - Page `window.open` / `target=_blank` is denied entirely: no native popup,
   no new tab, no navigation. `PopupRequested` is traced as
   `browser.popup_denied`.
-- The system controller keyboard (Quadrant default, Grid fallback) is a
+- The system controller keyboard (Dual QWERTY default, Grid fallback) is a
   topmost no-activate overlay owned by the main app. Cross on a page text
   field opens it for `OskTarget::BrowserPage`; Triangle in the URL well opens
   it for `OskTarget::BrowserUrl`. Focus/autofocus never opens it. Real

@@ -1,12 +1,12 @@
 //! System OSK session: input routing, text-action dispatch, and the topmost
 //! no-activate overlay window. The Browser never owns OSK state or layout.
 
-use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction};
+use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadSample};
 use crate::persist::prefs::OskMode;
 use crate::platform::ui_sound::UiSoundKind;
-use crate::ui::osk::grid::{Dir, GridKey};
-use crate::ui::osk::quadrant::{Half, Output};
-use crate::ui::osk::{OskState, OskTarget};
+use crate::ui::osk::dual::{Half, TriggerLatch};
+use crate::ui::osk::grid::GridKey;
+use crate::ui::osk::{Dir, OskState, OskTarget, Output};
 use iced::{Point, Size, Task, window};
 use std::time::Instant;
 
@@ -19,9 +19,9 @@ pub struct SystemOsk {
     pub state: OskState,
     pub pending_show: bool,
     pub cover: Option<crate::ui::layout::MonitorCover>,
-    pub r2_latched: bool,
-    pub l3_latched: bool,
-    pub r3_latched: bool,
+    pub left_stick: NavStepper,
+    pub right_stick: NavStepper,
+    pub triggers: TriggerLatch,
     pub grid_stepper: NavStepper,
 }
 
@@ -32,9 +32,9 @@ impl SystemOsk {
             state: OskState::new(mode),
             pending_show: false,
             cover: None,
-            r2_latched: false,
-            l3_latched: false,
-            r3_latched: false,
+            left_stick: NavStepper::default(),
+            right_stick: NavStepper::default(),
+            triggers: TriggerLatch::default(),
             grid_stepper: NavStepper::default(),
         }
     }
@@ -125,9 +125,9 @@ impl App {
         if target == Some(OskTarget::BrowserUrl) && !matches!(reason, "keyboard" | "ime") {
             self.browser.panel.cancel_url_edit();
         }
-        self.osk.r2_latched = false;
-        self.osk.l3_latched = false;
-        self.osk.r3_latched = false;
+        self.osk.left_stick.reset();
+        self.osk.right_stick.reset();
+        self.osk.triggers.reset();
         self.osk.grid_stepper.reset();
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.close")
             .field("reason", reason)
@@ -153,7 +153,14 @@ impl App {
     }
 
     pub(crate) fn set_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
+        if self.osk.state.mode == mode {
+            return Task::none();
+        }
         self.osk.state.set_mode(mode);
+        self.osk.left_stick.reset();
+        self.osk.right_stick.reset();
+        self.osk.triggers.reset();
+        self.osk.grid_stepper.reset();
         if let Some(id) = self.osk.window {
             return crate::ui::layout::invalidate_window(id);
         }
@@ -165,7 +172,56 @@ impl App {
             self.osk.window = None;
             self.osk.pending_show = false;
             self.osk.state.close();
+            self.osk.left_stick.reset();
+            self.osk.right_stick.reset();
+            self.osk.triggers.reset();
+            self.osk.grid_stepper.reset();
         }
+        Task::none()
+    }
+
+    /// Debug-only: capture the OSK overlay window exactly as rendered. The
+    /// screenshot carries the window alpha, so QA can prove both halves exist
+    /// instead of trusting behavioural state alone.
+    #[cfg(debug_assertions)]
+    pub(crate) fn capture_osk_window(&mut self) -> Task<Message> {
+        let Some(win) = self.osk.window else {
+            return Task::none();
+        };
+        iced::window::screenshot(win).map(Message::OskShot)
+    }
+
+    /// Debug-only: persist an OSK overlay shot to the replay sandbox's
+    /// `shots/` directory and log its size for QA.
+    #[cfg(debug_assertions)]
+    pub(crate) fn save_osk_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
+        let (w, h) = (shot.size.width, shot.size.height);
+        let scale = shot.scale_factor;
+        let rgba = shot.rgba.to_vec();
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        std::thread::spawn(move || {
+            let dir = crate::persist::paths::data_dir().join("shots");
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                crate::platform::app_log::warn(format!(
+                    "osk-shot skipped: cannot create {dir:?}: {err}"
+                ));
+                return;
+            }
+            let path = dir.join(format!("osk-shot-{ms}.png"));
+            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                Ok(()) => crate::platform::app_log::info(format!(
+                    "osk-shot saved path={} size={w}x{h} scale={scale}",
+                    path.display()
+                )),
+                Err(err) => crate::platform::app_log::warn(format!(
+                    "osk-shot failed path={}: {err}",
+                    path.display()
+                )),
+            }
+        });
         Task::none()
     }
 
@@ -217,52 +273,35 @@ impl App {
         let mut outputs: Vec<Output> = Vec::new();
 
         match self.osk.state.mode {
-            OskMode::Quadrant => {
-                outputs = self.osk.state.quadrant.update(
-                    (sample.lstick_x, sample.lstick_y),
-                    (sample.rstick_x, sample.rstick_y),
-                );
+            OskMode::Dual => {
+                let left = side_stick(sample, true);
+                if let Some(action) = self.osk.left_stick.update(&left, now, true, true)
+                    && let Some(direction) = nav_dir(action)
+                {
+                    self.osk.state.dual_move(Half::Left, direction);
+                }
+                let right = side_stick(sample, false);
+                if let Some(action) = self.osk.right_stick.update(&right, now, true, true)
+                    && let Some(direction) = nav_dir(action)
+                {
+                    self.osk.state.dual_move(Half::Right, direction);
+                }
+                // Each trigger commits the cursor on its own half. L2/R2 are
+                // edges: holding one types once.
+                for half in self.osk.triggers.update(sample.l2, sample.r2) {
+                    outputs.push(Output::Text(self.osk.state.dual_key(half)));
+                }
             }
             OskMode::Grid => {
                 let masked = crate::ui::launcher::input::dpad_only(sample);
-                if let Some(action) = self.osk.grid_stepper.update(&masked, now, true, true) {
-                    let dir = match action {
-                        NavAction::Up => Some(Dir::Up),
-                        NavAction::Down => Some(Dir::Down),
-                        NavAction::Left => Some(Dir::Left),
-                        NavAction::Right => Some(Dir::Right),
-                        _ => None,
-                    };
-                    if let Some(dir) = dir {
-                        self.osk.state.grid_move(dir);
-                        self.play_ui_cue(UiSoundKind::Nav);
-                    }
+                if let Some(action) = self.osk.grid_stepper.update(&masked, now, true, true)
+                    && let Some(direction) = nav_dir(action)
+                {
+                    self.osk.state.grid_move(direction);
+                    self.play_ui_cue(UiSoundKind::Nav);
                 }
             }
         }
-
-        // R2 Enter (edge): shared by both modes.
-        let r2 = sample.r2;
-        if r2 && !self.osk.r2_latched {
-            outputs.push(Output::Enter);
-        }
-        self.osk.r2_latched = r2;
-
-        // L3/R3 home keys are Quadrant controls (tap only).
-        let l3 = sample
-            .held
-            .contains(&crate::ui::launcher::gesture::GestureControl::L3);
-        if self.osk.state.mode == OskMode::Quadrant && l3 && !self.osk.l3_latched {
-            outputs.push(self.osk.state.home_key(Half::Left));
-        }
-        self.osk.l3_latched = l3;
-        let r3 = sample
-            .held
-            .contains(&crate::ui::launcher::gesture::GestureControl::R3);
-        if self.osk.state.mode == OskMode::Quadrant && r3 && !self.osk.r3_latched {
-            outputs.push(self.osk.state.home_key(Half::Right));
-        }
-        self.osk.r3_latched = r3;
 
         let mut close = false;
         if let Some(action) = tap_actions
@@ -271,7 +310,7 @@ impl App {
         {
             match action.button {
                 PadButton::Cross => match self.osk.state.mode {
-                    OskMode::Quadrant => outputs.push(Output::Space),
+                    OskMode::Dual => outputs.push(Output::Space),
                     OskMode::Grid => match self.osk.state.grid_key() {
                         GridKey::Char(ch) => outputs.push(Output::Text(ch)),
                         GridKey::Space => outputs.push(Output::Space),
@@ -283,13 +322,8 @@ impl App {
                 },
                 PadButton::Triangle => outputs.push(Output::Backspace),
                 PadButton::Square => self.osk.state.toggle_layer(),
+                PadButton::Options => outputs.push(Output::Enter),
                 PadButton::Circle => close = true,
-                PadButton::L3 if self.osk.state.mode == OskMode::Quadrant => {
-                    outputs.push(self.osk.state.home_key(Half::Left));
-                }
-                PadButton::R3 if self.osk.state.mode == OskMode::Quadrant => {
-                    outputs.push(self.osk.state.home_key(Half::Right));
-                }
                 _ => {}
             }
         }
@@ -396,8 +430,9 @@ impl App {
         Task::none()
     }
 
-    /// Debug replay: feed one split-stick sample through the real Quadrant
-    /// state machine and apply any committed text.
+    /// Debug replay: feed one split-stick sample through the live DQ path.
+    /// Send a neutral step between same-direction moves so the stepper's
+    /// release grace can reset, exactly like a real stick.
     #[cfg(debug_assertions)]
     pub(crate) fn replay_osk_stick(
         &mut self,
@@ -407,15 +442,55 @@ impl App {
         if !self.osk.state.open {
             return Task::none();
         }
-        let outputs = self.osk.state.quadrant.update(left, right);
-        let mut task = Task::none();
-        for output in outputs {
-            task = task.chain(self.apply_osk_output(output));
+        let mut sample = PadSample {
+            lstick_x: left.0,
+            lstick_y: left.1,
+            rstick_x: right.0,
+            rstick_y: right.1,
+            ..PadSample::default()
+        };
+        sample.stick_x = sample.lstick_x;
+        sample.stick_y = sample.lstick_y;
+        let pad = crate::domain::pad::PadId("replay".into());
+        let reading = crate::ui::launcher::input::NavReading {
+            id: pad,
+            sample,
+            source: "replay",
+        };
+        self.on_osk_pad(&[reading], &[])
+    }
+
+    /// Debug replay: press/release one trigger (or both) so DQ commits through
+    /// the real edge latch. Release in the same step keeps the next synthetic
+    /// press independent.
+    #[cfg(debug_assertions)]
+    pub(crate) fn replay_osk_trigger(&mut self, side: &str) -> Task<Message> {
+        if !self.osk.state.open {
+            return Task::none();
         }
-        if let Some(id) = self.osk.window {
-            task = task.chain(crate::ui::layout::invalidate_window(id));
-        }
-        task
+        let (l2, r2) = match side {
+            "left" => (true, false),
+            "right" => (false, true),
+            "both" => (true, true),
+            _ => return Task::none(),
+        };
+        let pad = crate::domain::pad::PadId("replay".into());
+        let press = crate::ui::launcher::input::NavReading {
+            id: pad.clone(),
+            sample: PadSample {
+                l2,
+                r2,
+                ..PadSample::default()
+            },
+            source: "replay",
+        };
+        let release = crate::ui::launcher::input::NavReading {
+            id: pad,
+            sample: PadSample::default(),
+            source: "replay",
+        };
+        self.on_osk_pad(&[press], &[])
+            .chain(self.on_osk_pad(&[release], &[]))
     }
 
     /// Debug replay: inject one source-side tap through the live owner (OSK
@@ -464,5 +539,30 @@ impl App {
             return self.on_browser_pad(&[reading], &[action]);
         }
         Task::none()
+    }
+}
+
+/// One stick as a nav sample. DQ keeps the halves independent, so the D-pad
+/// and the other stick are deliberately zeroed.
+fn side_stick(sample: &PadSample, left: bool) -> PadSample {
+    let (x, y) = if left {
+        (sample.lstick_x, sample.lstick_y)
+    } else {
+        (sample.rstick_x, sample.rstick_y)
+    };
+    PadSample {
+        stick_x: x,
+        stick_y: y,
+        ..PadSample::default()
+    }
+}
+
+fn nav_dir(action: NavAction) -> Option<Dir> {
+    match action {
+        NavAction::Up => Some(Dir::Up),
+        NavAction::Down => Some(Dir::Down),
+        NavAction::Left => Some(Dir::Left),
+        NavAction::Right => Some(Dir::Right),
+        _ => None,
     }
 }

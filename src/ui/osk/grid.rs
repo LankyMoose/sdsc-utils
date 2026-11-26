@@ -1,15 +1,6 @@
 //! Grid controller keyboard: D-pad focus + Cross activate fallback mode.
 
-use super::quadrant::Layer;
-
-/// D-pad direction for grid focus movement (system-owned; no Browser types).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dir {
-    Up,
-    Down,
-    Left,
-    Right,
-}
+use super::{Dir, Layer};
 
 /// One grid key. Character keys commit text; the rest are control actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

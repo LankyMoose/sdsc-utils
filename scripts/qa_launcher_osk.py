@@ -2,9 +2,9 @@
 """Launcher Settings system-OSK proof (no OS input).
 
 Opens Add shortcut in Launcher edit mode, pads focus between Title and
-Arguments, opens the system OSK with Cross on each field, types via the
-Quadrant gesture machine, saves with Enter, and verifies the committed manual
-entry in games.json. Cross must never save while the form is open.
+Arguments, opens the system OSK with Cross on each field, types from both DQ
+halves, saves with Options (Enter), and verifies the committed manual entry in
+games.json. Cross must never save while the form is open.
 """
 
 from __future__ import annotations
@@ -57,24 +57,22 @@ def main() -> int:
         },
         # Cross on focused Title opens the system OSK.
         {"app": "launcher", "action": "pad.tap", "params": {"button": "cross"}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        # F then T -> "ft".
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": 0.0}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": -0.6}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
+        # D then K: one character from each half's persistent cursor.
+        {"app": "launcher", "action": "osk.trigger", "params": {"side": "left"}},
+        {"app": "launcher", "action": "osk.trigger", "params": {"side": "right"}},
         # Circle closes the OSK; Down moves pad focus to Arguments; Cross opens
         # the OSK for it again.
         {"app": "launcher", "action": "pad.tap", "params": {"button": "circle"}},
         {"app": "launcher", "action": "pad.dir", "params": {"dir": "down"}},
         {"app": "launcher", "action": "pad.tap", "params": {"button": "cross"}},
+        # X: left cursor D -> C (down) -> X (left).
+        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.65}},
         {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        # X: left stick down quadrant outer-left.
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": -0.55, "y": 0.8}},
+        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": -0.65, "y": 0.0}},
         {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        # Enter closes the OSK and hands off to the form's Save/Add path.
-        {"app": "launcher", "action": "key", "params": {"key": "enter"}},
+        {"app": "launcher", "action": "osk.trigger", "params": {"side": "left"}},
+        # Options is Enter: commit the OSK text into the form, then save.
+        {"app": "launcher", "action": "pad.tap", "params": {"button": "options"}},
         {"app": "launcher", "action": "commit", "params": {}},
         {"app": "launcher", "action": "close", "params": {}},
     ]
@@ -143,7 +141,7 @@ def main() -> int:
         if not manual:
             print("error: Add shortcut did not commit a manual entry", file=sys.stderr)
             return 1
-        if manual[0].get("title") != "ft":
+        if manual[0].get("title") != "dk":
             print("error: Title draft did not receive the OSK text", file=sys.stderr)
             return 1
         if manual[0].get("args") != "x":

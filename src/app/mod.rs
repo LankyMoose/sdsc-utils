@@ -181,6 +181,12 @@ pub enum Message {
     OskOpened(window::Id),
     /// System OSK overlay message (no interactive keys; reserved).
     Osk(crate::ui::osk::OskMessage),
+    /// Debug-only: capture the OSK overlay after the settle delay.
+    #[cfg(debug_assertions)]
+    OskCapture,
+    /// Debug-only: OSK overlay window screenshot ready to persist.
+    #[cfg(debug_assertions)]
+    OskShot(iced::window::Screenshot),
     /// Optional BrowserEngine install/update finished or was cancelled.
     EngineInstallDone {
         generation: u64,
@@ -415,7 +421,9 @@ impl Message {
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick
             | Message::AmbientPreviewOpened(_)
-            | Message::AmbientPreviewTick => None,
+            | Message::AmbientPreviewTick
+            | Message::OskCapture
+            | Message::OskShot(_) => None,
             #[cfg(feature = "cef-engine")]
             Message::EngineInstallProgress { .. }
             | Message::EngineManifestReady { .. }
@@ -530,6 +538,8 @@ impl Message {
             Message::HomeProgressTick | Message::HomeControllerTick => false,
             #[cfg(debug_assertions)]
             Message::AmbientPreviewOpened(_) | Message::AmbientPreviewTick => false,
+            #[cfg(debug_assertions)]
+            Message::OskCapture | Message::OskShot(_) => false,
             #[cfg(debug_assertions)]
             Message::PreviewDrag | Message::PreviewClose => true,
             Message::Popup(_)
@@ -2023,6 +2033,10 @@ impl App {
             Message::BrowserFrame => self.on_browser_frame(),
             Message::OskOpened(id) => self.on_osk_opened(id),
             Message::Osk(_) => Task::none(),
+            #[cfg(debug_assertions)]
+            Message::OskCapture => self.capture_osk_window(),
+            #[cfg(debug_assertions)]
+            Message::OskShot(shot) => self.save_osk_shot(shot),
             Message::EngineInstallDone {
                 generation,
                 outcome,

@@ -1517,7 +1517,7 @@ fn system_settings_view<'a>(settings: &ConfigureSettings) -> Element<'a, Configu
                     text("Controller keyboard")
                         .size(theme::type_scale::BODY)
                         .color(theme::INK),
-                    text("On-screen keyboard layout for text fields")
+                    text("Two-stick split QWERTY, or D-pad Grid fallback")
                         .size(12.0)
                         .color(theme::DIM),
                 ]
@@ -3092,7 +3092,7 @@ mod tests {
             lightbar_enabled: true,
             home_enabled: false,
             home_auto_open: HomeAutoOpen::Any,
-            osk_mode: OskMode::Quadrant,
+            osk_mode: OskMode::Dual,
             launcher_immersive_layout: ImmersiveLayout::Vertical,
             launcher_clock_enabled: true,
             launcher_navbar: NavbarVisibility::WhenNavigating,

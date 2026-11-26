@@ -36,7 +36,7 @@ or the MSIX packaging.
    `back`/`forward`/`reload` actions mapped to L1/R1/Options (tap only).
 2. **Make the OSK a system service.** Move it out of `ui/browser`/
    `app/browser.rs` into system-owned modules and a topmost no-activate
-   overlay. Quadrant default, Grid fallback; Cross-only open; real input
+   overlay. Dual QWERTY default, Grid fallback; Cross-only open; real input
    closes; first Cross on a page field opens.
 3. **Prove reuse** with Launcher Settings Title/Arguments using the same OSK.
 4. **Define contract v0**: manifest + surface + actions + text session +
@@ -145,7 +145,7 @@ Do not re-litigate these unless the user explicitly changes them.
   the v0.1 header row (Triangle edits the URL well through the system OSK).
 - OSK keys and its control bar are **not mouse-clickable**; real mouse input
   dismisses the OSK.
-- The OSK mode is a **system setting**: Quadrant default, Grid fallback.
+- The OSK mode is a **system setting**: Dual QWERTY default, Grid fallback.
   No per-app mode.
 - The OSK renders as a **topmost, no-activate system overlay window** owned by
   the main app. It must not steal focus from the Browser/app. Controller input
@@ -302,7 +302,7 @@ render hints from it.
 Browser: Cross target is a page text field
 Browser: TextSession { active: true } + open-text-input request
 OS:      opens system OSK (validated against the Cross edge)
-User:    types via Quadrant/Grid
+User:    types via Dual QWERTY/Grid
 OS:      sends TextAction::Insert/Backspace/Enter/Cancel
 Browser: applies to CEF / focused page field
 OS:      real mouse/keyboard/IME/touch -> close OSK
@@ -366,17 +366,20 @@ Future additions (not now):
 
 ### Modes and settings
 
-- `OskMode::{Quadrant, Grid}`, global system pref.
-- Default **Quadrant**.
+- `OskMode::{Dual, Grid}`, global system pref.
+- Default **Dual QWERTY** (Microsoft Research's DQ interaction).
 - Grid is the fallback/accessibility mode.
+- Existing prefs/env `quadrant` load as `Dual` (serde + parse alias).
 - Settings → **System** section, one row: **Controller keyboard** →
-  Quadrant / Grid.
-- Debug/QA override: `SDSC_OSK_MODE=quadrant|grid` (debug builds).
-- Mode changes while the OSK is open reset both halves/gestures.
+  Dual QWERTY / Grid.
+- Debug/QA override: `SDSC_OSK_MODE=dual|grid` (debug builds; `quadrant` also
+  maps to dual).
+- Mode changes while the OSK is open reset both layouts.
 
-### Quadrant layout
+### Dual QWERTY layout
 
-Split QWERTY. Left stick covers the left half, right stick the right half.
+Split QWERTY. Each half keeps a persistent cursor; the left stick moves the
+left cursor and the right stick moves the right cursor.
 
 ```text
 LEFT                          RIGHT
@@ -385,33 +388,12 @@ LEFT                          RIGHT
    Z X C V B                  N M , . /
 ```
 
-Derived clusters (the article's `FTGB` example is the left "right" quadrant):
-
-| Half | Quadrant | Default / inner | Up | Down | Outer |
-|---|---|---|---|---|---|
-| Left | Right | F | T | B | G |
-| Left | Left | S | Q | Z | A |
-| Left | Up | E | — | — | W (left) / R (right) |
-| Left | Down | C | — | — | X (left) / V (right) |
-| Left | Home | D (L3 click) | | | |
-| Right | Right | L | P | / | ; |
-| Right | Left | J | Y | N | H |
-| Right | Up | I | — | — | U (left) / O (right) |
-| Right | Down | , | — | — | M (left) / . (right) |
-| Right | Home | K (R3 click) | | | |
-
-Sub-key rules:
-
-- Horizontal quadrants: up/down if the perpendicular axis passes the sub
-  threshold; outer if the along-axis magnitude is near full; otherwise the
-  default inner key.
-- Vertical quadrants: left/right if the perpendicular axis passes the sub
-  threshold; otherwise the default center key. The outer slot duplicates the
-  default (no fourth key).
-- Full deflection selects the outer key only when not in an up/down sub-zone.
-- Home keys are not in any quadrant; use L3/R3 clicks.
-
-Symbol layer (proposal; tune during implementation):
+- Cursors start on **D** and **K** (home row, middle column).
+- Movement is one key per stick step; edges clamp, they do not wrap.
+- The shared `NavStepper` supplies the repeat schedule (280ms initial delay,
+  90ms repeat, 100ms neutral release grace).
+- Both cursors move independently and are always highlighted.
+- Symbol layer preserves both cursor positions (same 3x5 index):
 
 ```text
 LEFT                          RIGHT
@@ -420,53 +402,35 @@ LEFT                          RIGHT
  . , ? ! '                    # % + = ~
 ```
 
-Home symbols are the center keys (`:` and `&`) by default; rearrange if needed.
+### DQ input
 
-### Gesture state machine
-
-Per half, independent:
-
-1. **Idle** — inside arm radius.
-2. **Arm** — cross arm radius; choose quadrant by dominant axis; latch it.
-3. **Preview** — update sub-key with hysteresis.
-4. **Commit** — returning inside release radius commits the preview once.
-5. **Re-arm** — require neutral before the next character.
-
-Rules:
-
-- Commit on **release to neutral**, not on sub-key entry. This prevents typing
-  the default key on the way to a sub-key.
-- Quadrant latches until neutral for v1. Crossing the center into another
-  quadrant cancels the gesture; require neutral. (Future: cross-center
-  re-latch if playtesting wants it.)
-- Use hysteresis on arm, release, sub-direction, and outer thresholds.
-- Both sticks may be active independently.
-- Opening/closing/layer change resets both halves and requires neutral.
-- Starting thresholds (tune with a real pad):
-  - arm radius `0.55`
-  - release radius `0.22`
-  - sub-direction enter `0.45`, leave `0.32`
-  - outer enter `0.82`, leave `0.70`
-- `PadSample.lstick_x/y` and `rstick_x/y` already have the soft `0.12`
-  deadzone; use a radial arm threshold above that.
+- **L2 / R2** commit the selected left/right key on the trigger's rising edge.
+  Holding a trigger types once.
+- Both triggers pressed together type both selected keys (left first); there
+  is no chord/space gesture in the minimal mapping.
+- **Cross** is Space, **Triangle** Backspace, **Square** Alpha/Symbols,
+  **Options** Enter, **Circle** Close.
+- Opening/closing/layer reset the cursor state; layer changes keep positions.
+- `PadSample.lstick_x/y` and `rstick_x/y` use the soft `0.12` deadzone; the
+  sticks are navigation only, not text commit gestures.
 
 ### Controls
 
 | Input | Action |
 |---|---|
-| Left stick | Left half |
-| Right stick | Right half |
+| Left stick | Move the left cursor |
+| Right stick | Move the right cursor |
+| L2 | Type the left selected key |
+| R2 | Type the right selected key |
 | Cross | Space |
 | Triangle | Backspace (tap; no repeat in v0) |
-| R2 | Enter |
 | Square | Alpha / Symbols |
+| Options | Enter |
 | Circle | Close OSK |
-| L3 | Home key left (D) |
-| R3 | Home key right (K) |
 
 - OSK keys/control bar are static; no mouse click handlers.
 - Grid mode retains D-pad focus, Cross activate, Triangle backspace, Square
-  layer, Circle close. No mouse-clickable keys.
+  layer, Options enter, Circle close. No mouse-clickable keys.
 - First Cross on a page text field opens the OSK; no focus auto-open.
 
 ### System overlay
@@ -638,7 +602,7 @@ Required design before splitting:
 - The main app does **not** link CEF/Browser UI after the split.
 - The shared boundary is the app protocol crate (manifest/surface/actions/
   text-session/lifecycle), not the OSK UI.
-- Cargo features can gate Grid/Quadrant modes per build if a particular app
+- Cargo features can gate Grid/Dual QWERTY modes per build if a particular app
   does not need both; both apps use the system OSK service, not a shared UI
   library.
 
@@ -668,7 +632,7 @@ packaging decisions are settled. Do not attempt the full split in the first PR.
 - Move OSK state/view/tick out of `ui/browser`/`app/browser` into system
   ownership (`ui/osk/` + `app/osk.rs` or equivalent).
 - Implement the topmost no-activate overlay window/platform bits.
-- Grid mode first (move existing behavior), then Quadrant.
+- Grid mode first (move existing behavior), then Dual QWERTY.
 - Add global `OskMode` pref + System settings row + debug override.
 - Controller-only policy: Cross-only open, real-input close, keyboard handoff,
   static keys, no F6/Square.
@@ -709,8 +673,8 @@ replay only; never OS input injection; keep `SDSC_DEBUG_INPUT=0`.
 
 Unit tests:
 
-- Quadrant mapping, thresholds/hysteresis, neutral re-arm, cross-center cancel,
-  both sticks, home keys, symbols, mode switching.
+- Dual QWERTY cursor mapping/clamping, independent halves, layer persistence,
+  trigger edge latches, mode switching.
 - Action manifest/enabled state and OS mapping defaults.
 - Browser v0: single tab, restore last page, popups denied, no chrome targets,
   page cursor/docking still works, back/forward/reload actions.
@@ -726,11 +690,12 @@ Replay/pixel QA:
   uniform-render guard.
 - New action QA — L1/R1/Options fire back/forward/reload; enabled state
   respected; no hold/hints.
-- New system OSK QA — first Cross on a page field opens; Quadrant gesture types;
-  Grid fallback via `SDSC_OSK_MODE=grid`; mouse/keyboard close + hand-off.
+- System OSK QA — first Cross on a page field opens; DQ types from both halves;
+  Grid fallback via `SDSC_OSK_MODE=grid`; mouse/keyboard close + hand-off;
+  `qa_osk_visual.py` screenshots the overlay and asserts both halves/cursors.
 - Non-browser OSK QA — Launcher Settings Title/Args editing; save/add path.
-- Manual controller playtest for quadrant thresholds/feel, overlay z-order,
-  no-activate focus, Home/OSK interaction.
+- Manual controller playtest for DQ cursor feel, overlay z-order, no-activate
+  focus, Home/OSK interaction.
 
 ---
 
@@ -759,7 +724,7 @@ Current touch points:
 
 Likely new modules:
 
-- `src/ui/osk/` — system OSK state/layout/view (Quadrant + Grid), no Browser
+- `src/ui/osk/` — system OSK state/layout/view (Dual QWERTY + Grid), no Browser
   imports.
 - `src/app/osk.rs` — system OSK session/input/output/overlay lifecycle.
 - `src/app/actions.rs` or equivalent — semantic action manifest/mapping.
@@ -833,8 +798,8 @@ Phases A–C are complete when:
   hold/hints.
 - The OSK is system-owned and rendered as a topmost no-activate overlay, not a
   Browser component.
-- Quadrant is the default mode; Grid fallback; System settings row; debug
-  override; mode persists.
+- Dual QWERTY is the default mode; Grid fallback; System settings row; debug
+  override; mode persists; legacy `quadrant` prefs load as dual.
 - Cross-only open, first Cross on a page field; real input closes; keyboard
   hand-off; F6/Square/Triangle→URL removed; static keys.
 - Page text sessions use the system OSK; no address prompt.

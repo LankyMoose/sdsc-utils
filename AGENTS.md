@@ -21,7 +21,8 @@
 | Browser action QA (Back/Forward/Reload) | `python scripts/qa_browser_actions.py` |
 | Browser popup-denial QA (synthetic, no OS input) | `python scripts/qa_browser_popup.py` |
 | Browser realistic-flow QA (search/click/back/URL/Circle) | `python scripts/qa_browser_flows.py` |
-| System OSK QA (Quadrant + Grid) | `python scripts/qa_browser_osk.py` |
+| System OSK QA (Dual QWERTY + Grid) | `python scripts/qa_browser_osk.py` |
+| System OSK visual QA (both halves + cursors) | `python scripts/qa_osk_visual.py` |
 | Launcher Settings OSK proof QA | `python scripts/qa_launcher_osk.py` |
 | Browser pixel QA (render smoke test) | `python scripts/qa_browser_visual.py` |
 
@@ -101,7 +102,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 | `src/app/` | iced daemon (`App`): tray, HID worker ownership, `DeviceSession`, window lifecycle for popup / Settings / Launcher / toast / system OSK, message routing; `browser.rs` (top-level `BrowserAppState`, standalone Browser window, header/URL editor, pad/key/`BrowserMessage` routing), `osk.rs` (system OSK session/overlay/input/text routing), `actions.rs` (semantic action bindings), `home.rs` (`HomeApps` installed/active apps + Home window lifecycle/input) |
 | `src/browser/` | Browser internals: engine seam + CEF OSR worker, DOM target query, controller cursor, dormant tabs/bookmarks/history backends, stable frame texture; no reader fallback |
 | `src/hosted/` | Hosted app contract v0: manifest, native surface, semantic actions, text session, OS-owned lifecycle (no widget toolkit) |
-| `src/ui/osk/` | System controller keyboard: Quadrant core/layouts + Grid fallback; no Browser imports |
+| `src/ui/osk/` | System controller keyboard: Dual QWERTY core/layouts + Grid fallback; no Browser imports |
 | `src/app/actions.rs` | OS-owned semantic action bindings (Browser L1/R1/Options) + `ActionInvoked` path |
 | `src/session/` | Pure device session (no windows/HWND): presence, notify, analytics, Launcher-open policy; emits `SessionEffect`s the UI applies |
 | `src/controller/` | HID polling + worker (`hid/`), DualSense protocol (`dualsense/`: battery, lightbar, rumble, input, identity), known controllers, debug-only `emulate` emulation |
@@ -127,7 +128,7 @@ Missing this order can cause subtle issues (clippy warnings can fmt-reformat cod
 - **Button taps are source-side events, not reconstructed state**. `PadInterpreter` consumes ordered raw HID reports (not the merged snapshot), debounces press/release, and emits `PadAction::Tap`; `PadActionGate` dedupes UI sequence and arms pads only after rest following an owner change. Home/Browser/Launcher route these actions centrally. Do not add per-surface edge detection for face/Options/Create/L1/R1/L3/R3 taps. Analog/D-pad repeat and the Cross/Triangle hold progress meters still use the legacy per-surface bank.
 - **Battery step mapping is Linux-midpoint**. Windows may report different percentages; the app maps firmware steps → percentages via the fixed mid-point formula.
 - **Browser v0 is single-tab, in-process, and has one header row**: Back/L1 · URL well (Triangle edits) · Forward/R1. No tab strip/bookmarks/history/status UI; popups denied. Circle closes/suspends (cancelling an active URL edit first); Home/PS also closes. L1/R1/Options are semantic back/forward/reload via `src/app/actions.rs`; tap only. Triangle opens the URL editor through the system OSK (`OskTarget::BrowserUrl`), separate from page text/IME. Keep page cursor/D-pad/docking/IME intact. The separate `sdsc-browser` add-on process, stdio protocol, and Home add-on install were tried and reverted (see `notes/single-process-browser.md`); do not reintroduce IPC without a committed packaging requirement.
-- **The OSK is a system service**: `src/ui/osk/` + `src/app/osk.rs`, topmost no-activate overlay; the Browser ships no OSK UI/layout/gesture/mode code. Cross on a page field or Triangle in the URL well opens it; real mouse/keyboard/IME/touch closes it, keyboard keys hand off (Escape consumed). Quadrant is default; Grid fallback; `OskMode` is a system pref (`SDSC_OSK_MODE=quadrant|grid` debug override).
+- **The OSK is a system service**: `src/ui/osk/` + `src/app/osk.rs`, topmost no-activate overlay; the Browser ships no OSK UI/layout/gesture/mode code. Cross on a page field or Triangle in the URL well opens it; real mouse/keyboard/IME/touch closes it, keyboard keys hand off (Escape consumed). Dual QWERTY (split cursors, L2/R2 type) is default; Grid fallback; `OskMode` is a system pref (`SDSC_OSK_MODE=dual|grid` debug override, legacy `quadrant` maps to dual).
 
 ## Where to find things
 

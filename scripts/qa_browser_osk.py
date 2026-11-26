@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""System OSK smoke test (no OS input).
+"""System OSK behaviour test (no OS input).
 
 Covers both modes:
-- Quadrant (default): first Cross on a page text field opens the system OSK,
-  split-stick release-to-neutral commits characters, keyboard input closes the
-  OSK and hands the key to the page, real mouse input dismisses it.
+- Dual QWERTY (default): first Cross on a page text field opens the system OSK,
+  both sticks move independent cursors, L2/R2 type from both halves, Cross is
+  space, Triangle backspaces, Square switches symbols, Options enters, real
+  mouse input dismisses it, and keyboard input closes + hands off the key.
 - Grid (`SDSC_OSK_MODE=grid`): the same Cross open, D-pad/Cross activation
   path types the focused grid key.
 
@@ -86,34 +87,45 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     session = Path(tempfile.gettempdir()) / f"sdsc-system-osk-{mode}-qa" / stamp
     session.mkdir(parents=True, exist_ok=True)
-    if mode == "quadrant":
+    if mode == "dual":
         actions = [
             {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
             {"app": "browser", "action": "cursor.dock", "params": {"x": 100, "y": 70}},
             # First Cross on the text field: focus + open the system OSK.
             {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            # Opening requires a neutral stick sample before arming.
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-            # F: left stick right quadrant default, commit on release.
+            # D and K: one character from each half's persistent cursor.
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
+            # Move the left cursor D -> F and type F.
             {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": 0.0}},
             {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-            # Neutral re-arm gate, then T: up subkey (hysteresis path).
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": -0.6}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
+            # Move the right cursor K -> J and type J. Both halves stay independent.
+            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": -0.65, "y": 0.0}},
+            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": 0.0, "y": 0.0}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
+            # Cross Space, Triangle Backspace.
+            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+            {"app": "browser", "action": "pad.tap", "params": {"button": "triangle"}},
+            # Symbols: left F slot is ';', right J slot is '$' on the symbol layer.
+            {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
+            # Back to alpha, the right cursor persisted on J across the layer.
+            {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
+            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
+            # Options is Enter; the page field keeps its value.
+            {"app": "browser", "action": "pad.tap", "params": {"button": "options"}},
             # Real keyboard closes the OSK, then hands 'a' to the page field.
             {"app": "browser", "action": "key", "params": {"key": "a"}},
-            # Reopen with Cross, type F, then dismiss with real mouse input.
+            # Reopen with Cross, then dismiss with real mouse input.
             {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": 0.0}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
             {"app": "browser", "action": "mouse.click", "params": {"x": 100, "y": 270}},
             # Reopen and close with Escape (consumed by the OSK).
             {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
             {"app": "browser", "action": "key", "params": {"key": "escape"}},
         ]
-        expected = "ftaf"
+        expected = "dkfj;$ja"
     else:
         actions = [
             {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
@@ -179,9 +191,13 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
         platform = read_jsonl(trace_dir / "platform.jsonl") if trace_dir else []
         opens = [row for row in platform if row.get("event") == "osk.open"]
         closes = [row for row in platform if row.get("event") == "osk.close"]
+        enters = [row for row in platform if row.get("event") == "osk.enter"]
         pad_taps = [row for row in platform if row.get("event") == "replay.pad_tap"]
         print(f"{mode}: sandbox={sandbox}")
-        print(f"{mode}: title={title!r} opens={len(opens)} closes={len(closes)}")
+        print(
+            f"{mode}: title={title!r} opens={len(opens)} closes={len(closes)} "
+            f"enters={len(enters)}"
+        )
         if title != f"typed={expected}":
             return False, f"{mode}: expected typed={expected}, got {title!r}"
         if not opens:
@@ -194,9 +210,11 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
             return False, f"{mode}: OSK opened before Cross (focus auto-open regression)"
         if not any(row.get("reason") == "keyboard" for row in closes):
             return False, f"{mode}: keyboard did not close the OSK"
-        if mode == "quadrant":
+        if mode == "dual":
+            if not enters:
+                return False, "dual: Options never emitted osk.enter"
             if not any(row.get("reason") == "mouse" for row in closes):
-                return False, "quadrant: real mouse did not close the OSK"
+                return False, "dual: real mouse did not close the OSK"
         return True, ""
     finally:
         if not args_keep and proc.poll() is None:
@@ -232,7 +250,7 @@ def main() -> int:
     session.mkdir(parents=True, exist_ok=True)
     page = session / "osk.html"
     page.write_text(PAGE, encoding="utf-8")
-    for mode in ("quadrant", "grid"):
+    for mode in ("dual", "grid"):
         ok, error = run(exe, root, page, mode)
         if not ok:
             print(f"error: {error}", file=sys.stderr)

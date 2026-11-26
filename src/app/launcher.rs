@@ -1737,6 +1737,7 @@ impl App {
                     Some("circle") => PadButton::Circle,
                     Some("square") => PadButton::Square,
                     Some("triangle") => PadButton::Triangle,
+                    Some("options") => PadButton::Options,
                     _ => return Task::none(),
                 };
                 self.replay_pad_tap(button)
@@ -1765,6 +1766,14 @@ impl App {
                     Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
                     _ => self.replay_osk_stick(pair, (0.0, 0.0)),
                 }
+            }
+            "osk.trigger" => {
+                let side = step
+                    .params
+                    .get("side")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("left");
+                self.replay_osk_trigger(side)
             }
             "key" => {
                 let key = step

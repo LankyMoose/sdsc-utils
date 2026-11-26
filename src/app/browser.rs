@@ -372,6 +372,15 @@ impl super::App {
                 }
             }
             #[cfg(debug_assertions)]
+            "osk.trigger" => {
+                let side = step
+                    .params
+                    .get("side")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("left");
+                self.replay_osk_trigger(side)
+            }
+            #[cfg(debug_assertions)]
             "osk.open" => self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage),
             #[cfg(debug_assertions)]
             "osk.close" => self.close_osk("replay"),
@@ -468,6 +477,21 @@ impl super::App {
                 invalidate.chain(Task::perform(
                     super::delay(std::time::Duration::from_millis(250)),
                     |()| Message::Browser(crate::ui::browser::BrowserMessage::Capture),
+                ))
+            }
+            #[cfg(debug_assertions)]
+            "osk.screenshot" => {
+                // Same settle delay as the Browser shot. The OSK is a separate
+                // window: capture it directly so transparent regions and both
+                // keyboard halves are visible to pixel QA.
+                let invalidate = self
+                    .osk
+                    .window
+                    .map(crate::ui::layout::invalidate_window)
+                    .unwrap_or_else(Task::none);
+                invalidate.chain(Task::perform(
+                    super::delay(std::time::Duration::from_millis(250)),
+                    |()| Message::OskCapture,
                 ))
             }
             #[cfg(debug_assertions)]
