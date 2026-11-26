@@ -336,12 +336,12 @@ pub fn remount_toast_surface<Message: Send + 'static>(
     window::resize(id, size)
 }
 
-/// Hide the overlay toast without going through iced `set_mode(Hidden)`.
+/// Hide an overlay shown through [`show_overlay_without_activate`].
 ///
-/// On Windows the toast is shown via raw `ShowWindow`, so winit's `VISIBLE`
-/// flag stays false; `set_mode(Hidden)` would then be a no-op and leave the
-/// toast on screen.
-pub fn hide_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+/// On Windows these overlays are shown via raw `ShowWindow`, so winit's
+/// `VISIBLE` flag stays false; `set_mode(Hidden)` would then be a no-op and
+/// leave the window on screen.
+pub fn hide_overlay_without_activate<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
         window::run(id, |window| {
@@ -362,6 +362,11 @@ pub fn hide_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     {
         window::set_mode(id, window::Mode::Hidden)
     }
+}
+
+/// Hide the overlay toast; see [`hide_overlay_without_activate`].
+pub fn hide_toast<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    hide_overlay_without_activate(id)
 }
 
 pub fn popup_position(anchor: TrayAnchor, scale: f32, monitor: Option<Size>, size: Size) -> Point {

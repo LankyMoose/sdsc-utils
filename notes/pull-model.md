@@ -40,6 +40,12 @@ they are not the integrator for analog state.
   so hidden windows never subscribe.
 - Gate a hold/cursor clock on the model's own activity
   (`needs_frames`, `hold_animating`), not on raw pad edges.
+- Warm hidden windows still get `view` builds. Return cheap empty content when
+  the surface is closed (OSK) instead of rebuilding its full layout on every
+  unrelated frame.
+- Overlays shown with raw `ShowWindow(SW_SHOWNOACTIVATE)` must hide with raw
+  `host::hide` (`hide_overlay_without_activate`); `set_mode(Hidden)` no-ops
+  because winit still thinks the window is hidden.
 
 ## Checklist for a new animated surface
 

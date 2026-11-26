@@ -1818,6 +1818,12 @@ impl App {
         }
 
         if Some(window) == self.osk.window {
+            // Warm window, closed keyboard: keep the view cheap. Rebuilding
+            // the full layout on every BrowserFrame was enough to jank the
+            // cursor after the first OSK open/close.
+            if !self.osk.state.open {
+                return crate::ui::osk::empty();
+            }
             return crate::ui::osk::surface(
                 &self.osk.state,
                 Arc::clone(&self.osk.slot),

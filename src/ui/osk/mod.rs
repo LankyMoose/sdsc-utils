@@ -288,6 +288,17 @@ fn keycap(label: &str, active: bool, width: impl Into<Length>) -> Element<'stati
     .into()
 }
 
+/// Cheap placeholder for the warm-but-closed OSK window.
+///
+/// The window is kept allocated for fast reopen; without this the full
+/// keyboard layout would be rebuilt on every app update even while closed.
+pub fn empty<'a, Message: 'a>() -> Element<'a, Message> {
+    container(space())
+        .width(Length::Shrink)
+        .height(Length::Shrink)
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

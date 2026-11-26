@@ -137,7 +137,9 @@ impl App {
         };
         // Hide, don't destroy: the overlay stays warm for the next text field,
         // and keyboard focus never left the host app in the first place.
-        let hide = window::set_mode(id, window::Mode::Hidden);
+        // Must use the raw hide: the OSK was shown with SW_SHOWNOACTIVATE, so
+        // winit thinks it is already hidden and `set_mode(Hidden)` no-ops.
+        let hide = crate::ui::layout::hide_overlay_without_activate(id);
         if target == Some(OskTarget::BrowserUrl) {
             return hide.chain(self.invalidate_browser_window());
         }
