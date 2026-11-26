@@ -364,6 +364,11 @@ Future additions (not now):
 
 ## 6. System OSK design
 
+> **Pending follow-up:** the OSK refresh/navigation refactor is tracked in
+> [refresh-navigation-work-order.md](refresh-navigation-work-order.md) —
+> pull-model OSK, menu-grade navigation gate, all-live-pad feedback, and
+> per-window refresh. This section describes the current shipped behavior.
+
 ### Modes and settings
 
 - `OskMode::{Dual, Grid}`, global system pref.
