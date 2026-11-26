@@ -71,7 +71,8 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   rendering and `BrowserMessage`. The header is one centred row inside the
   16:9 card: `‹ L1` · URL well · `R1 ›`. Each history cluster is one capsule
   holding just the bumper key and its chevron; the chevron uses the dim label
-  color and both dim together when the action is unavailable.
+  color and both dim together when the action is unavailable. SVG tint alpha
+  is ignored by the rasterizer, so icon dimming uses `Svg::opacity`.
   The URL well is 420–680px wide; equal side slots keep it centred with an 8px
   gap to each capsule. `BrowserPanel` owns the URL draft/edit state; the page
   starts below a 44px row + 1px rule.

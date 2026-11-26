@@ -153,6 +153,7 @@ def assert_header(
     geometry: dict[str, float],
     *,
     editing: bool,
+    forward_disabled: bool = False,
     label: str,
 ) -> None:
     header_top = int(geometry["header_top"])
@@ -198,6 +199,21 @@ def assert_header(
     if accent < 8:
         raise AssertionError(f"{label}: header action prompts missing (accent={accent})")
 
+    # A disabled forward capsule must dim its key and chevron together. The
+    # SVG rasterizer ignores the tint color's alpha, so icons need the widget
+    # opacity; without it the chevron stayed full-brightness next to a dim key.
+    if forward_disabled:
+        x0 = int(url_x + url_w) + 8
+        mid = int(geometry["header_mid"])
+        peak = 0
+        for y in range(mid - 12, mid + 12):
+            for x in range(x0, x0 + 80):
+                peak = max(peak, sum(pixel(rgba, width, x, y)))
+        if peak >= 280:
+            raise AssertionError(
+                f"{label}: disabled forward hint is not dim (peak={peak})"
+            )
+
 
 def assert_page_color(
     rgba: bytes,
@@ -232,7 +248,13 @@ def build_plan(session: Path) -> tuple[list[dict[str, object]], list[dict[str, o
     def action(name: str, params: dict[str, object] | None = None) -> dict[str, object]:
         return {"app": "browser", "action": name, "params": params or {}}
 
-    def shot(label: str, requires: list[dict[str, object]], page: str, editing: bool) -> None:
+    def shot(
+        label: str,
+        requires: list[dict[str, object]],
+        page: str,
+        editing: bool,
+        forward_disabled: bool = False,
+    ) -> None:
         # The first capture settles the compositor (and can still read the
         # previous frame after a commit); the second is the asserted shot.
         settle = action("screenshot")
@@ -247,6 +269,7 @@ def build_plan(session: Path) -> tuple[list[dict[str, object]], list[dict[str, o
                 "requires": requires,
                 "color": PAGE[page]["color"],
                 "editing": editing,
+                "forward_disabled": forward_disabled,
             }
         )
 
@@ -260,6 +283,7 @@ def build_plan(session: Path) -> tuple[list[dict[str, object]], list[dict[str, o
         ],
         "google",
         False,
+        forward_disabled=True,
     )
 
     # Search: click the field, type, submit.
@@ -520,6 +544,7 @@ def main() -> int:
                 width,
                 geometry,
                 editing=bool(spec["editing"]),
+                forward_disabled=bool(spec["forward_disabled"]),
                 label=f"step {index} {spec['label']}",
             )
             assert_page_color(

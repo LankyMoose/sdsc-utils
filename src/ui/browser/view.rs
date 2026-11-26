@@ -182,10 +182,16 @@ fn browser_cursor_debug_overlay(
     )
 }
 
-fn header_icon(icon: &'static str, size: f32, color: Color) -> Element<'static, BrowserMessage> {
+fn header_icon(
+    icon: &'static str,
+    size: f32,
+    color: Color,
+    opacity: f32,
+) -> Element<'static, BrowserMessage> {
     svg(svg::Handle::from_memory(icon.as_bytes()))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
+        .opacity(opacity)
         .style(move |_theme, _status| svg::Style { color: Some(color) })
         .into()
 }
@@ -205,9 +211,12 @@ fn history_hint(
     const ICON_SIZE: f32 = 14.0;
     let alpha = if enabled { 1.0 } else { 0.4 };
     let mut parts: Vec<Element<'static, BrowserMessage>> = Vec::with_capacity(2);
-    let icon_color = theme::scale_alpha(theme::DIM, alpha);
+    // SVG tinting replaces only RGB; the color alpha is ignored by the
+    // rasterizer. Use the widget opacity (applied in the image shader) so the
+    // chevron dims with the key.
+    let icon_color = theme::DIM;
     if icon_first {
-        parts.push(header_icon(icon, ICON_SIZE, icon_color));
+        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha));
     }
     let key_text = || {
         // The monospace key's cap reads one pixel high when only its line box
@@ -229,7 +238,7 @@ fn history_hint(
     };
     parts.push(key_text());
     if !icon_first {
-        parts.push(header_icon(icon, ICON_SIZE, icon_color));
+        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha));
     }
     let border = if pressed {
         theme::ACCENT
@@ -283,7 +292,7 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
         text_fit::ellipsize_to_width(display_url(panel.session.url()), 14.0, budget)
     };
     let mut content = row![
-        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED),
+        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED, 1.0),
         text(value)
             .size(14.0)
             .wrapping(Wrapping::None)
