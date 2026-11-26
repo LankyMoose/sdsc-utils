@@ -125,10 +125,6 @@ pub struct BrowserAppState {
     /// An update is on disk but the running CEF is still the old version.
     #[cfg(feature = "cef-engine")]
     pub engine_restart_required: bool,
-    /// Accumulated analog scroll for the next BrowserFrame tick.
-    pub pending_scroll: (f32, f32),
-    /// Page point the pending scroll belongs to (cursor at accumulation).
-    pub pending_scroll_at: (f32, f32),
     /// Engine-mode D-pad cursor jumps run on this standalone stepper (fed a
     /// stickless `dpad_only` mask): the Launcher bank stays parked in engine
     /// mode so stick moves never double-fire into both cursor and nav.
@@ -142,35 +138,10 @@ pub struct BrowserAppState {
     pub tabs_restored: bool,
 }
 
-impl BrowserAppState {
-    /// True while the Browser window has visual state that changes without an
-    /// app message: cursor velocity/flight/dock morph or an unsent mouse
-    /// position. Gates `BrowserFrame`; CEF presentation is pull-model.
-    pub(crate) fn needs_frames(&self) -> bool {
-        let cursor = &self.panel.cursor;
-        let moving = cursor.vx.abs() > 0.5 || cursor.vy.abs() > 0.5 || cursor.fly_to.is_some();
-        let dock_target = if cursor.attached.is_some() { 1.0 } else { 0.0 };
-        let morphing = (cursor.dock_blend - dock_target).abs() > 0.001;
-        let (qx, qy) = (cursor.x as i32, cursor.y.max(0.0) as i32);
-        let mouse_pending = self.panel.last_sent_mouse != Some((qx, qy));
-        let scroll_pending = self.pending_scroll.0 != 0.0 || self.pending_scroll.1 != 0.0;
-        moving || morphing || mouse_pending || scroll_pending
-    }
-}
-
 use iced::Task;
 use std::time::Instant;
 
 use super::Message;
-
-/// True when a pad sample has a live analog cursor/scroll axis. Face buttons
-/// do not need the Browser cursor clock; their actions run immediately.
-pub(crate) fn browser_stick_active(sample: &crate::domain::pad::PadSample) -> bool {
-    sample.lstick_x != 0.0
-        || sample.lstick_y != 0.0
-        || sample.rstick_x != 0.0
-        || sample.rstick_y != 0.0
-}
 
 /// Map source-side tap actions to the Browser's semantic nav actions.
 /// Tap only: no hold actions, no history selector, no hints/status.
@@ -337,11 +308,12 @@ impl super::App {
                         .iter()
                         .find(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
                         .map(|f| f.id);
-                    panel.cursor.attached = id;
-                    panel.cursor.x = x;
-                    panel.cursor.y = y;
-                    panel.cursor.dock_blend = if id.is_some() { 1.0 } else { 0.0 };
-                    panel.cursor.last_dock = id.and_then(|id| {
+                    let mut cursor = panel.cursor.lock();
+                    cursor.cursor.attached = id;
+                    cursor.cursor.x = x;
+                    cursor.cursor.y = y;
+                    cursor.cursor.dock_blend = if id.is_some() { 1.0 } else { 0.0 };
+                    cursor.cursor.last_dock = id.and_then(|id| {
                         panel
                             .focusables
                             .iter()
@@ -350,6 +322,56 @@ impl super::App {
                     });
                 }
                 Task::none()
+            }
+            #[cfg(debug_assertions)]
+            "pad.stick" => {
+                let x = step
+                    .params
+                    .get("x")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let y = step
+                    .params
+                    .get("y")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let mut sample = crate::domain::pad::PadSample {
+                    lstick_x: x,
+                    lstick_y: y,
+                    stick_x: x,
+                    stick_y: y,
+                    ..Default::default()
+                };
+                sample.rstick_x = step
+                    .params
+                    .get("rx")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                sample.rstick_y = step
+                    .params
+                    .get("ry")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                sample.r2 = step
+                    .params
+                    .get("r2")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let pad = crate::domain::pad::PadId("replay".into());
+                let reading = crate::ui::launcher::input::NavReading {
+                    id: pad,
+                    sample,
+                    source: "replay",
+                };
+                let neutral = reading.sample.lstick_x == 0.0
+                    && reading.sample.lstick_y == 0.0
+                    && reading.sample.rstick_x == 0.0
+                    && reading.sample.rstick_y == 0.0;
+                self.input_hub
+                    .set_replay_reading((!neutral).then(|| reading.clone()));
+                self.input_hub
+                    .publish(vec![reading], crate::domain::pad::SnapshotReason::Sample);
+                self.invalidate_browser_window()
             }
             #[cfg(debug_assertions)]
             "pad.tap" => {
@@ -1495,7 +1517,6 @@ impl super::App {
         // Center before the first frame, not after the window has painted the
         // previous open's cursor position.
         self.browser.panel.cursor.reset_for_page();
-        self.browser.panel.last_sent_mouse = None;
         self.browser_visible = true;
         self.browser_pending_show = true;
         let was_open = self.browser.panel.session.is_open();
@@ -1614,43 +1635,6 @@ impl super::App {
         self.sync_browser_viewport();
         Task::none()
     }
-
-    pub(crate) fn on_browser_frame(&mut self) -> Task<Message> {
-        if !self.browser_visible
-            || self.home_visible
-            || self.launcher_visible
-            || self.osk.state.open
-        {
-            return Task::none();
-        }
-        // One integrator, one clock. The cursor advances from the latest HID
-        // snapshot at the Browser frame rate instead of splitting integration
-        // between PadInput edges and a stale-sample fallback. This keeps a
-        // held stick moving even when page pixels are static.
-        let now = Instant::now();
-        let sample = self
-            .input_hub
-            .latest_reading(std::time::Duration::from_millis(200))
-            .map(|reading| reading.sample)
-            .unwrap_or_default();
-        self.advance_browser_cursor(&sample, now);
-        // Cursor glides and script-driven scroll still need one mouse sync
-        // per paint even when no new pad edge arrived.
-        if let Some(engine) = &self.browser.engine {
-            let (dx, dy) = std::mem::take(&mut self.browser.pending_scroll);
-            if dx != 0.0 || dy != 0.0 {
-                let (x, y) = self.browser.pending_scroll_at;
-                engine.send(EngineCommand::ScrollBy {
-                    tab: self.browser_tab(),
-                    dx,
-                    dy,
-                    x,
-                    y,
-                });
-            }
-        }
-        self.sync_browser_mouse()
-    }
 }
 
 impl super::App {
@@ -1726,22 +1710,22 @@ impl super::App {
                     Some(NavAction::Up) => {
                         self.play_ui_cue(UiSoundKind::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Up);
-                        Task::none()
+                        self.invalidate_browser_window()
                     }
                     Some(NavAction::Down) => {
                         self.play_ui_cue(UiSoundKind::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Down);
-                        Task::none()
+                        self.invalidate_browser_window()
                     }
                     Some(NavAction::Left) => {
                         self.play_ui_cue(UiSoundKind::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Left);
-                        Task::none()
+                        self.invalidate_browser_window()
                     }
                     Some(NavAction::Right) => {
                         self.play_ui_cue(UiSoundKind::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Right);
-                        Task::none()
+                        self.invalidate_browser_window()
                     }
                     Some(NavAction::Confirm) => self.click_browser_cursor(),
                     // Triangle is the URL editor; page navigation itself
@@ -1752,23 +1736,18 @@ impl super::App {
                     Some(NavAction::Cancel) => self.on_browser_circle(),
                     Some(NavAction::ToggleMagnetism) => {
                         self.play_ui_cue(UiSoundKind::Action);
-                        let cursor = &mut self.browser.panel.cursor;
-                        cursor.magnet = !cursor.magnet;
-                        if !cursor.magnet {
-                            cursor.attached = None;
-                            cursor.no_dock = None;
-                        }
+                        let magnet = !self.browser.panel.cursor.snapshot().magnet;
+                        self.browser.panel.cursor.set_magnet(magnet);
                         crate::platform::app_log::info(format!(
                             "ui-diag: browser magnet {}",
-                            if cursor.magnet { "on" } else { "off" }
+                            if magnet { "on" } else { "off" }
                         ));
-                        Task::none()
+                        self.invalidate_browser_window()
                     }
                     _ => Task::none(),
                 }
             };
-            let sync = self.sync_browser_mouse();
-            Task::batch(vec![flag, action, sync])
+            Task::batch(vec![flag, action])
         } else {
             // Reader fallback: D-pad scrolls text, Cross restores the page.
             if let Some(invoked) = semantic {
@@ -2714,24 +2693,6 @@ mod tests {
             button,
             action: PadButtonAction::Hold,
         }
-    }
-
-    #[test]
-    fn only_stick_axes_need_the_browser_cursor_clock() {
-        use crate::domain::pad::PadSample;
-        assert!(!browser_stick_active(&PadSample::default()));
-        assert!(!browser_stick_active(&PadSample {
-            cross: true,
-            ..Default::default()
-        }));
-        assert!(browser_stick_active(&PadSample {
-            lstick_x: -0.95,
-            ..Default::default()
-        }));
-        assert!(browser_stick_active(&PadSample {
-            rstick_y: 0.5,
-            ..Default::default()
-        }));
     }
 
     #[test]

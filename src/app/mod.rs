@@ -175,8 +175,6 @@ pub enum Message {
     BrowserOpened(window::Id),
     /// Browser-window chrome / page / cursor message.
     Browser(crate::ui::browser::BrowserMessage),
-    /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
-    BrowserFrame,
     /// Poll a pending history jump that never reported landing/error.
     BrowserHistoryTimeout,
     /// Debug-only: 5s Browser frame-shot cadence + settled-dock capture.
@@ -387,7 +385,6 @@ impl Message {
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
             | Message::BrowserOpened(_)
-            | Message::BrowserFrame
             | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
             | Message::Osk(_)
@@ -530,7 +527,6 @@ impl Message {
             | Message::FinishStartClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
-            | Message::BrowserFrame
             | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
             | Message::EngineInstallDone { .. }
@@ -1648,6 +1644,13 @@ impl App {
         self.input_hub.set_osk_listening(
             self.osk.state.open && !crate::platform::debug_quiet::input_dropped(),
         );
+        self.input_hub.set_browser_listening(
+            self.browser_visible
+                && !self.home_visible
+                && !self.launcher_visible
+                && !self.osk.state.open
+                && !crate::platform::debug_quiet::input_dropped(),
+        );
         if pad_listening {
             subscriptions.push(Subscription::run_with(
                 self.input_hub.clone(),
@@ -1694,18 +1697,8 @@ impl App {
                 iced::time::every(Duration::from_millis(500)).map(|_| Message::LauncherIdleTick),
             );
         }
-        let browser_pad_active = !self.home_visible
-            && !self.launcher_visible
-            && !self.osk.state.open
-            && self
-                .input_hub
-                .latest_reading(Duration::from_millis(200))
-                .is_some_and(|reading| crate::app::browser::browser_stick_active(&reading.sample));
-        if self.browser_visible && (self.browser.needs_frames() || browser_pad_active) {
-            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::BrowserFrame));
-        }
         // A history jump that never reports a landing/error must still settle.
-        // Independent of BrowserFrame so an idle cursor cannot strand it.
+        // Independent of the cursor surface so an idle cursor cannot strand it.
         if self.pending_history_travel.is_some() {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(250))
@@ -1819,7 +1812,7 @@ impl App {
 
         if Some(window) == self.osk.window {
             // Warm window, closed keyboard: keep the view cheap. Rebuilding
-            // the full layout on every BrowserFrame was enough to jank the
+            // the full layout on every app update was enough to jank the
             // cursor after the first OSK open/close.
             if !self.osk.state.open {
                 return crate::ui::osk::empty();
@@ -1844,12 +1837,25 @@ impl App {
                     crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
                 })
                 .unwrap_or(theme::BACKDROP_ALPHA);
+            let draws = crate::ui::browser::view::cursor_draws(&self.browser.panel);
+            let cursor = crate::ui::browser::cursor_surface::CursorSurfaceSpec {
+                handle: self.browser.panel.cursor.clone(),
+                hub: self.input_hub.clone(),
+                engine: self.browser.engine.clone(),
+                tab: self.browser.panel.active_tab,
+                active: draws
+                    && !self.home_visible
+                    && !self.launcher_visible
+                    && !self.osk.state.open,
+                draws,
+            };
             return crate::ui::browser::view::root_view(
                 &self.browser.panel,
                 self.browser.engine_available,
                 w,
                 h,
                 backdrop_alpha,
+                cursor,
             )
             .map(Message::Browser);
         }
@@ -2108,7 +2114,6 @@ impl App {
             Message::Configure(message) => self.on_configure_message(message),
             Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
-            Message::BrowserFrame => self.on_browser_frame(),
             Message::BrowserHistoryTimeout => {
                 self.check_history_travel_timeout();
                 Task::none()
@@ -3438,7 +3443,6 @@ fn redraw_message_source(message: &Message) -> crate::platform::redraw_stats::Me
     match message {
         Message::PadInput(_) => Source::PadInput,
         Message::LauncherFrame => Source::LauncherFrame,
-        Message::BrowserFrame => Source::BrowserFrame,
         Message::ToastFrame => Source::ToastFrame,
         Message::IdentifyFrame => Source::IdentifyFrame,
         Message::HomeProgressTick => Source::HomeProgress,
@@ -3486,28 +3490,108 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
 }
 
 /// Bind the hid-worker → iced pad-input edge channel while listening.
-/// OSK-open edge filter: returns `(forward_to_ui, next_active)`.
-/// Analog frames feed the slot only; the UI needs a wake on transitions,
-/// actions, non-sample snapshots, and while PS is held.
-fn osk_stream_wake(edge: &crate::domain::pad::InputEdge, active: bool) -> (bool, bool) {
+/// Per-stream arm/wake state for the ownership filters.
+#[derive(Debug, Clone, Copy, Default)]
+struct EdgeWakeState {
+    stick: bool,
+    digital: bool,
+}
+
+/// OSK-open edge filter: returns `(forward_to_ui, next_state)`.
+///
+/// Analog frames feed the slot only; the UI needs a wake on stick
+/// transitions, actions, non-sample snapshots, and D-pad/button changes.
+/// Held D-pad repeats are handled by the pull-model widget.
+fn osk_stream_wake(
+    edge: &crate::domain::pad::InputEdge,
+    state: EdgeWakeState,
+) -> (bool, EdgeWakeState) {
     let sample_reason = matches!(
         edge.reason,
         crate::domain::pad::SnapshotReason::Sample
             | crate::domain::pad::SnapshotReason::SamplePartial
     );
-    let resting = edge
+    let stick = edge
         .readings
         .iter()
-        .all(|reading| crate::domain::pad::sample_nav_resting(&reading.sample));
+        .any(|reading| sample_has_stick(&reading.sample));
+    let digital = edge
+        .readings
+        .iter()
+        .any(|reading| sample_has_digital(&reading.sample));
     let ps_held = edge.readings.iter().any(|reading| {
         reading
             .sample
             .held
             .contains(&crate::domain::gesture::GestureControl::Ps)
     });
-    // Wake on start (both false) and release (both true), not while held.
-    let wake = !sample_reason || !edge.actions.is_empty() || ps_held || resting == active;
-    (wake, !resting)
+    let wake = !sample_reason
+        || !edge.actions.is_empty()
+        || ps_held
+        || digital != state.digital
+        || stick != state.stick;
+    (wake, EdgeWakeState { stick, digital })
+}
+
+/// Browser edge filter: the cursor pulls the latest snapshot, so drop
+/// stick-only steady frames. Digital controls stay on the edge stream because
+/// the Browser D-pad stepper repeats from those frames.
+fn browser_stream_wake(
+    edge: &crate::domain::pad::InputEdge,
+    state: EdgeWakeState,
+) -> (bool, EdgeWakeState) {
+    let sample_reason = matches!(
+        edge.reason,
+        crate::domain::pad::SnapshotReason::Sample
+            | crate::domain::pad::SnapshotReason::SamplePartial
+    );
+    let stick = edge
+        .readings
+        .iter()
+        .any(|reading| sample_has_stick(&reading.sample));
+    let digital = edge
+        .readings
+        .iter()
+        .any(|reading| sample_has_digital(&reading.sample));
+    let ps_held = edge.readings.iter().any(|reading| {
+        reading
+            .sample
+            .held
+            .contains(&crate::domain::gesture::GestureControl::Ps)
+    });
+    let wake = !sample_reason
+        || !edge.actions.is_empty()
+        || ps_held
+        || digital
+        || digital != state.digital
+        || stick != state.stick;
+    (wake, EdgeWakeState { stick, digital })
+}
+
+fn sample_has_stick(sample: &crate::domain::pad::PadSample) -> bool {
+    sample.lstick_x != 0.0
+        || sample.lstick_y != 0.0
+        || sample.rstick_x != 0.0
+        || sample.rstick_y != 0.0
+}
+
+fn sample_has_digital(sample: &crate::domain::pad::PadSample) -> bool {
+    !sample.held.is_empty()
+        || sample.cross
+        || sample.circle
+        || sample.square
+        || sample.triangle
+        || sample.options
+        || sample.create
+        || sample.l1
+        || sample.r1
+        || sample.l2
+        || sample.r2
+        || sample.l3
+        || sample.dpad_up
+        || sample.dpad_down
+        || sample.dpad_left
+        || sample.dpad_right
 }
 
 fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + Send + use<> {
@@ -3518,7 +3602,8 @@ fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + S
         let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         hub.bind(tx);
         let _guard = InputEdgeBindGuard { hub: hub.clone() };
-        let mut osk_active = false;
+        let mut osk_state = EdgeWakeState::default();
+        let mut browser_state = EdgeWakeState::default();
         while let Some(first) = rx.next().await {
             // Conflate to the latest buffered edge: readings are absolute
             // state, so intermediates are stale by definition. Without this,
@@ -3539,8 +3624,17 @@ fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + S
             // forward a wake on rest<->active transitions and while PS is
             // held (global Home chord); actions always pass immediately.
             if hub.osk_listening() {
-                let (wake, next_active) = osk_stream_wake(&edge, osk_active);
-                osk_active = next_active;
+                let (wake, next) = osk_stream_wake(&edge, osk_state);
+                osk_state = next;
+                if !wake {
+                    continue;
+                }
+            } else if hub.browser_listening() {
+                // Browser cursor is pull-model: analog-only frames stay in
+                // the snapshot. Digital frames stay on the edge stream so the
+                // D-pad stepper repeat cadence works.
+                let (wake, next) = browser_stream_wake(&edge, browser_state);
+                browser_state = next;
                 if !wake {
                     continue;
                 }
@@ -3955,29 +4049,29 @@ mod tests {
                 &meta,
             )
         };
-        let mut active = false;
-        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), active);
+        let mut state = EdgeWakeState::default();
+        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), state);
         assert!(!wake, "resting neutral stays in the slot");
-        assert!(!next);
+        assert!(!next.stick && !next.digital);
         let held = PadSample {
             lstick_x: -0.95,
             stick_x: -0.95,
             ..Default::default()
         };
-        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), active);
+        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), state);
         assert!(wake, "rest->active wake");
-        active = next;
-        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), active);
+        state = next;
+        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), state);
         assert!(!wake, "held analog frames do not cross");
-        assert!(next);
-        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), active);
+        assert!(next.stick);
+        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), state);
         assert!(wake, "release wake");
-        assert!(!next);
+        assert!(!next.stick);
         let ps = PadSample {
             held: [GestureControl::Ps].into_iter().collect(),
             ..Default::default()
         };
-        let (wake, _) = osk_stream_wake(&edge(ps, Vec::new()), false);
+        let (wake, _) = osk_stream_wake(&edge(ps, Vec::new()), EdgeWakeState::default());
         assert!(wake, "PS stays global");
         let (wake, _) = osk_stream_wake(
             &edge(
@@ -3988,9 +4082,64 @@ mod tests {
                     action: crate::domain::pad::PadButtonAction::Tap,
                 }],
             ),
-            false,
+            EdgeWakeState::default(),
         );
         assert!(wake, "taps always publish immediately");
+        let dpad = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        let (wake, next) = osk_stream_wake(&edge(dpad.clone(), Vec::new()), state);
+        assert!(wake, "first D-pad press wakes the pull widget");
+        assert!(next.digital);
+        let (wake, _) = osk_stream_wake(&edge(dpad, Vec::new()), next);
+        assert!(!wake, "held D-pad repeats are widget-owned");
+    }
+
+    #[test]
+    fn browser_stream_keeps_digital_but_drops_analog_only_frames() {
+        use crate::domain::pad::{InputEdge, PadId, PadSample, SnapshotMeta, SnapshotReason};
+        let meta = SnapshotMeta {
+            published_at: std::time::Instant::now(),
+            seq: 1,
+            reason: SnapshotReason::Sample,
+            pad_count: 1,
+        };
+        let edge = |sample: PadSample| {
+            InputEdge::from_snapshot(
+                vec![crate::domain::pad::NavReading {
+                    id: PadId("hid:a".into()),
+                    sample,
+                    source: "hid",
+                }],
+                Vec::new(),
+                &meta,
+            )
+        };
+        let held = PadSample {
+            lstick_x: -0.95,
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        let (wake, state) = browser_stream_wake(&edge(held.clone()), EdgeWakeState::default());
+        assert!(wake, "stick start wakes the canvas");
+        assert!(state.stick);
+        assert!(!state.digital);
+        let (wake, _) = browser_stream_wake(&edge(held), state);
+        assert!(!wake, "held analog stays in the snapshot");
+        let dpad = PadSample {
+            dpad_up: true,
+            ..Default::default()
+        };
+        let (wake, state) = browser_stream_wake(&edge(dpad.clone()), EdgeWakeState::default());
+        assert!(wake, "D-pad press must reach the jump stepper");
+        assert!(!state.stick);
+        assert!(state.digital);
+        let (wake, _) = browser_stream_wake(&edge(dpad), state);
+        assert!(wake, "D-pad repeat stays on the edge stream");
+        let (wake, state) = browser_stream_wake(&edge(PadSample::default()), state);
+        assert!(wake, "D-pad release wakes the stepper");
+        assert!(!state.digital);
     }
 
     /// The forget sequence end to end: prune drops the pad from the fleet, and

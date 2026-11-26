@@ -13,6 +13,11 @@
 //! roams free. All geometry is page pixels at 1x (the engine viewport is
 //! fixed), so the UI maps to card space with a single uniform scale.
 
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+use crate::domain::pad::PadSample;
+
 /// Focusable element, in page pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Focusable {
@@ -812,6 +817,267 @@ impl Cursor {
             return (cx, cy);
         }
         (cx + dx * t, cy + dy * t)
+    }
+}
+
+/// Dominant right-stick axis for one scroll gesture. Chosen when the stick
+/// leaves neutral and held until it returns, so a diagonal hold cannot drift
+/// sideways while the user scrolls vertically (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+impl ScrollAxis {
+    fn other(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+}
+
+/// One cursor advance's engine-facing output.
+#[derive(Debug, Default)]
+pub struct CursorFrame {
+    /// Quantized pointer position that changed this frame.
+    pub mouse: Option<(i32, i32)>,
+    /// Right-stick scroll delta and page point.
+    pub scroll: Option<(f32, f32, (f32, f32))>,
+    /// A D-pad flight landed; ask the engine for a fresh DOM cull.
+    pub reseed: bool,
+}
+
+/// Shared cursor state for the live tab. The pull-model widget advances it at
+/// draw/update time; the app only reads snapshots for discrete actions.
+#[derive(Debug)]
+pub struct CursorRuntime {
+    pub cursor: Cursor,
+    pub focusables: Vec<Focusable>,
+    pub analog_at: Option<Instant>,
+    pub scroll_axis: Option<ScrollAxis>,
+    pub last_sent_mouse: Option<(i32, i32)>,
+    pub last_stick: (f32, f32),
+    pub force_mouse_sync: bool,
+    pub dom_reseed_pending: bool,
+    pub last_dock_change: Option<Instant>,
+}
+
+impl Default for CursorRuntime {
+    fn default() -> Self {
+        Self {
+            cursor: Cursor::new(),
+            focusables: Vec::new(),
+            analog_at: None,
+            scroll_axis: None,
+            last_sent_mouse: None,
+            last_stick: (0.0, 0.0),
+            force_mouse_sync: false,
+            dom_reseed_pending: false,
+            last_dock_change: None,
+        }
+    }
+}
+
+impl CursorRuntime {
+    /// Integrate one latest pad sample. Includes neutral frames so friction,
+    /// flights, and dock morphs settle even when the page pixels are static.
+    pub fn advance(&mut self, sample: &PadSample, now: Instant) -> CursorFrame {
+        use crate::browser::cursor::SCROLL_SPEED;
+        let dt = self
+            .analog_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
+            .unwrap_or(0.0);
+        self.analog_at = Some(now);
+        self.cursor.turbo = sample.r2;
+        self.last_stick = (sample.lstick_x, sample.lstick_y);
+
+        let before = self.cursor.attached;
+        let (bx, by) = (self.cursor.x, self.cursor.y);
+        let scrolling = sample.rstick_x != 0.0 || sample.rstick_y != 0.0;
+        let cursor = &mut self.cursor;
+        cursor.advance_with(
+            sample.lstick_x,
+            sample.lstick_y,
+            dt,
+            &self.focusables,
+            scrolling,
+        );
+        if before != self.cursor.attached {
+            self.last_dock_change = Some(now);
+            let describe = |id: Option<u64>| match id {
+                None => "free".to_string(),
+                Some(i) => match self.focusables.iter().find(|o| o.id == i) {
+                    Some(o) => format!(
+                        "#{i} {:?} ({:.0},{:.0},{:.0}x{:.0})",
+                        o.kind, o.x, o.y, o.w, o.h
+                    ),
+                    None => format!("#{i} gone"),
+                },
+            };
+            crate::platform::app_log::info(format!(
+                "cursor dock {} -> {} stick=({:.2},{:.2}) rstick=({:.2},{:.2}) scrolling={} pos=({bx:.0},{by:.0})",
+                describe(before),
+                describe(self.cursor.attached),
+                sample.lstick_x,
+                sample.lstick_y,
+                sample.rstick_x,
+                sample.rstick_y,
+                u8::from(scrolling),
+            ));
+        }
+
+        let axis = match self.scroll_axis {
+            Some(_) if sample.rstick_x == 0.0 && sample.rstick_y == 0.0 => {
+                self.scroll_axis = None;
+                None
+            }
+            Some(axis) => {
+                let (locked, other) = match axis {
+                    ScrollAxis::Vertical => (sample.rstick_y, sample.rstick_x),
+                    ScrollAxis::Horizontal => (sample.rstick_x, sample.rstick_y),
+                };
+                if locked == 0.0 && other != 0.0 {
+                    let next = axis.other();
+                    self.scroll_axis = Some(next);
+                    Some(next)
+                } else {
+                    Some(axis)
+                }
+            }
+            None if sample.rstick_x == 0.0 && sample.rstick_y == 0.0 => None,
+            None => {
+                let axis = if sample.rstick_y.abs() >= sample.rstick_x.abs() {
+                    ScrollAxis::Vertical
+                } else {
+                    ScrollAxis::Horizontal
+                };
+                self.scroll_axis = Some(axis);
+                Some(axis)
+            }
+        };
+        let scale = if sample.r2 { 2.0 } else { 1.0 };
+        let scroll = match axis {
+            Some(ScrollAxis::Vertical) => {
+                let dy = sample.rstick_y * SCROLL_SPEED * dt * scale;
+                (dy != 0.0).then_some((0.0, dy, (self.cursor.x, self.cursor.y)))
+            }
+            Some(ScrollAxis::Horizontal) => {
+                let dx = sample.rstick_x * SCROLL_SPEED * dt * scale;
+                (dx != 0.0).then_some((dx, 0.0, (self.cursor.x, self.cursor.y)))
+            }
+            None => None,
+        };
+
+        let (qx, qy) = (self.cursor.x as i32, self.cursor.y.max(0.0) as i32);
+        let mouse = if self.force_mouse_sync || self.last_sent_mouse != Some((qx, qy)) {
+            self.force_mouse_sync = false;
+            self.last_sent_mouse = Some((qx, qy));
+            Some((qx, qy))
+        } else {
+            None
+        };
+
+        let reseed = self.dom_reseed_pending && self.cursor.fly_to.is_none();
+        if reseed {
+            self.dom_reseed_pending = false;
+        }
+
+        CursorFrame {
+            mouse,
+            scroll,
+            reseed,
+        }
+    }
+}
+
+/// Shared handle to one tab's cursor runtime. Clones share the same state;
+/// dormant tabs each own their own handle.
+#[derive(Debug, Clone, Default)]
+pub struct CursorHandle(Arc<Mutex<CursorRuntime>>);
+
+impl CursorHandle {
+    pub fn lock(&self) -> MutexGuard<'_, CursorRuntime> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn snapshot(&self) -> Cursor {
+        self.lock().cursor.clone()
+    }
+
+    pub fn set_viewport(&self, w: f32, h: f32) {
+        self.lock().cursor.set_viewport(w, h);
+    }
+
+    pub fn reset_for_page(&self) {
+        let mut rt = self.lock();
+        rt.cursor.reset_for_page();
+        rt.focusables.clear();
+        rt.analog_at = None;
+        rt.scroll_axis = None;
+        rt.last_sent_mouse = None;
+        rt.last_stick = (0.0, 0.0);
+        rt.force_mouse_sync = true;
+        rt.dom_reseed_pending = false;
+        rt.last_dock_change = None;
+    }
+
+    pub fn reset_analog(&self) {
+        let mut rt = self.lock();
+        rt.analog_at = None;
+        rt.scroll_axis = None;
+        rt.last_stick = (0.0, 0.0);
+    }
+
+    pub fn set_focusables(&self, focusables: Vec<Focusable>) {
+        self.lock().focusables = focusables;
+    }
+
+    pub fn retarget(&self, focusables: &[Focusable]) {
+        let mut rt = self.lock();
+        rt.focusables = focusables.to_vec();
+        rt.cursor.retarget(focusables);
+    }
+
+    pub fn jump(&self, dir: JumpDir) -> bool {
+        let mut rt = self.lock();
+        let was = rt.cursor.attached;
+        let targets = rt.focusables.clone();
+        rt.cursor.jump(dir, &targets);
+        rt.dom_reseed_pending = true;
+        was != rt.cursor.attached || rt.cursor.fly_to.is_some()
+    }
+
+    pub fn set_magnet(&self, magnet: bool) {
+        let mut rt = self.lock();
+        rt.cursor.magnet = magnet;
+        if !magnet {
+            rt.cursor.attached = None;
+            rt.cursor.no_dock = None;
+        }
+    }
+
+    pub fn request_pointer_sync(&self) {
+        self.lock().force_mouse_sync = true;
+    }
+
+    pub fn mark_mouse_sent(&self, position: (i32, i32)) {
+        let mut rt = self.lock();
+        rt.last_sent_mouse = Some(position);
+        rt.force_mouse_sync = false;
+    }
+
+    pub fn last_stick(&self) -> (f32, f32) {
+        self.lock().last_stick
+    }
+
+    pub fn take_dock_change(&self) -> Option<Instant> {
+        self.lock().last_dock_change.take()
+    }
+
+    pub fn dock_change_at(&self) -> Option<Instant> {
+        self.lock().last_dock_change
     }
 }
 

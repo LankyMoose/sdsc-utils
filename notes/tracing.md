@@ -289,7 +289,10 @@ Analog delivery is deliberately not traced per sample; measure it with the
 `msg.pad_input` counter instead. While the OSK is open, analog data goes to
 `OskInputSlot` and is polled by `OskSurface`; the edge stream forwards only
 rest↔active wakes, PS-held edges, non-sample snapshots, and immediate taps.
-The app receives only discrete `OskMessage` steps/commits plus taps.
+The app receives only discrete `OskMessage` steps/commits plus taps. Browser
+engine mode uses the same wake-only edge contract: `CursorSurface` pulls the
+snapshot and owns its redraw clock, so `msg.pad_input` and `msg.browser_frame`
+stay 0 while the cursor moves.
 
 ## Commands
 

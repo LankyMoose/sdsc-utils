@@ -78,13 +78,14 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 
 ## Current input/UX contract (pad)
 
-- Analog scroll is accumulated once per `BrowserFrame` and applied as an
-  instant `scrollBy` on the innermost scroller under the cursor (falling back
-  to the window). Wheel events feed Chromium's scroll animator, which trails
-  the stick and keeps gliding after release; the instant path stops the frame
-  the stick centers. `--disable-smooth-scrolling` still covers real wheel
-  input. The custom iced scrollbar was removed — Chromium owns the page
-  scrollbar.
+- Analog scroll and cursor movement are owned by the pull-model
+  `CursorSurface`: it pulls the latest pad snapshot, advances wall-clock state,
+  streams an instant `scrollBy` on the innermost scroller under the cursor
+  (falling back to the window), and requests its own vsync frames. Wheel
+  events feed Chromium's scroll animator, which trails the stick and keeps
+  gliding after release; the instant path stops the frame the stick centers.
+  `--disable-smooth-scrolling` still covers real wheel input. The custom iced
+  scrollbar was removed — Chromium owns the page scrollbar.
 - Docked links use trusted CEF mouse input at the element center. If no
   navigation starts within 700ms, the backend falls back to
   `window.__sdsc_click` so a miss never leaves the link unclickable. Docked

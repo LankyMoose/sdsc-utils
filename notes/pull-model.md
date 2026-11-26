@@ -22,6 +22,10 @@ they are not the integrator for analog state.
 - `ui::pull::FrameDemand` — `Idle` / `Now` / `At(Instant)`; maps to
   `Shell::request_redraw*`, shader `Action`, or canvas `Action`. Use it for
   every per-window clock request.
+- `ui::browser::cursor_surface::CursorSurface` — the browser cursor owns its
+  clock: pulls the latest pad snapshot, advances `CursorHandle`, sends CEF
+  pointer/scroll commands, and requests vsync redraws while active. No
+  `BrowserFrame` app message.
 - `ui::motion::Timeline` — wall-clock segment with pause support; pose is
   derived, never accumulated.
 - `InputHub::latest_reading(max_age)` — preferred live pad reading for

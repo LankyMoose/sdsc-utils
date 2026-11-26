@@ -44,6 +44,13 @@ pub struct InputHub {
     gate: Mutex<EdgeGate>,
     /// Latest all-pad analog snapshot for the pull-model OSK widget.
     osk_slot: Arc<OskInputSlot>,
+    /// Browser engine mode: cursor pulls the snapshot, so the edge bridge only
+    /// forwards actions and rest↔active wake-ups.
+    browser_listening: std::sync::atomic::AtomicBool,
+    /// Debug replay: a held sample that persists across redraws (replay has no
+    /// HID publication loop), so cursor QA can measure its own clock.
+    #[cfg(debug_assertions)]
+    replay_reading: Mutex<Option<NavReading>>,
 }
 
 /// Analog edge gate state (hid-worker side).
@@ -69,6 +76,9 @@ impl InputHub {
             edge_tx: Mutex::new(None),
             gate: Mutex::new(EdgeGate::default()),
             osk_slot: Arc::new(OskInputSlot::default()),
+            browser_listening: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            replay_reading: Mutex::new(None),
         }
     }
 
@@ -138,11 +148,25 @@ impl InputHub {
     /// whether an edge subscription is active. `max_age` treats a stalled or
     /// disconnected worker as neutral so a stale held stick cannot steer.
     pub fn latest_reading(&self, max_age: Duration) -> Option<NavReading> {
+        #[cfg(debug_assertions)]
+        if let Ok(replay) = self.replay_reading.lock()
+            && let Some(reading) = replay.as_ref()
+        {
+            return Some(reading.clone());
+        }
         let guard = self.snapshot.lock().ok()?;
         if guard.published_at.elapsed() > max_age {
             return None;
         }
         preferred_reading(&guard.readings).cloned()
+    }
+
+    /// Debug replay: hold one synthetic pad sample across redraws.
+    #[cfg(debug_assertions)]
+    pub fn set_replay_reading(&self, reading: Option<NavReading>) {
+        if let Ok(mut replay) = self.replay_reading.lock() {
+            *replay = reading;
+        }
     }
 
     /// Install the iced-side sender so the worker can push edges (subscription start).
@@ -239,6 +263,18 @@ impl InputHub {
     /// True while the OSK owns the pad (edge stream becomes wake-only).
     pub fn osk_listening(&self) -> bool {
         self.osk_slot.is_enabled()
+    }
+
+    /// Browser engine mode: cursor pulls the snapshot, so analog-only edges
+    /// are filtered to rest↔active wake-ups.
+    pub fn set_browser_listening(&self, enabled: bool) {
+        self.browser_listening
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn browser_listening(&self) -> bool {
+        self.browser_listening
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

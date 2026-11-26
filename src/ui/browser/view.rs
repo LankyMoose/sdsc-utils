@@ -6,6 +6,7 @@
 //! composition and the browser-facing message vocabulary.
 
 use crate::browser::engine::BrowserCursor;
+use crate::ui::browser::cursor_surface::{CursorSurfaceSpec, cursor_surface};
 use crate::ui::browser::state::{
     BROWSER_HEADER_GROUP_GAP, BROWSER_HEADER_H, BROWSER_HEADER_PAD, BROWSER_HEADER_RULE,
     BROWSER_HEADER_TOTAL, BROWSER_HEADER_V_PAD, BROWSER_URL_BAR_H, BROWSER_URL_BAR_PAD,
@@ -82,12 +83,13 @@ pub const BROWSER_SCROLL_STEP: f32 = 240.0;
 
 /// Whether the pad cursor should be drawn at all. A physical pointer owns the
 /// surface.
-fn cursor_draws(panel: &BrowserPanel) -> bool {
+pub(crate) fn cursor_draws(panel: &BrowserPanel) -> bool {
     !panel.page_mouse_active
 }
 
 /// Map a page cursor point to card pixels. The surface is 1:1: the engine
 /// viewport is resized to the page area.
+#[cfg(test)]
 fn cursor_card_point(x: f32, y: f32) -> (f32, f32) {
     (x, y)
 }
@@ -134,81 +136,50 @@ pub(crate) fn cursor_interaction(cursor: BrowserCursor) -> iced::mouse::Interact
     }
 }
 
-/// Virtual cursor overlay across the page: a ring that morphs between the
-/// free dot and the docked wrap. Position, size, and corner radius
-/// interpolate every tick (smoothstepped blend), so docking animates circle
-/// to square instead of popping.
-fn browser_cursor_overlay<'a>(
-    panel: &'a BrowserPanel,
+/// Virtual cursor debug overlay: one thin ring per page snap target, colored
+/// by kind. Draws exactly the rectangle's intersection with the card (the
+/// truthful pixels); off-screen targets skip. The live cursor ring itself is
+/// the pull-model canvas in [`cursor_surface`].
+fn browser_cursor_debug_overlay(
+    panel: &BrowserPanel,
     page_w: f32,
     page_h: f32,
-) -> Element<'a, BrowserMessage> {
-    if !cursor_draws(panel) {
-        return space().width(Length::Fixed(0.0)).into();
+) -> Option<Element<'_, BrowserMessage>> {
+    if !panel.debug_overlay || panel.focusables.is_empty() {
+        return None;
     }
-    let cursor = &panel.cursor;
-    // 0 = free dot, 1 = docked wrap; smoothstepped so both ends ease.
-    let t = cursor.dock_blend.clamp(0.0, 1.0);
-    let t = t * t * (3.0 - 2.0 * t);
-    // Dot geometry in page px.
-    let (dx, dy) = (cursor.x - 10.0, cursor.y - 10.0);
-    let wrap = cursor.attached_rect(&panel.focusables).or(cursor.last_dock);
-    let (wx, wy, ww, wh) = match wrap {
-        Some((x, y, w, h)) => (x - 2.0, y - 2.0, (w + 4.0).max(8.0), (h + 4.0).max(8.0)),
-        None => (dx, dy, 20.0, 20.0),
-    };
-    let (ix, iy) = (dx + (wx - dx) * t, dy + (wy - dy) * t);
-    let (iw, ih) = (20.0 + (ww - 20.0) * t, 20.0 + (wh - 20.0) * t);
-    let (x, y) = cursor_card_point(ix, iy);
-    let radius = 10.0 + (crate::ui::theme::radius::SM - 10.0) * t;
-    let morph: Element<'_, BrowserMessage> = column![
-        space().height(Length::Fixed(y.max(0.0))),
-        row![
-            space().width(Length::Fixed(x.max(0.0))),
-            container(space().width(Length::Fixed(iw)).height(Length::Fixed(ih)))
-                .style(move |theme| crate::ui::theme::cursor_morph(theme, radius)),
-        ],
-    ]
-    .spacing(0)
-    .into();
-    // F10 coverage view: one thin ring per page snap target, colored by
-    // kind. Draws exactly the rectangle's intersection with the card (the
-    // truthful pixels); off-screen targets skip.
-    let body: Element<'_, BrowserMessage> = if panel.debug_overlay {
-        let mut overlay = stack![morph]
-            .width(Length::Fixed(page_w))
-            .height(Length::Fixed(page_h));
-        for f in &panel.focusables {
-            let (bx, by) = (f.x, f.y);
-            let (bw, bh) = (f.w.max(3.0), f.h.max(3.0));
-            let (ox, oy) = (bx.max(0.0), by.max(0.0));
-            let (ex, ey) = ((bx + bw).min(page_w), (by + bh).min(page_h));
-            if ex <= ox || ey <= oy {
-                continue;
-            }
-            let (bw, bh) = (ex - ox, ey - oy);
-            let kind = f.kind;
-            overlay = overlay.push(
-                column![
-                    space().height(Length::Fixed(oy)),
-                    row![
-                        space().width(Length::Fixed(ox)),
-                        container(space().width(Length::Fixed(bw)).height(Length::Fixed(bh)))
-                            .style(move |theme| crate::ui::theme::debug_target(theme, kind)),
-                    ],
-                ]
-                .spacing(0),
-            );
-        }
-        overlay.into()
-    } else {
-        morph
-    };
-    container(body)
+    let mut overlay = stack![space()]
         .width(Length::Fixed(page_w))
-        .height(Length::Fixed(page_h))
-        .clip(true)
-        .into()
+        .height(Length::Fixed(page_h));
+    for f in &panel.focusables {
+        let (bx, by) = (f.x, f.y);
+        let (bw, bh) = (f.w.max(3.0), f.h.max(3.0));
+        let (ox, oy) = (bx.max(0.0), by.max(0.0));
+        let (ex, ey) = ((bx + bw).min(page_w), (by + bh).min(page_h));
+        if ex <= ox || ey <= oy {
+            continue;
+        }
+        let (bw, bh) = (ex - ox, ey - oy);
+        let kind = f.kind;
+        overlay = overlay.push(
+            column![
+                space().height(Length::Fixed(oy)),
+                row![
+                    space().width(Length::Fixed(ox)),
+                    container(space().width(Length::Fixed(bw)).height(Length::Fixed(bh)))
+                        .style(move |theme| crate::ui::theme::debug_target(theme, kind)),
+                ],
+            ]
+            .spacing(0),
+        );
+    }
+    Some(
+        container(overlay)
+            .width(Length::Fixed(page_w))
+            .height(Length::Fixed(page_h))
+            .clip(true)
+            .into(),
+    )
 }
 
 fn header_icon(icon: &'static str, size: f32, color: Color) -> Element<'static, BrowserMessage> {
@@ -441,14 +412,18 @@ pub fn browser_view<'a>(
     engine_available: bool,
     page_w: f32,
     page_h: f32,
+    cursor: CursorSurfaceSpec,
 ) -> Element<'a, BrowserMessage> {
-    let page = stack![
+    let mut page = stack![
         browser_page_view(panel, engine_available, page_w, page_h),
-        browser_cursor_overlay(panel, page_w, page_h),
+        cursor_surface(cursor, page_w, page_h),
     ]
     .width(Length::Fixed(page_w))
     .height(Length::Fixed(page_h))
     .clip(true);
+    if let Some(debug) = browser_cursor_debug_overlay(panel, page_w, page_h) {
+        page = page.push(debug);
+    }
     column![browser_header(panel, page_w), page]
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(BROWSER_HEADER_TOTAL + page_h))
@@ -471,14 +446,21 @@ pub fn root_view(
     stage_w: f32,
     stage_h: f32,
     backdrop_alpha: f32,
+    cursor: CursorSurfaceSpec,
 ) -> Element<'_, BrowserMessage> {
     let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
     let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
-    let card = container(browser_view(panel, engine_available, page_w, page_h))
-        .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
-        .style(theme::menu_panel)
-        .width(Length::Fixed(layout.card_w))
-        .height(Length::Fixed(layout.card_h));
+    let card = container(browser_view(
+        panel,
+        engine_available,
+        page_w,
+        page_h,
+        cursor,
+    ))
+    .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
+    .style(theme::menu_panel)
+    .width(Length::Fixed(layout.card_w))
+    .height(Length::Fixed(layout.card_h));
     let transparent = crate::ui::chrome::transparent_windows();
     let root: Element<'_, BrowserMessage> = container(card)
         .width(Fill)
@@ -556,7 +538,10 @@ mod tests {
         panel.set_viewport(1734.0, 860.0);
         panel.reset_live_page();
         assert_eq!(
-            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            {
+                let cursor = panel.page.cursor.snapshot();
+                (cursor.view_w, cursor.view_h)
+            },
             (1734.0, 860.0)
         );
 
@@ -571,14 +556,20 @@ mod tests {
         });
         assert!(panel.activate_stored(id));
         assert_eq!(
-            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            {
+                let cursor = panel.page.cursor.snapshot();
+                (cursor.view_w, cursor.view_h)
+            },
             (1734.0, 860.0)
         );
 
         // `stash_live` leaves a default placeholder page behind.
         panel.stash_live();
         assert_eq!(
-            (panel.page.cursor.view_w, panel.page.cursor.view_h),
+            {
+                let cursor = panel.page.cursor.snapshot();
+                (cursor.view_w, cursor.view_h)
+            },
             (1734.0, 860.0)
         );
     }
@@ -624,7 +615,7 @@ mod tests {
     #[test]
     fn cursor_overlay_is_page_space_only() {
         let mut panel = BrowserPanel::default();
-        panel.cursor.y = 0.0;
+        panel.cursor.lock().cursor.y = 0.0;
         assert!(cursor_draws(&panel), "free page cursor is drawn");
         panel.page_mouse_active = true;
         assert!(!cursor_draws(&panel), "physical mouse hides the pad ring");

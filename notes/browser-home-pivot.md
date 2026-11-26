@@ -128,9 +128,10 @@ but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
    renders or owns the panel. Rendering moved to `src/ui/browser/view.rs`
    (`root_view`, `fullscreen_layout`) and all browser messages are
    `BrowserMessage` (no `LauncherMessage::Browser*` left). Browser owns pad
-   routing (`on_browser_pad`: cursor, D-pad jumps, history selector, R3
-   flag), keyboard (`on_browser_key`), its own 60Hz `BrowserFrame` tick, and
-   window close/suspend/focus return. Home is routed before Browser; Browser
+   routing (`on_browser_pad`: cursor commands, D-pad jumps, history selector,
+   R3 flag), keyboard (`on_browser_key`), a self-clocking pull-model
+   `CursorSurface` (no global `BrowserFrame` tick), and window
+   close/suspend/focus return. Home is routed before Browser; Browser
    before Launcher. The live window renders a **16:9 card**, height-driven at
    `window height - 100px` (50px breather per side), centered on the monitor
    with the one-row header inside it; `browser_layout` is the single geometry

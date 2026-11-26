@@ -403,15 +403,12 @@ impl<Message> iced::widget::shader::Program<Message> for BrowserFrameProgram {
         _bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Option<iced::widget::Action<Message>> {
-        // Pull-model redraw clock: the browser owns a 60Hz presentation
-        // loop while mounted (no per-frame engine messages or view
-        // rebuilds). A new generation presents immediately; otherwise the
-        // loop polls again next frame period.
-        let now = iced::time::Instant::now();
+        // Present only when CEF actually produced a new frame. Idle pages no
+        // longer hold a 60Hz poll; the cursor canvas owns its own clock.
         if self.slot.generation() != state.last_seen.load(std::sync::atomic::Ordering::SeqCst) {
             crate::ui::pull::FrameDemand::Now.into_program()
         } else {
-            crate::ui::pull::FrameDemand::next(now).into_program()
+            None
         }
     }
 

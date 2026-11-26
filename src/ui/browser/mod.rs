@@ -4,6 +4,7 @@
 //! `notes/browser-embedding.md` for the engine/cursor contract and
 //! `notes/browser-home-pivot.md` for window ownership.
 
+pub mod cursor_surface;
 pub mod state;
 pub mod view;
 

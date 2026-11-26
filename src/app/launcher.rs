@@ -438,11 +438,9 @@ impl App {
         let tab = self.browser.panel.active_tab;
         // Clamp out of the header zone: the engine's viewport starts at
         // y=0 and has no use for negative points.
-        let (qx, qy) = (
-            self.browser.panel.cursor.x as i32,
-            self.browser.panel.cursor.y.max(0.0) as i32,
-        );
-        self.browser.panel.last_sent_mouse = Some((qx, qy));
+        let cursor = self.browser.panel.cursor.snapshot();
+        let (qx, qy) = (cursor.x as i32, cursor.y.max(0.0) as i32);
+        self.browser.panel.cursor.mark_mouse_sent((qx, qy));
         if let Some(engine) = &self.browser.engine {
             engine.send(EngineCommand::MouseMove {
                 tab,
@@ -729,28 +727,31 @@ impl App {
     /// never yanks a driven cursor.
     pub(crate) fn try_dock_focused(&mut self, id: u64) -> bool {
         let panel = &mut self.browser.panel;
-        if !panel.cursor.magnet || panel.cursor.fly_to.is_some() {
+        let snapshot = panel.cursor.snapshot();
+        if !snapshot.magnet || snapshot.fly_to.is_some() {
             return false;
         }
-        if panel.last_pad_stick.0.hypot(panel.last_pad_stick.1) != 0.0 {
+        let stick = panel.cursor.last_stick();
+        if stick.0.hypot(stick.1) != 0.0 {
             return false;
         }
         let Some(item) = panel.focusables.iter().find(|o| o.id == id).cloned() else {
             return false;
         };
-        let cursor = &mut panel.cursor;
-        cursor.attached = Some(id);
-        cursor.dock_blend = 1.0;
-        cursor.vx = 0.0;
-        cursor.vy = 0.0;
-        cursor.break_armed = false;
-        cursor.docked_for = 0.0;
-        if cursor.no_dock == Some(id) {
-            cursor.no_dock = None;
+        let mut cursor = panel.cursor.lock();
+        cursor.cursor.attached = Some(id);
+        cursor.cursor.dock_blend = 1.0;
+        cursor.cursor.vx = 0.0;
+        cursor.cursor.vy = 0.0;
+        cursor.cursor.break_armed = false;
+        cursor.cursor.docked_for = 0.0;
+        if cursor.cursor.no_dock == Some(id) {
+            cursor.cursor.no_dock = None;
         }
-        cursor.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
-        cursor.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
-        cursor.last_dock = Some((item.x, item.y, item.w, item.h));
+        cursor.cursor.x = (item.x + item.w / 2.0).clamp(0.0, VIEWPORT_W);
+        cursor.cursor.y = (item.y + item.h / 2.0).clamp(0.0, VIEWPORT_H);
+        cursor.cursor.last_dock = Some((item.x, item.y, item.w, item.h));
+        drop(cursor);
         crate::controller::hid::diag::diag_info(format!("ui-diag: browser autofocus dock {id}"));
         true
     }
@@ -794,51 +795,6 @@ impl App {
         Task::none()
     }
 
-    /// Integrate one analog sample into the cursor/scroll state. The Browser
-    /// frame clock is the sole integrator: it pulls the latest HID snapshot,
-    /// so a held stick keeps moving even when no pad edge or page pixel
-    /// changed this frame.
-    pub(crate) fn advance_browser_cursor(
-        &mut self,
-        sample: &crate::domain::pad::PadSample,
-        now: Instant,
-    ) {
-        #[cfg(debug_assertions)]
-        let was_docked = self.browser.panel.cursor.attached.is_some();
-        let (dx, dy) = self.browser.panel.advance_stick(
-            sample.lstick_x,
-            sample.lstick_y,
-            sample.rstick_x,
-            sample.rstick_y,
-            sample.r2,
-            now,
-        );
-        // Stick vector for autofocus docking: a deflected stick means the
-        // user is driving and wins over page focus.
-        self.browser.panel.last_pad_stick = (sample.lstick_x, sample.lstick_y);
-        // Dock-triggered shot: capture the exact pixels the fresh wrap sits
-        // on (throttled; the 5s cadence rarely coincides with a dock).
-        #[cfg(debug_assertions)]
-        if self.debug_browser && !was_docked && self.browser.panel.cursor.attached.is_some() {
-            self.browser.panel.last_dock_change = Some(now);
-        }
-        if (dx != 0.0 || dy != 0.0)
-            && let Some(engine) = &self.browser.engine
-        {
-            // Scroll under the pad cursor: Chromium routes to the innermost
-            // scroller under the point, so center-targeting stranded page
-            // scrolls inside carousels after use.
-            let (cx, cy) = (self.browser.panel.cursor.x, self.browser.panel.cursor.y);
-            engine.send(EngineCommand::ScrollBy {
-                tab: self.browser_tab(),
-                dx,
-                dy,
-                x: cx,
-                y: cy,
-            });
-        }
-    }
-
     /// D-pad cursor jumps for engine mode. The banked nav stepper stays
     /// parked there (stick moves must never double-fire into both cursor
     /// and nav), which would otherwise starve the `jump_cursor` arms of
@@ -866,42 +822,6 @@ impl App {
         Some((jump, reading.id.clone()))
     }
 
-    /// Stream the pad cursor as the one true mouse (see `EngineCommand::MouseMove`):
-    /// quantized to whole px so a resting cursor sends nothing. Called once
-    /// per browser tick AFTER input handling, so stick glides and D-pad
-    /// jumps — every cursor mover — converge on one sync point.
-    pub(crate) fn sync_browser_mouse(&mut self) -> Task<Message> {
-        // Clamped out of the header zone (see `sync_live_mouse`).
-        let (qx, qy) = (
-            self.browser.panel.cursor.x as i32,
-            self.browser.panel.cursor.y.max(0.0) as i32,
-        );
-        if self.browser.panel.last_sent_mouse != Some((qx, qy)) {
-            self.browser.panel.last_sent_mouse = Some((qx, qy));
-            if let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::MouseMove {
-                    tab: self.browser_tab(),
-                    x: qx as f32,
-                    y: qy as f32,
-                    modifiers: keyboard_types::Modifiers::empty(),
-                });
-            }
-        }
-        // A D-pad jump asks for a fresh target cull once the flight lands
-        // (the live set was culled around the previous pull center). Send
-        // the reseed after the MouseMove so the engine centers on the
-        // arrival position, not the flight origin.
-        if self.browser.panel.dom_reseed_pending && self.browser.panel.cursor.fly_to.is_none() {
-            self.browser.panel.dom_reseed_pending = false;
-            if let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::ReseedDom {
-                    tab: self.browser_tab(),
-                });
-            }
-        }
-        Task::none()
-    }
-
     /// Click at the cursor: attached element center, else the free point.
     /// Links use trusted CEF mouse input (with a delayed JS fallback), so
     /// Chromium keeps user activation and does not mark the navigation as
@@ -910,8 +830,9 @@ impl App {
     pub(crate) fn click_browser_cursor(&mut self) -> Task<Message> {
         let (x, y, target, trusted, text_field) = {
             let panel = &self.browser.panel;
+            let cursor = panel.cursor.snapshot();
             let targets = &panel.focusables;
-            let (x, y) = panel.cursor.click_point(targets);
+            let (x, y) = cursor.click_point(targets);
             // Links use trusted CEF mouse input so Chromium keeps user
             // activation and does not mark the resulting history entry
             // skippable. The backend falls back to the JS element click if
@@ -920,7 +841,7 @@ impl App {
             let mut target = None;
             let mut trusted = false;
             let mut text_field = false;
-            if let Some(id) = panel.cursor.attached
+            if let Some(id) = cursor.attached
                 && let Some(item) = panel.focusables.iter().find(|o| o.id == id)
             {
                 match item.kind {
@@ -992,10 +913,11 @@ impl App {
     pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
         let targets = self.browser.panel.page.focusables.clone();
         let panel = &mut self.browser.panel;
-        let (cx, cy) = (panel.cursor.x, panel.cursor.y);
-        let dock = panel.cursor.attached;
-        let dock_rect = panel.cursor.attached_rect(&targets);
-        let would_click = panel.cursor.click_point(&targets);
+        let cursor = panel.cursor.snapshot();
+        let (cx, cy) = (cursor.x, cursor.y);
+        let dock = cursor.attached;
+        let dock_rect = cursor.attached_rect(&targets);
+        let would_click = cursor.click_point(&targets);
         let last_click_ago = panel
             .last_click
             .map(|(_, t)| now.saturating_duration_since(t).as_millis());
@@ -1066,10 +988,12 @@ impl App {
         }
         let now = Instant::now();
         let panel = &mut self.browser.panel;
+        let cursor = panel.cursor.snapshot();
         // A fresh dock shoots once it settles (~300ms for the morph to
         // complete); the 5s cadence covers everything else.
-        let settled_dock = panel.cursor.attached.is_some()
-            && panel.last_dock_change.is_some_and(|t| {
+        let dock_change = panel.cursor.dock_change_at();
+        let settled_dock = cursor.attached.is_some()
+            && dock_change.is_some_and(|t| {
                 now.saturating_duration_since(t) >= Duration::from_millis(300)
                     && panel.last_shot.is_none_or(|s| s < t)
             });
@@ -1096,12 +1020,12 @@ impl App {
     pub(crate) fn save_browser_shot(&mut self, shot: iced::window::Screenshot) -> Task<Message> {
         let panel = &self.browser.panel;
         let targets = &panel.focusables;
-        let cursor = (panel.cursor.x, panel.cursor.y);
-        let magnet = panel.cursor.magnet;
-        let dock = panel.cursor.attached;
-        let blend = panel.cursor.dock_blend;
-        let rect = panel
-            .cursor
+        let cursor_state = panel.cursor.snapshot();
+        let cursor = (cursor_state.x, cursor_state.y);
+        let magnet = cursor_state.magnet;
+        let dock = cursor_state.attached;
+        let blend = cursor_state.dock_blend;
+        let rect = cursor_state
             .attached_rect(targets)
             .map(|(x, y, w, h)| format!("({x:.0},{y:.0}) {w:.0}x{h:.0}"))
             .unwrap_or_else(|| "-".to_string());
@@ -1211,12 +1135,13 @@ impl App {
     }
 
     /// Pad/keyboard body scroll. Engine mode scrolls Chromium at the cursor
-    /// point (`on_browser_frame` handles analog scroll); this path covers
+    /// point (the cursor surface handles analog scroll); this path covers
     /// explicit D-pad/keys.
     pub(crate) fn scroll_browser(&mut self, delta: f32) -> Task<Message> {
         if self.browser.panel.session.has_frame() {
             if let Some(engine) = &self.browser.engine {
-                let (cx, cy) = (self.browser.panel.cursor.x, self.browser.panel.cursor.y);
+                let cursor = self.browser.panel.cursor.snapshot();
+                let (cx, cy) = (cursor.x, cursor.y);
                 engine.send(EngineCommand::ScrollBy {
                     tab: self.browser_tab(),
                     dx: 0.0,
@@ -1333,7 +1258,7 @@ impl App {
                 // after one tree if it never does (culled targets never
                 // dock). A mid-flight jump keeps the target parked.
                 if self.browser.panel.pending_focus.is_some()
-                    && self.browser.panel.cursor.fly_to.is_none()
+                    && self.browser.panel.cursor.snapshot().fly_to.is_none()
                 {
                     let id = self
                         .browser
@@ -1393,7 +1318,7 @@ impl App {
             }
             EngineEvent::FocusChanged { tab: _, id } => {
                 // Magnet off means never dock — drop any parked target too.
-                if !self.browser.panel.cursor.magnet {
+                if !self.browser.panel.cursor.snapshot().magnet {
                     self.browser.panel.pending_focus = None;
                 } else if !self.try_dock_focused(id) {
                     // Not live / mid-flight / stick busy: park for the next

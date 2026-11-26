@@ -25,7 +25,7 @@ PAGE = """<!doctype html>
 <style>
   html, body { margin:0; width:100%; height:100%; background:#f5f0e6; }
   #band { position:fixed; left:0; top:0; width:100%; height:45%; background:#c0392b; }
-  h1 { position:fixed; left:60px; top:52%; margin:0; font: 48px sans-serif; color:#1f2937; }
+  h1 { position:fixed; left:35%; top:52%; margin:0; font: 48px sans-serif; color:#1f2937; }
 </style></head>
 <body><div id="band"></div><h1>visual qa</h1></body></html>
 """

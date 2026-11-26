@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::browser::cursor::CursorHandle;
+
 /// Header row height, excluding the hairline rule below it.
 pub const BROWSER_HEADER_H: f32 = 44.0;
 /// Hairline under the header row.
@@ -45,24 +47,6 @@ pub struct EngineHistorySnapshot {
     pub entries: Vec<crate::browser::engine::EngineHistoryEntry>,
 }
 
-/// Dominant right-stick axis for one scroll gesture. Chosen when the stick
-/// leaves neutral and held until it returns, so a diagonal hold cannot drift
-/// sideways while the user scrolls vertically (or vice versa).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollAxis {
-    Vertical,
-    Horizontal,
-}
-
-impl ScrollAxis {
-    fn other(self) -> Self {
-        match self {
-            Self::Vertical => Self::Horizontal,
-            Self::Horizontal => Self::Vertical,
-        }
-    }
-}
-
 /// Per-tab page state: everything that belongs to one tab's document.
 /// `BrowserPanel::page` is always the ACTIVE tab's; background tabs stash
 /// theirs in `BrowserPanel::stored`. The panel derefs to this, so all
@@ -71,8 +55,9 @@ impl ScrollAxis {
 #[derive(Debug, Clone, Default)]
 pub struct BrowserTabPage {
     pub session: crate::browser::BrowserSession,
-    /// Virtual cursor (engine mode only; pad-owned).
-    pub cursor: crate::browser::cursor::Cursor,
+    /// Virtual cursor (engine mode only; pad-owned). The pull-model surface
+    /// advances the shared runtime; app actions read snapshots.
+    pub cursor: CursorHandle,
     /// Focusable elements from the latest accessibility tree.
     pub focusables: Vec<crate::browser::cursor::Focusable>,
     pub scroll_y: f32,
@@ -82,21 +67,10 @@ pub struct BrowserTabPage {
     /// Document extent in page pixels (grow-only; `EngineEvent::ScrollExtent`).
     /// Drives the page scrollbar. `(0,0)` until the first snapshot.
     pub page_extent: (f32, f32),
-    /// Last analog integrate step (None until the first pad sample).
-    pub analog_at: Option<Instant>,
-    /// Active right-stick scroll axis lock (None = stick at rest, unlocked).
-    pub scroll_axis: Option<ScrollAxis>,
     /// Page-driven focus target (autofocus / JS `.focus()`): UI id to dock
     /// when it next resolves in the live set. One shot per tree — a culled
     /// target never docks ("if possible").
     pub pending_focus: Option<u64>,
-    /// Last left-stick vector seen by the cursor tick. Autofocus docking
-    /// requires the stick at rest (an active steer means the user is driving
-    /// and wins over the page).
-    pub last_pad_stick: (f32, f32),
-    /// Last sent mouse position (quantized px), so the pad cursor streams
-    /// moves to the engine only when it actually travels. Never persisted.
-    pub last_sent_mouse: Option<(i32, i32)>,
     /// Last click point + time, for the R3 issue-flag correlation.
     pub last_click: Option<((f32, f32), Instant)>,
     /// Last canonical engine history; tracing compares it with the UI stack.
@@ -156,11 +130,6 @@ pub struct BrowserPanel {
     pub page_cursor: crate::browser::engine::BrowserCursor,
     /// Last debug frame-shot time (5s cadence while the overlay is on).
     pub last_shot: Option<Instant>,
-    /// Last dock transition (None→Some) wall-clock, for settled dock shots.
-    /// Dock-triggered shots wait ~300ms so the morph completes first —
-    /// shooting on the dock tick only ever captures a half-morphed wrap
-    /// and reads as a misplaced outline.
-    pub last_dock_change: Option<Instant>,
     /// JS element-click mode for Button-kind dock targets (toggled from the
     /// browser card itself; off by default): `__sdsc_click` on the exact
     /// element instead of the trusted synthetic pair. Lets A/B testing
@@ -171,9 +140,6 @@ pub struct BrowserPanel {
     /// Live page-area size in card pixels (the engine viewport resizes to
     /// this; the cursor space matches it 1:1).
     pub viewport: (f32, f32),
-    /// A D-pad jump asked for a fresh DOM target cull around the cursor.
-    /// Cleared once the jump flight lands and the engine is told to pull.
-    pub dom_reseed_pending: bool,
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
@@ -230,14 +196,12 @@ impl Default for BrowserPanel {
             page_click_count: 1,
             page_cursor: crate::browser::engine::BrowserCursor::Default,
             last_shot: None,
-            last_dock_change: None,
             js_click: false,
             r3_latched: false,
             viewport: (
                 crate::browser::cursor::VIEWPORT_W,
                 crate::browser::cursor::VIEWPORT_H,
             ),
-            dom_reseed_pending: false,
             debug_overlay: false,
             bookmarks: Vec::new(),
             l1_held: false,
@@ -407,8 +371,7 @@ impl BrowserPanel {
         self.session.close_surface();
         self.pending_focus = None;
         // Drop the analog clock so reopening never applies a huge first dt.
-        self.analog_at = None;
-        self.scroll_axis = None;
+        self.cursor.reset_analog();
         self.cancel_url_edit();
         self.l1_held = false;
         self.r1_held = false;
@@ -469,12 +432,10 @@ impl BrowserPanel {
         self.scroll_y
     }
 
-    /// Integrate one analog pad sample: left stick moves the cursor
-    /// (magnetic snap + glide when enabled), right stick scrolls. Runs every
-    /// tick, including neutral ones, so friction and glide converge even
-    /// with no deflection — a released stick must decay, not freeze.
-    /// Returns the scroll delta in page pixels for this step; `dt` is
-    /// clamped so background gaps cannot teleport either axis.
+    /// Integrate one analog pad sample through the shared cursor runtime.
+    ///
+    /// Production uses the pull-model cursor surface; this wrapper remains for
+    /// tests and for callers that need a deterministic single step.
     pub fn advance_stick(
         &mut self,
         lx: f32,
@@ -484,98 +445,40 @@ impl BrowserPanel {
         r2: bool,
         now: Instant,
     ) -> (f32, f32) {
-        use crate::browser::cursor::SCROLL_SPEED;
-        let dt = self
-            .analog_at
-            .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
-            .unwrap_or(0.0);
-        self.analog_at = Some(now);
-        self.page.cursor.turbo = r2;
-        // Docking transitions are rare and are the cursor's most surprising
-        // behavior (magnet centre snap, break-free kick); keep the trace in
-        // release too so user-marked nudges are diagnosable.
-        let before = self.page.cursor.attached;
-        let (bx, by) = (self.page.cursor.x, self.page.cursor.y);
-        let scrolling = rx != 0.0 || ry != 0.0;
-        let cursor = &mut self.page.cursor;
-        cursor.advance_with(lx, ly, dt, &self.page.focusables, scrolling);
-        {
-            let after = self.page.cursor.attached;
-            if before != after {
-                let describe = |id: Option<u64>| match id {
-                    None => "free".to_string(),
-                    Some(i) => match self.page.focusables.iter().find(|o| o.id == i) {
-                        Some(o) => format!(
-                            "#{i} {:?} ({:.0},{:.0},{:.0}x{:.0})",
-                            o.kind, o.x, o.y, o.w, o.h
-                        ),
-                        None => format!("#{i} gone"),
-                    },
-                };
-                crate::platform::app_log::info(format!(
-                    "cursor dock {} -> {} stick=({lx:.2},{ly:.2}) rstick=({rx:.2},{ry:.2}) scrolling={} pos=({bx:.0},{by:.0})",
-                    describe(before),
-                    describe(after),
-                    u8::from(scrolling),
-                ));
-            }
-        }
-        // One axis per gesture: a slightly diagonal hold must not drift
-        // sideways (the scroll-trap). The lock is chosen on the first
-        // deflected sample and cleared only at neutral; if the locked
-        // axis is released while the other stays deflected, adopt the
-        // other so crossing over without a neutral pass never dead-sticks.
-        let axis = match self.scroll_axis {
-            Some(_) if rx == 0.0 && ry == 0.0 => {
-                self.scroll_axis = None;
-                None
-            }
-            Some(axis) => {
-                let (locked, other) = match axis {
-                    ScrollAxis::Vertical => (ry, rx),
-                    ScrollAxis::Horizontal => (rx, ry),
-                };
-                if locked == 0.0 && other != 0.0 {
-                    let next = axis.other();
-                    self.scroll_axis = Some(next);
-                    Some(next)
-                } else {
-                    Some(axis)
-                }
-            }
-            None if rx == 0.0 && ry == 0.0 => None,
-            None => {
-                // Tie goes vertical: down-page is the dominant gesture.
-                let axis = if ry.abs() >= rx.abs() {
-                    ScrollAxis::Vertical
-                } else {
-                    ScrollAxis::Horizontal
-                };
-                self.scroll_axis = Some(axis);
-                Some(axis)
-            }
+        let mut sample = crate::domain::pad::PadSample {
+            lstick_x: lx,
+            lstick_y: ly,
+            rstick_x: rx,
+            rstick_y: ry,
+            r2,
+            ..Default::default()
         };
-        let scale = if r2 { 2.0 } else { 1.0 };
-        match axis {
-            Some(ScrollAxis::Vertical) => (0.0, ry * SCROLL_SPEED * dt * scale),
-            Some(ScrollAxis::Horizontal) => (rx * SCROLL_SPEED * dt * scale, 0.0),
-            None => (0.0, 0.0),
-        }
+        sample.stick_x = lx;
+        sample.stick_y = ly;
+        let mut rt = self.page.cursor.lock();
+        rt.focusables = self.page.focusables.clone();
+        rt.advance(&sample, now)
+            .scroll
+            .map(|(dx, dy, _)| (dx, dy))
+            .unwrap_or((0.0, 0.0))
     }
 
     /// D-pad focus step: spatial cone jump over page targets. A press always
     /// asks the engine for a fresh target set around the new cursor.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
-        let from = (self.page.cursor.x, self.page.cursor.y);
-        let was = self.page.cursor.attached;
-        self.dom_reseed_pending = true;
-        self.page.cursor.jump(dir, &self.page.focusables);
+        let before = self.page.cursor.snapshot();
+        self.page
+            .cursor
+            .set_focusables(self.page.focusables.clone());
+        self.page.cursor.jump(dir);
+        let after = self.page.cursor.snapshot();
         crate::platform::app_log::info(format!(
-            "cursor jump {dir:?} from=({:.0},{:.0}) dock={was:?} fly={:?} attached={:?} targets={}",
-            from.0,
-            from.1,
-            self.page.cursor.fly_to,
-            self.page.cursor.attached,
+            "cursor jump {dir:?} from=({:.0},{:.0}) dock={:?} fly={:?} attached={:?} targets={}",
+            before.x,
+            before.y,
+            before.attached,
+            after.fly_to,
+            after.attached,
             self.page.focusables.len(),
         ));
     }
@@ -675,12 +578,12 @@ mod tests {
     use std::time::Duration;
 
     fn panel() -> BrowserPanel {
-        let mut panel = BrowserPanel {
+        let panel = BrowserPanel {
             viewport: (900.0, 700.0),
             ..BrowserPanel::default()
         };
-        panel.page.cursor.x = 450.0;
-        panel.page.cursor.y = 350.0;
+        panel.page.cursor.lock().cursor.x = 450.0;
+        panel.page.cursor.lock().cursor.y = 350.0;
         panel
     }
 
@@ -726,7 +629,7 @@ mod tests {
         assert!(dy < 0.0);
         let at = at + Duration::from_millis(100);
         step(&mut panel, 0.0, 0.0, false, at);
-        assert_eq!(panel.scroll_axis, None);
+        assert_eq!(panel.cursor.lock().scroll_axis, None);
         let at = at + Duration::from_millis(100);
         let (dx, dy) = step(&mut panel, 0.9, -0.2, false, at);
         assert!(dx > 0.0);
@@ -784,12 +687,12 @@ mod tests {
                 url: None,
             },
         ];
-        panel.page.cursor.x = 150.0;
-        panel.page.cursor.y = 320.0;
-        panel.page.cursor.attached = Some(2);
+        panel.page.cursor.lock().cursor.x = 150.0;
+        panel.page.cursor.lock().cursor.y = 320.0;
+        panel.page.cursor.lock().cursor.attached = Some(2);
         panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
-        assert!(panel.dom_reseed_pending);
-        assert_eq!(panel.page.cursor.fly_to, Some((150.0, 120.0)));
+        assert!(panel.cursor.lock().dom_reseed_pending);
+        assert_eq!(panel.cursor.snapshot().fly_to, Some((150.0, 120.0)));
     }
 
     #[test]
