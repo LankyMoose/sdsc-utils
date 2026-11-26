@@ -24,8 +24,10 @@ they are not the integrator for analog state.
   every per-window clock request.
 - `ui::browser::cursor_surface::CursorSurface` — the browser cursor owns its
   clock: pulls the latest pad snapshot, advances `CursorHandle`, sends CEF
-  pointer/scroll commands, and requests vsync redraws while active. No
-  `BrowserFrame` app message.
+  pointer/scroll commands, and requests vsync redraws only while the ring pose
+  actually changes (or a docked stick is inside the break-grace window).
+  Meaningful stick changes arrive as edge wake-ups (`InputEdge::analog_changed`);
+  steady held sticks stay in the snapshot. No `BrowserFrame` app message.
 - `ui::motion::Timeline` — wall-clock segment with pause support; pose is
   derived, never accumulated.
 - `InputHub::latest_reading(max_age)` — preferred live pad reading for

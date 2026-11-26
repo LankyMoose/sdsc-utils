@@ -3564,6 +3564,7 @@ fn browser_stream_wake(
         || ps_held
         || digital
         || digital != state.digital
+        || edge.analog_changed
         || stick != state.stick;
     (wake, EdgeWakeState { stick, digital })
 }

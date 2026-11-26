@@ -197,7 +197,7 @@ impl InputHub {
         self.push_edge_at(edge, Instant::now());
     }
 
-    fn push_edge_at(&self, edge: InputEdge, now: Instant) {
+    fn push_edge_at(&self, mut edge: InputEdge, now: Instant) {
         if self.edge_tx.lock().map(|g| g.is_none()).unwrap_or(true) {
             return;
         }
@@ -206,6 +206,7 @@ impl InputHub {
         };
         let digital_change = digital_changed(&gate.last, &edge.readings);
         let stick_change = stick_changed(&gate.last, &edge.readings);
+        edge.analog_changed = stick_change;
         let all_resting = edge
             .readings
             .iter()
@@ -324,6 +325,19 @@ impl OskInputSlot {
         }
     }
 
+    /// True while debug replay frames are still queued.
+    pub fn has_replay(&self) -> bool {
+        #[cfg(debug_assertions)]
+        let has = self
+            .state
+            .lock()
+            .map(|guard| !guard.replay.is_empty())
+            .unwrap_or(false);
+        #[cfg(not(debug_assertions))]
+        let has = false;
+        has
+    }
+
     /// Latest `(sequence, readings)`; a sequence change means new analog data.
     pub fn read(&self) -> (u64, Vec<NavReading>) {
         match self.state.lock() {
@@ -416,6 +430,10 @@ pub struct InputEdge {
     pub seq: u64,
     pub reason: SnapshotReason,
     pub pad_count: usize,
+    /// True when a stick axis moved beyond the analog noise epsilon since the
+    /// previous published edge. Pull-model surfaces can sleep while false.
+    #[serde(default)]
+    pub analog_changed: bool,
 }
 
 impl InputEdge {
@@ -430,6 +448,7 @@ impl InputEdge {
             seq: meta.seq,
             reason: meta.reason,
             pad_count: meta.pad_count,
+            analog_changed: false,
         }
     }
 

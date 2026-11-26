@@ -108,30 +108,19 @@ impl<Message> canvas::Program<Message> for CursorSurface {
         }
 
         let snapshot = self.handle.snapshot();
-        let moving = snapshot.vx.abs() > 0.5
-            || snapshot.vy.abs() > 0.5
-            || snapshot.fly_to.is_some()
-            || (snapshot.dock_blend
-                - if snapshot.attached.is_some() {
-                    1.0
-                } else {
-                    0.0
-                })
-            .abs()
-                > 0.001;
         let stick = sample.lstick_x != 0.0
             || sample.lstick_y != 0.0
             || sample.rstick_x != 0.0
             || sample.rstick_y != 0.0;
-        let pending = {
-            let runtime = self.handle.lock();
-            runtime.force_mouse_sync
-                || runtime.dom_reseed_pending
-                || runtime.last_sent_mouse != Some((snapshot.x as i32, snapshot.y.max(0.0) as i32))
-        };
-        if moving || stick || pending {
-            // Immediate request: iced/wgpu presents at vsync, so the cursor
-            // targets the monitor rate instead of a hardcoded 16ms phase.
+        // A docked cursor latches a held stick for the break grace: keep a
+        // slow confirmation loop only until that grace expires.
+        let dock_grace = snapshot.attached.is_some()
+            && stick
+            && snapshot.docked_for < crate::browser::cursor::BREAK_LATCH_GRACE_SECS;
+        if frame.pose_changed || dock_grace {
+            // The ring actually moved (or may break free shortly): present at
+            // vsync. Otherwise the canvas sleeps and a meaningful stick change
+            // wakes it through the pad edge stream.
             Some(canvas::Action::request_redraw())
         } else {
             None

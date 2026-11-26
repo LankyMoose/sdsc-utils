@@ -272,6 +272,11 @@ impl OskSurface<'_> {
         {
             crate::ui::pull::FrameDemand::next(Instant::now()).request(shell);
         }
+        if self.slot.has_replay() {
+            // Drain synthetic replay frames even when the next queued frame is
+            // neutral (press/release sequences are queued back-to-back).
+            crate::ui::pull::FrameDemand::Now.request(shell);
+        }
     }
 }
 

@@ -2383,6 +2383,7 @@ impl App {
         if self.begin_pad_edge(owner, &edge).is_none() {
             return Task::none();
         }
+        let analog_changed = edge.analog_changed;
         // One action per pad frame; conflated edges drain FIFO across frames.
         let tap_action = self.pending_pad_actions.pop_front();
         let tap_actions: &[PadAction] = tap_action.as_slice();
@@ -2417,7 +2418,13 @@ impl App {
             return self.on_osk_tap_actions(tap_actions);
         }
         if self.browser_visible {
-            return self.on_browser_pad(&readings, tap_actions);
+            let task = self.on_browser_pad(&readings, tap_actions);
+            if analog_changed {
+                // CursorSurface sleeps when the ring pose stops changing;
+                // meaningful stick changes wake it with one redraw.
+                return task.chain(self.invalidate_browser_window());
+            }
+            return task;
         }
 
         if launcher_open {

@@ -847,6 +847,8 @@ pub struct CursorFrame {
     pub scroll: Option<(f32, f32, (f32, f32))>,
     /// A D-pad flight landed; ask the engine for a fresh DOM cull.
     pub reseed: bool,
+    /// The drawn ring pose changed; the surface should present a frame.
+    pub pose_changed: bool,
 }
 
 /// Shared cursor state for the live tab. The pull-model widget advances it at
@@ -892,6 +894,13 @@ impl CursorRuntime {
         self.analog_at = Some(now);
         self.cursor.turbo = sample.r2;
         self.last_stick = (sample.lstick_x, sample.lstick_y);
+        let before_pose = (
+            self.cursor.x,
+            self.cursor.y,
+            self.cursor.dock_blend,
+            self.cursor.attached,
+            self.cursor.last_dock,
+        );
 
         let before = self.cursor.attached;
         let (bx, by) = (self.cursor.x, self.cursor.y);
@@ -983,11 +992,20 @@ impl CursorRuntime {
         if reseed {
             self.dom_reseed_pending = false;
         }
+        let pose_changed = before_pose
+            != (
+                self.cursor.x,
+                self.cursor.y,
+                self.cursor.dock_blend,
+                self.cursor.attached,
+                self.cursor.last_dock,
+            );
 
         CursorFrame {
             mouse,
             scroll,
             reseed,
+            pose_changed,
         }
     }
 }
@@ -2186,5 +2204,25 @@ mod tests {
         c.attached = Some(1);
         c.retarget(&[link(1, 0.0, 0.0)]);
         assert_eq!(c.attached, Some(1));
+    }
+
+    #[test]
+    fn runtime_reports_only_pose_changes_for_presentation() {
+        let mut rt = CursorRuntime::default();
+        let t0 = Instant::now();
+        let held = crate::domain::pad::PadSample {
+            lstick_x: 0.9,
+            stick_x: 0.9,
+            ..Default::default()
+        };
+        let frame = rt.advance(&held, t0);
+        assert!(!frame.pose_changed, "first sample only primes the clock");
+        let frame = rt.advance(&held, t0 + std::time::Duration::from_millis(100));
+        assert!(frame.pose_changed, "subsequent analog step moves the ring");
+        let frame = rt.advance(
+            &crate::domain::pad::PadSample::default(),
+            t0 + std::time::Duration::from_millis(100),
+        );
+        assert!(!frame.pose_changed, "zero-dt neutral frame is static");
     }
 }
