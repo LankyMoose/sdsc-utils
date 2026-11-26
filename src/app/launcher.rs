@@ -523,6 +523,7 @@ impl App {
         // viewport bounds (not the 800x600 defaults) survive navigation.
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.focusables.clear();
+        self.browser.panel.page.focusables_url = None;
         let generation = self.browser.panel.session.begin_load(url.clone());
         if let Some(pending) = self.pending_browser_trace.as_mut() {
             pending.generation = Some(generation);
@@ -972,6 +973,20 @@ impl App {
         let Some(win) = self.browser_window else {
             return Task::none();
         };
+        // A replay screenshot must not capture the previous document's paint
+        // when navigation has already updated the URL/title. Retry briefly
+        // until the frame slot carries the current URL; the event-driven
+        // replay gate keeps the step open until the shot is saved.
+        if self.replay.is_some() && self.replay_capture_retries < 20 {
+            let current = self.browser.panel.session.url();
+            if self.browser.panel.session.frame_slot().url().as_deref() != Some(current) {
+                self.replay_capture_retries += 1;
+                return Task::perform(super::delay(Duration::from_millis(50)), |()| {
+                    Message::Browser(crate::ui::browser::BrowserMessage::Capture)
+                });
+            }
+        }
+        self.replay_capture_retries = 0;
         iced::window::screenshot(win)
             .map(crate::ui::browser::BrowserMessage::Shot)
             .map(Message::Browser)
@@ -1039,26 +1054,30 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        std::thread::spawn(move || {
-            let dir = crate::persist::paths::data_dir().join("shots");
-            if let Err(err) = std::fs::create_dir_all(&dir) {
-                app_log::warn(format!("shot skipped: cannot create {dir:?}: {err}"));
-                return;
-            }
-            let path = dir.join(format!("shot-{ms}.png"));
-            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
-                Ok(()) => app_log::info(format!(
-                    "shot saved path={} size={w}x{h} scale={scale} frame_gen={frame_gen} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({:.0},{:.0})",
-                    path.display(),
-                    cursor.0,
-                    cursor.1,
-                    scroll.0,
-                    scroll.1,
-                )),
-                Err(err) => app_log::warn(format!("shot failed path={}: {err}", path.display())),
-            }
-        });
-        Task::none()
+        Task::perform(
+            super::spawn_blocking(move || {
+                let dir = crate::persist::paths::data_dir().join("shots");
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    app_log::warn(format!("shot skipped: cannot create {dir:?}: {err}"));
+                    return;
+                }
+                let path = dir.join(format!("shot-{ms}.png"));
+                match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                    Ok(()) => app_log::info(format!(
+                        "shot saved path={} size={w}x{h} scale={scale} frame_gen={frame_gen} cursor=({:.0},{:.0}) magnet={magnet} dock={dock:?} blend={blend:.2} rect={rect} wells={wells} scroll=({:.0},{:.0})",
+                        path.display(),
+                        cursor.0,
+                        cursor.1,
+                        scroll.0,
+                        scroll.1,
+                    )),
+                    Err(err) => {
+                        app_log::warn(format!("shot failed path={}: {err}", path.display()))
+                    }
+                }
+            }),
+            |_| Message::ReplayCaptureDone,
+        )
     }
 
     /// Worker-owned frame slot handoff for a tab the UI already knows
@@ -1204,14 +1223,17 @@ impl App {
                 let shot = self.shoot_browser_window(false);
                 // Move the RGBA buffer into the slot; the stable-texture
                 // primitive uploads unseen generations into one texture.
+                let url = self.browser.panel.session.url().to_string();
                 self.browser
                     .panel
                     .session
-                    .write_frame(frame.width, frame.height, frame.rgba);
+                    .write_frame(frame.width, frame.height, frame.rgba, &url);
                 #[cfg(debug_assertions)]
                 return shot;
             }
             EngineEvent::TitleChanged { tab: _, title } => {
+                self.browser.panel.page.title_generation =
+                    self.browser.panel.page.title_generation.wrapping_add(1);
                 self.browser.panel.session.note_title(title);
                 // The boot tab loads before the Browser window opens; writing
                 // the strip now would replace the saved multi-tab file with
@@ -1250,8 +1272,9 @@ impl App {
                     crate::browser::bookmarks::origin_key(&url)
                 ));
             }
-            EngineEvent::A11yTree { tab: _, items } => {
+            EngineEvent::A11yTree { tab: _, url, items } => {
                 self.browser.panel.page.focusables = items;
+                self.browser.panel.page.focusables_url = Some(url);
                 let targets = self.browser.panel.page.focusables.clone();
                 self.browser.panel.page.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
@@ -1286,7 +1309,9 @@ impl App {
             EngineEvent::ScrollExtent { extent, .. } => {
                 self.browser.panel.page_extent = extent;
             }
-            EngineEvent::ActivityChanged { .. } => {}
+            EngineEvent::ActivityChanged { phase, .. } => {
+                self.browser.panel.page.activity = phase;
+            }
             EngineEvent::HistoryCapability {
                 tab: _,
                 can_back,
@@ -1379,6 +1404,7 @@ impl App {
             };
             match event {
                 EngineEvent::TitleChanged { title, .. } => {
+                    stored.page.title_generation = stored.page.title_generation.wrapping_add(1);
                     stored.page.session.note_title(title);
                     page_changed = true;
                 }
@@ -1387,8 +1413,9 @@ impl App {
                     page_changed = true;
                 }
                 EngineEvent::FaviconChanged { .. } => {}
-                EngineEvent::A11yTree { items, .. } => {
+                EngineEvent::A11yTree { url, items, .. } => {
                     stored.page.focusables = items;
+                    stored.page.focusables_url = Some(url);
                     let all = stored.page.focusables.clone();
                     stored.page.cursor.retarget(&all);
                 }
@@ -1405,7 +1432,9 @@ impl App {
                 EngineEvent::ScrollExtent { extent, .. } => {
                     stored.page.page_extent = extent;
                 }
-                EngineEvent::ActivityChanged { .. } => {}
+                EngineEvent::ActivityChanged { phase, .. } => {
+                    stored.page.activity = phase;
+                }
                 EngineEvent::HistoryCapability {
                     can_back,
                     can_forward,

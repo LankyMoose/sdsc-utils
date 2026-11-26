@@ -25,6 +25,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import qa_offscreen
+
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>system osk qa</title>
 <style>
@@ -50,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, help="debug sdsc-utils executable")
     parser.add_argument("--keep", action="store_true", help="keep the app running")
+    parser.add_argument(
+        "--mode",
+        choices=("dual", "grid", "both"),
+        default="both",
+        help="OSK mode(s) to exercise (default: both)",
+    )
     return parser.parse_args()
 
 
@@ -142,8 +150,7 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
     prefix = session.name
     before = set(replay_root.glob(f"{prefix}-*")) if replay_root.is_dir() else set()
     env = os.environ.copy()
-    env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DEBUG_INPUT"] = "0"
+    qa_offscreen.apply_env(env)
     env["SDSC_OSK_MODE"] = mode
     print(f"session={session}")
     proc = subprocess.Popen(
@@ -153,6 +160,7 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    offscreen = qa_offscreen.watch(proc.pid)
     sandbox = None
     done = False
     deadline = time.time() + 60
@@ -215,8 +223,11 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
                 return False, "dual: Options never emitted osk.enter"
             if not any(row.get("reason") == "mouse" for row in closes):
                 return False, "dual: real mouse did not close the OSK"
+        if not offscreen.report():
+            return False, f"{mode}: offscreen QA failed"
         return True, ""
     finally:
+        offscreen.stop()
         if not args_keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(
@@ -250,7 +261,8 @@ def main() -> int:
     session.mkdir(parents=True, exist_ok=True)
     page = session / "osk.html"
     page.write_text(PAGE, encoding="utf-8")
-    for mode in ("dual", "grid"):
+    modes = ("dual", "grid") if args.mode == "both" else (args.mode,)
+    for mode in modes:
         ok, error = run(exe, root, page, mode)
         if not ok:
             print(f"error: {error}", file=sys.stderr)

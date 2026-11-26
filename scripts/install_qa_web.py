@@ -49,6 +49,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import qa_offscreen
+
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "target" / "install-qa"
 DOWNLOADS = OUT / "downloads"
@@ -205,6 +207,8 @@ class Console:
         self.last_debug_open: str = ""
         self.last_controller_input = True
         self.last_automated = False
+        self.offscreen: qa_offscreen.OffscreenWatch | None = None
+        self.last_offscreen_ok: bool | None = None
         (
             self.manifest,
             self.engine_bundled,
@@ -363,6 +367,7 @@ class Console:
                 "last_debug_open": self.last_debug_open,
                 "last_controller_input": self.last_controller_input,
                 "last_automated": self.last_automated,
+                "last_offscreen_ok": self.last_offscreen_ok,
                 "preparing": self.preparing,
                 "prepare_step": self.prepare_step,
                 "prepare_error": self.prepare_error,
@@ -684,6 +689,13 @@ class Console:
             self.proc = None
             self.running_flavor = None
             self.running_pid = None
+            watcher = self.offscreen
+            self.offscreen = None
+        if watcher is not None:
+            clean = watcher.report()
+            self.last_offscreen_ok = clean
+            if not clean:
+                self.log("launch: OFFSCREEN QA FAILED (a window was on a monitor)")
         if proc is not None and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(
@@ -707,15 +719,26 @@ class Console:
         automated: bool = False,
     ):
         # Automated sessions never accept real input. Synthetic replay steps
-        # drive the app instead.
+        # drive the app instead. Quiet/offscreen placement is compiled out of
+        # release builds, so refuse to pretend a release run is hidden.
         if automated:
             controller_input = False
+            if flavor == "release":
+                raise RuntimeError(
+                    "Automated offscreen placement needs the Debug build "
+                    "(release builds do not honor quiet/offscreen)"
+                )
         self.stop()
         if flavor.startswith("installed:"):
             tag = normalize_tag(flavor.split(":", 1)[1]) or flavor.split(":", 1)[1]
             entry = self.installed.get(tag)
             if not entry:
                 raise RuntimeError(f"{tag} is not installed")
+            if automated and str(entry.get("mode", "")).split(":", 1)[0] == "release":
+                raise RuntimeError(
+                    "Automated offscreen placement needs a Debug install "
+                    "(release builds do not honor quiet/offscreen)"
+                )
             exe = Path(entry["exe"])
             cwd = Path(entry["path"])
             appdata = Path(entry["appdata"])
@@ -731,11 +754,12 @@ class Console:
         env["SDSC_UPDATE_API_URL"] = self.feed_url()
         env["SDSC_CEF_NO_BUILD_FALLBACK"] = "1"
         # Manual launches open on the primary monitor with focus; automated
-        # launches use the secondary monitor and never steal focus. Real pad,
+        # launches are placed fully offscreen and never steal focus. Real pad,
         # keyboard, and mouse input stays live for manual testing and is
         # locked out for automation (synthetic replay drives tests instead).
         env["SDSC_DEBUG_QUIET"] = "1" if automated else "0"
         env["SDSC_DEBUG_INPUT"] = "1" if controller_input else "0"
+        env["SDSC_DEBUG_OFFSCREEN"] = "1" if automated else "0"
         if self.engine:
             env["SDSC_CEF_DLC_URL"] = self.engine["url"]
             env["SDSC_CEF_DLC_SHA256"] = self.engine["sha256"]
@@ -760,10 +784,14 @@ class Console:
             self.last_debug_open = debug_open
             self.last_controller_input = controller_input
             self.last_automated = automated
+            self.last_offscreen_ok = None
+            self.offscreen = (
+                qa_offscreen.watch(self.proc.pid) if automated else None
+            )
         self.log(
             f"launch: {flavor} pid={self.proc.pid} "
             f"input={'on' if controller_input else 'off'} "
-            f"display={'secondary' if automated else 'primary'} data={appdata}"
+            f"display={'offscreen' if automated else 'primary'} data={appdata}"
         )
         return self.api_state()
 
@@ -955,7 +983,7 @@ PAGE = """<!doctype html>
       <label><input id="engine" type="checkbox"> Bundle browser engine</label>
       <label><input id="open-home" type="checkbox" checked> Open Home (debug)</label>
       <label><input id="controller-input" type="checkbox" checked> Allow real input (pad/keyboard/mouse)</label>
-      <label><input id="automated" type="checkbox"> Automated (secondary monitor)</label>
+      <label><input id="automated" type="checkbox"> Automated (offscreen)</label>
       <label><input id="restage" type="checkbox"> Rebuild install</label>
     </div>
     <div class="row">
@@ -965,7 +993,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="row error" id="error" style="display:none"></div>
     <div class="row muted" id="run">—</div>
-    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and Home's apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (secondary monitor)</b> for quiet placement on the secondary display with no focus steal; uncheck <b>Allow real input</b> too so the physical controller, keyboard, and mouse cannot navigate or close it. Browser input tests use synthetic replay steps, never OS input injection.</div>
+    <div class="row hint">Leave <b>Bundle browser engine</b> unchecked to start with no CEF at all: only the exe is staged, and Home's apps → Browser → Install walks the DLC flow. Check it to test an already-installed engine. <b>Rebuild install</b> resets the private appdata, including a previously downloaded engine. Manual runs open on the primary monitor with focus. Check <b>Automated (offscreen)</b> for fully-hidden placement outside every monitor with no focus steal (Debug builds; the console refuses a release automated launch); uncheck <b>Allow real input</b> too so the physical controller, keyboard, and mouse cannot navigate or close it. Browser input tests use synthetic replay steps, never OS input injection.</div>
   </section>
 
   <section class="card">
@@ -990,6 +1018,8 @@ function render(){
   if (S.preparing) status += `working: ${S.prepare_step || 'starting'}`;
   else if (S.running) status += `running ${S.running_flavor}`;
   else status += 'not running';
+  if (S.last_offscreen_ok === true) status += ' · offscreen OK';
+  else if (S.last_offscreen_ok === false) status += ' · OFFSCREEN FAIL';
   $('status').textContent = status;
   if (!initialized) {
     $('version').value = feed;

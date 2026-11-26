@@ -109,10 +109,21 @@ fn quiet_show<Message: Send + 'static>(id: window::Id, show: bool) -> Task<Messa
             return;
         };
         let hwnd = win32_handle.hwnd.get();
-        host::move_to_secondary_monitor(hwnd);
+        if crate::platform::debug_quiet::offscreen() {
+            host::move_offscreen(hwnd);
+        } else {
+            host::move_to_secondary_monitor(hwnd);
+        }
         if show {
             host::set_no_activate(hwnd, true);
             host::show_window(hwnd);
+            if crate::platform::debug_quiet::offscreen() && !host::window_is_offscreen(hwnd) {
+                // Debug QA contract: quiet automated runs must never appear
+                // on any monitor. The Python watcher is the hard gate; this
+                // witness catches regressions in the app log too.
+                crate::platform::app_log::error("ui-diag: offscreen violation after quiet show");
+                debug_assert!(false, "quiet show placed a window on-screen");
+            }
         }
     })
     .discard()

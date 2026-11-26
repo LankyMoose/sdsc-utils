@@ -24,6 +24,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import qa_offscreen
+
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>input qa</title>
 <style>
@@ -114,10 +116,7 @@ def main() -> int:
     prefix = session.name
     before = set(replay_root.glob(f"{prefix}-*")) if replay_root.is_dir() else set()
     env = os.environ.copy()
-    # Debug replay prepares these itself; setting them here documents the
-    # contract and keeps the script safe if replay behavior changes.
-    env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DEBUG_INPUT"] = "0"
+    qa_offscreen.apply_env(env)
     print(f"session={session}")
     print(f"exe={exe}")
     proc = subprocess.Popen(
@@ -127,6 +126,7 @@ def main() -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    offscreen = qa_offscreen.watch(proc.pid)
 
     sandbox = None
     done = False
@@ -195,8 +195,11 @@ def main() -> int:
         if '"cursor":"Text"' not in engine_text:
             print("error: CEF cursor shape did not reach the UI", file=sys.stderr)
             return 1
+        if not offscreen.report():
+            return 1
         return 0
     finally:
+        offscreen.stop()
         if not args.keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(

@@ -324,6 +324,9 @@ pub enum EngineEvent {
     /// cursor and drops stale attachments.
     A11yTree {
         tab: TabId,
+        /// Document URL the snapshot belongs to. Replay uses this to reject
+        /// stale post-navigation trees from the previous document.
+        url: String,
         items: Vec<crate::browser::cursor::Focusable>,
     },
     /// Viewport scroll offset the backend translated the current tree with

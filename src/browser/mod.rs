@@ -170,8 +170,8 @@ impl BrowserSession {
     /// Engine path: install the latest RGBA frame. `FrameSlot::write`
     /// rejects mismatched buffers and bumps the generation the GPU
     /// primitive watches.
-    pub fn write_frame(&mut self, width: u32, height: u32, rgba: Vec<u8>) {
-        self.frame.write(width, height, rgba);
+    pub fn write_frame(&mut self, width: u32, height: u32, rgba: Vec<u8>, url: &str) {
+        self.frame.write(width, height, rgba, url);
     }
 
     pub fn clear_frame(&mut self) {
@@ -464,7 +464,7 @@ mod tests {
         let mut s = BrowserSession::default();
         s.open_surface();
         assert!(!s.has_content());
-        s.write_frame(800, 600, vec![0; 800 * 600 * 4]);
+        s.write_frame(800, 600, vec![0; 800 * 600 * 4], "https://a.test/");
         assert!(s.has_frame());
         assert!(s.has_content());
         let generation = s.begin_load("https://next.test".to_string());

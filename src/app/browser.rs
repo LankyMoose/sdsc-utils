@@ -89,6 +89,50 @@ pub(crate) struct PendingHistoryTravel {
     pub started: Instant,
 }
 
+/// Event-driven replay settle gate.
+///
+/// A step starts its successor when the step's own signals are observed:
+/// engine load/history settled, a window redraw landed, and screenshot
+/// captures completed. The timeout is only a liveness backstop, never the
+/// normal path.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplayWait {
+    /// Timeout generation (stale timeout messages are ignored).
+    pub id: u64,
+    /// Wait for `pending_browser_trace` / `pending_history_travel` to clear
+    /// and the active page activity to return to Idle.
+    pub needs_engine: bool,
+    /// Wait for one window `RedrawRequested` after the step.
+    pub needs_redraw: bool,
+    /// Wait for one screenshot capture to be handled.
+    pub needs_capture: bool,
+    /// Browser-open gate (first step only).
+    pub needs_browser_ready: bool,
+    /// Wait for a nonempty focusable set for the current document
+    /// (cursor.dock).
+    pub needs_focusables: bool,
+    /// Wait for a new CEF paint generation after a navigation.
+    pub needs_frame: bool,
+    pub frame_mark: u64,
+    /// Wait for the latest CEF paint to belong to the current document URL.
+    pub needs_current_frame: bool,
+    /// Wait for a page title-change event (selection/scroll reports).
+    pub needs_title: bool,
+    pub title_mark: u64,
+    /// Wait for the system OSK window to exist.
+    pub needs_osk_ready: bool,
+    /// Wait for the pull-model OSK widget to consume queued replay frames.
+    pub needs_osk_idle: bool,
+    /// Wait for an in-flight D-pad nudge to land.
+    pub needs_cursor_idle: bool,
+    pub redraw_seen: bool,
+    /// Capture count at wait creation; ready once the pending count drops.
+    pub captures_to_finish: u32,
+    /// Short debounce for steps that may start a navigation. A load start
+    /// arrives as `ActivityChanged`; this keeps a click/Enter from racing it.
+    pub engine_grace_until: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct BrowserAppState {
     /// Tabs, chrome targets, cursor, bookmarks, and per-tab page state.
@@ -163,7 +207,21 @@ fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
 }
 
 const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
-const REPLAY_STEP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Liveness backstop for an event-driven replay settle. The next step normally
+/// starts as soon as its engine/redraw/capture signal arrives; this only
+/// prevents a missing event from hanging the flow.
+const REPLAY_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Short engine debounce for input that may start a navigation (Enter, click,
+/// Cross). The load-start event normally arrives within a frame; this closes
+/// the dispatch-to-load race without turning into a per-step delay.
+const REPLAY_NAV_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
+/// Final settle before `replay.done`: lets the last queued CEF input land and
+/// the page title/URL flush without closing the window underneath it.
+const REPLAY_FINAL_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+/// Browser-open settle: the boot/default page navigation can start right after
+/// the window appears. Give it one debounce window before the first replay
+/// step so a restored Google load cannot supersede the replay navigate.
+const REPLAY_BROWSER_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 /// A selector jump that neither lands nor reports a DevTools error settles as
 /// a timeout so the action cannot hang the trace or the selector state.
 const HISTORY_TRAVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -196,24 +254,70 @@ impl super::App {
     /// Replay driver tick. Opens the Browser surface first, validates stable
     /// preconditions, then dispatches the next semantic step through the same
     /// handlers a real action uses.
+    ///
+    /// Scheduling is event-driven: after a step the driver waits for the
+    /// step's own signals (engine load/history settled, a window redraw, or a
+    /// screenshot capture), not a fixed delay. `REPLAY_SETTLE_TIMEOUT` is a
+    /// liveness backstop only.
     pub(crate) fn on_replay_step(&mut self) -> Task<Message> {
-        let Some(plan) = &self.replay else {
+        let Some(flow) = self.replay.as_ref().map(|plan| plan.flow()) else {
             return Task::none();
         };
-        let flow = plan.flow();
-        let wants_browser = plan.peek_app() == Some("browser");
+        if self.replay_wait.is_some() {
+            if self.replay_wait_ready() {
+                self.replay_wait = None;
+            } else {
+                // The frame/engine/capture event handlers kick us when ready.
+                return Task::none();
+            }
+        }
+        let wants_browser =
+            self.replay.as_ref().and_then(|plan| plan.peek_app()) == Some("browser");
         if wants_browser && !self.browser_visible {
             let open = self.open_browser_window();
-            return Task::batch([
-                open,
-                Task::perform(super::delay(REPLAY_BROWSER_WAIT), |()| Message::ReplayStep),
-            ]);
+            let wait = crate::app::browser::ReplayWait {
+                needs_browser_ready: true,
+                needs_engine: true,
+                engine_grace_until: Some(Instant::now() + REPLAY_BROWSER_GRACE),
+                needs_redraw: true,
+                ..Default::default()
+            };
+            let timeout = self.replay_install_wait(wait, REPLAY_BROWSER_WAIT);
+            return match timeout {
+                Some(timeout) => Task::batch([open, timeout]),
+                None => Task::batch([open, Task::done(Message::ReplayStep)]),
+            };
         }
-        if self.pending_history_travel.is_some() || self.pending_browser_trace.is_some() {
-            return Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep);
+        if !self.replay_prime_done {
+            // A Browser restored/open before replay may still be loading its
+            // default page. Let that settle (with a short start debounce) so
+            // the first replay step is not superseded by the boot load.
+            self.replay_prime_done = true;
+            let wait = crate::app::browser::ReplayWait {
+                needs_engine: true,
+                engine_grace_until: Some(Instant::now() + REPLAY_NAV_GRACE),
+                ..Default::default()
+            };
+            if let Some(timeout) = self.replay_install_wait(wait, REPLAY_SETTLE_TIMEOUT) {
+                return timeout;
+            }
         }
         let Some(step) = self.replay.as_mut().and_then(|plan| plan.next_step()) else {
+            if !self.replay_finished {
+                self.replay_finished = true;
+                let wait = crate::app::browser::ReplayWait {
+                    needs_engine: true,
+                    engine_grace_until: Some(Instant::now() + REPLAY_FINAL_GRACE),
+                    ..Default::default()
+                };
+                if let Some(timeout) = self.replay_install_wait(wait, REPLAY_SETTLE_TIMEOUT) {
+                    return timeout;
+                }
+                return Task::done(Message::ReplayStep);
+            }
             self.replay = None;
+            self.replay_finished = false;
+            self.replay_wait = None;
             crate::platform::trace::manifest("replay.done", serde_json::json!({ "flow": flow }));
             // Automated sessions must not leave the browser on screen after
             // the plan finishes. The trace is fully written before close.
@@ -241,12 +345,321 @@ impl super::App {
             }
         }
         crate::platform::trace::replay::set_replaying(true);
+        let frame_before = self.browser.panel.session.frame_slot().generation();
+        let title_before = self.browser.panel.page.title_generation;
         let task = self.replay_dispatch(&step);
         crate::platform::trace::replay::set_replaying(false);
-        Task::batch([
-            task,
-            Task::perform(super::delay(REPLAY_STEP_WAIT), |()| Message::ReplayStep),
-        ])
+        match self.replay_begin_settle(&step, frame_before, title_before) {
+            Some(timeout) => Task::batch([task, timeout]),
+            // Nothing to observe (e.g. Circle already closed the Browser):
+            // continue immediately instead of waiting for a redraw that may
+            // never exist.
+            None => Task::batch([task, Task::done(Message::ReplayStep)]),
+        }
+    }
+
+    /// Install a settle gate. Returns its timeout task, or `None` when the
+    /// condition is already satisfied (the caller's `replay_kick` continues).
+    fn replay_install_wait(
+        &mut self,
+        mut wait: crate::app::browser::ReplayWait,
+        timeout: std::time::Duration,
+    ) -> Option<Task<Message>> {
+        if self.replay_wait_ready_for(&wait) {
+            return None;
+        }
+        self.replay_wait_seq = self.replay_wait_seq.wrapping_add(1);
+        wait.id = self.replay_wait_seq;
+        let id = wait.id;
+        let grace = wait.engine_grace_until;
+        self.replay_wait = Some(wait);
+        let mut tasks = vec![Task::perform(super::delay(timeout), move |_| {
+            Message::ReplayWaitTimeout(id)
+        })];
+        if let Some(grace) = grace {
+            let after = grace.saturating_duration_since(Instant::now());
+            tasks.push(Task::perform(super::delay(after), move |_| {
+                Message::ReplayWaitGrace(id)
+            }));
+        }
+        Some(Task::batch(tasks))
+    }
+
+    /// Classify the step just dispatched and install its settle gate.
+    fn replay_begin_settle(
+        &mut self,
+        step: &crate::platform::trace::replay::ReplayStep,
+        frame_before: u64,
+        title_before: u64,
+    ) -> Option<Task<Message>> {
+        use crate::app::browser::ReplayWait;
+        let now = Instant::now();
+        let action = step.action.as_str();
+        let button = step
+            .params
+            .get("button")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let mut wait = ReplayWait::default();
+        match action {
+            // Navigation/history actions already carry a pending settle guard
+            // set synchronously by the dispatcher.
+            "navigate" | "history.back" | "history.forward" | "history.open" | "history.pick"
+            | "history.cancel" => {
+                wait.needs_engine = true;
+                // Wait for the new document's first paint (not just the load
+                // event) so a following screenshot cannot read the old slot.
+                wait.needs_frame = true;
+                wait.frame_mark = frame_before;
+            }
+            // Screenshots complete when their capture message lands.
+            "screenshot" | "osk.screenshot" => {
+                wait.needs_capture = true;
+                wait.captures_to_finish = self.replay_capture_pending;
+                if wait.captures_to_finish == 0 {
+                    wait.needs_capture = false;
+                }
+                if action == "osk.screenshot" && self.osk.state.open {
+                    wait.needs_osk_ready = true;
+                }
+                if action == "screenshot" {
+                    wait.needs_current_frame = true;
+                }
+            }
+            // The dock action needs the post-navigation A11y set to resolve.
+            "cursor.dock" => {
+                wait.needs_redraw = true;
+                wait.needs_focusables = true;
+            }
+            "wait" => {
+                wait.needs_engine = true;
+                wait.needs_redraw = true;
+                if self.osk.state.open {
+                    wait.needs_osk_ready = true;
+                }
+            }
+            "key" => {
+                wait.needs_redraw = true;
+                let enter = step
+                    .params
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|key| {
+                        key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return")
+                    });
+                if enter && self.browser_visible {
+                    // Enter can start a page navigation; let ActivityChanged
+                    // report it before the next step reads app state.
+                    wait.needs_engine = true;
+                    wait.engine_grace_until = Some(now + REPLAY_NAV_GRACE);
+                }
+            }
+            "mouse.click" | "pad.tap" if self.browser_visible => {
+                wait.needs_redraw = true;
+                wait.needs_engine = true;
+                wait.engine_grace_until = Some(now + REPLAY_NAV_GRACE);
+                if self.osk.state.open {
+                    wait.needs_osk_ready = true;
+                }
+            }
+            "osk.open" => {
+                wait.needs_redraw = true;
+                wait.needs_osk_ready = true;
+            }
+            // OSK trigger/stick steps queue synthetic pull-model frames; gate
+            // the next step on the widget consuming them.
+            "osk.trigger" | "osk.stick" => {
+                wait.needs_redraw = true;
+                wait.needs_osk_ready = true;
+                wait.needs_osk_idle = true;
+            }
+            "pad.tap" if step.app == "browser" && button == "circle" => {
+                // Circle closed the Browser: there may be no window left to
+                // present. Finish this step immediately.
+            }
+            "mouse.drag" | "mouse.wheel" => {
+                wait.needs_redraw = true;
+                // Selection/scroll changes must reach the page paint before
+                // the next synthetic input reads the new viewport state.
+                wait.needs_frame = true;
+                wait.frame_mark = frame_before;
+                wait.needs_title = true;
+                wait.title_mark = title_before;
+            }
+            "text" | "ime.preedit" | "ime.commit" | "pad.stick" | "osk.close" => {
+                wait.needs_redraw = true;
+            }
+            "pad.dir" => {
+                wait.needs_redraw = true;
+                wait.needs_cursor_idle = true;
+            }
+            _ => {
+                wait.needs_redraw = true;
+            }
+        }
+        // Launcher/manual-form steps are app-state changes; their next step
+        // reads that state directly. Don't wait for a present that may not
+        // exist (closing the only window) unless the step is visual.
+        if step.app == "launcher" && !matches!(action, "wait" | "screenshot" | "osk.screenshot") {
+            wait.needs_redraw = false;
+        }
+        self.replay_install_wait(wait, REPLAY_SETTLE_TIMEOUT)
+    }
+
+    /// True when the active settle gate's signals have all landed.
+    fn replay_wait_ready(&self) -> bool {
+        self.replay_wait
+            .as_ref()
+            .is_some_and(|wait| self.replay_wait_ready_for(wait))
+    }
+
+    fn replay_wait_ready_for(&self, wait: &crate::app::browser::ReplayWait) -> bool {
+        if wait.needs_browser_ready
+            && !(self.browser_visible
+                && self.browser_window.is_some()
+                && (self.browser_window_size.is_some() || self.browser.panel.session.has_frame()))
+        {
+            return false;
+        }
+        if wait.needs_engine {
+            if wait
+                .engine_grace_until
+                .is_some_and(|grace| Instant::now() < grace)
+            {
+                return false;
+            }
+            if self.pending_browser_trace.is_some() || self.pending_history_travel.is_some() {
+                return false;
+            }
+            if self.browser.panel.page.activity != crate::browser::engine::EngineActivity::Idle {
+                return false;
+            }
+        }
+        if wait.needs_focusables {
+            let current_url = self.browser.panel.session.url();
+            if self.browser.panel.page.focusables.is_empty()
+                || self.browser.panel.page.focusables_url.as_deref() != Some(current_url)
+            {
+                return false;
+            }
+        }
+        if wait.needs_frame {
+            let current = self.browser.panel.session.url();
+            let slot = self.browser.panel.session.frame_slot();
+            if slot.generation() <= wait.frame_mark || slot.url().as_deref() != Some(current) {
+                return false;
+            }
+        }
+        if wait.needs_current_frame {
+            let current = self.browser.panel.session.url();
+            if self.browser.panel.session.frame_slot().url().as_deref() != Some(current) {
+                return false;
+            }
+        }
+        if wait.needs_title && self.browser.panel.page.title_generation <= wait.title_mark {
+            return false;
+        }
+        if wait.needs_osk_ready
+            && !(self.osk.state.open && self.osk.window.is_some() && !self.osk.pending_show)
+        {
+            return false;
+        }
+        if wait.needs_osk_idle && self.osk.slot.has_replay() {
+            return false;
+        }
+        if wait.needs_cursor_idle && self.browser.panel.cursor.snapshot().fly_to.is_some() {
+            return false;
+        }
+        if wait.needs_redraw && !wait.redraw_seen {
+            return false;
+        }
+        if wait.needs_capture
+            && wait.captures_to_finish > 0
+            && self.replay_capture_pending >= wait.captures_to_finish
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Schedule the next step if the current gate is satisfied. Clears the
+    /// gate here so several events arriving before the queued `ReplayStep`
+    /// cannot queue duplicate step ticks.
+    pub(crate) fn replay_kick(&mut self) -> Task<Message> {
+        if self.replay.is_none() || self.replay_wait.is_none() {
+            return Task::none();
+        }
+        if self.replay_wait_ready() {
+            self.replay_wait = None;
+            Task::done(Message::ReplayStep)
+        } else {
+            Task::none()
+        }
+    }
+
+    pub(crate) fn replay_note_frame(&mut self) {
+        if let Some(wait) = &mut self.replay_wait {
+            wait.redraw_seen = true;
+        }
+    }
+
+    /// Redraw subscription is only alive while a gate needs a present (or the
+    /// OSK surface is draining queued replay frames and needs wake-ups).
+    pub(crate) fn replay_wants_frame(&self) -> bool {
+        self.replay_wait.as_ref().is_some_and(|wait| {
+            (wait.needs_redraw && !wait.redraw_seen)
+                || (wait.needs_osk_idle && self.osk.slot.has_replay())
+                || (wait.needs_cursor_idle && self.browser.panel.cursor.snapshot().fly_to.is_some())
+        })
+    }
+
+    pub(crate) fn on_replay_wait_timeout(&mut self, id: u64) -> Task<Message> {
+        let Some(wait) = &self.replay_wait else {
+            return Task::none();
+        };
+        if wait.id != id {
+            return Task::none();
+        }
+        let needs_engine = wait.needs_engine;
+        let needs_redraw = wait.needs_redraw;
+        let redraw_seen = wait.redraw_seen;
+        let needs_capture = wait.needs_capture;
+        crate::platform::trace::event(
+            crate::platform::trace::Lane::Platform,
+            "replay.settle_timeout",
+        )
+        .field("id", id)
+        .field("needs_engine", needs_engine)
+        .field("needs_redraw", needs_redraw)
+        .field("redraw_seen", redraw_seen)
+        .field("needs_capture", needs_capture)
+        .field("pending_trace", self.pending_browser_trace.is_some())
+        .field("pending_travel", self.pending_history_travel.is_some())
+        .field(
+            "activity",
+            format!("{:?}", self.browser.panel.page.activity),
+        )
+        .emit();
+        self.replay_wait = None;
+        Task::done(Message::ReplayStep)
+    }
+
+    /// The navigation debounce elapsed. Re-check the gate: a load that started
+    /// in the meantime keeps it closed (pending/activity), otherwise the step
+    /// can advance without waiting for the liveness timeout.
+    pub(crate) fn on_replay_wait_grace(&mut self, id: u64) -> Task<Message> {
+        if self.replay_wait.as_ref().is_some_and(|wait| wait.id == id) {
+            Task::done(Message::ReplayStep)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// A screenshot finished writing; the capture gate can close now. The app
+    /// update chain then wakes the replay driver.
+    pub(crate) fn on_replay_capture_done(&mut self) -> Task<Message> {
+        self.replay_capture_pending = self.replay_capture_pending.saturating_sub(1);
+        Task::none()
     }
 
     fn replay_dispatch(
@@ -398,6 +811,8 @@ impl super::App {
                 let action = match step.params.get("dir").and_then(serde_json::Value::as_str) {
                     Some("up") => NavAction::Up,
                     Some("down") => NavAction::Down,
+                    Some("left") => NavAction::Left,
+                    Some("right") => NavAction::Right,
                     _ => return Task::none(),
                 };
                 self.replay_pad_dir(action)
@@ -516,6 +931,7 @@ impl super::App {
             #[cfg(debug_assertions)]
             "screenshot" => {
                 self.browser.panel.debug_overlay = false;
+                self.replay_capture_pending = self.replay_capture_pending.saturating_add(1);
                 // Capture one settle-delayed frame. A screenshot requested in
                 // the same update as a committed navigation can still read the
                 // previous presented frame.
@@ -533,6 +949,7 @@ impl super::App {
                 // Same settle delay as the Browser shot. The OSK is a separate
                 // window: capture it directly so transparent regions and both
                 // keyboard halves are visible to pixel QA.
+                self.replay_capture_pending = self.replay_capture_pending.saturating_add(1);
                 let invalidate = self
                     .osk
                     .window

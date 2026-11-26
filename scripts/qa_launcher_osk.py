@@ -18,6 +18,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import qa_offscreen
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -96,8 +98,7 @@ def main() -> int:
     prefix = session.name
     before = set(replay_root.glob(f"{prefix}-*")) if replay_root.is_dir() else set()
     env = os.environ.copy()
-    env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DEBUG_INPUT"] = "0"
+    qa_offscreen.apply_env(env)
     print(f"session={session}")
     proc = subprocess.Popen(
         [str(exe), "--trace-replay", str(session), "--flow", "1"],
@@ -106,6 +107,7 @@ def main() -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    offscreen = qa_offscreen.watch(proc.pid)
     sandbox = None
     done = False
     deadline = time.time() + 60
@@ -155,8 +157,11 @@ def main() -> int:
         if "Shortcut title" not in targets or "Shortcut arguments" not in targets:
             print(f"error: OSK did not open for both fields: {targets}", file=sys.stderr)
             return 1
+        if not offscreen.report():
+            return 1
         return 0
     finally:
+        offscreen.stop()
         if not args.keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(

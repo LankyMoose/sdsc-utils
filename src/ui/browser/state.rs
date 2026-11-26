@@ -60,6 +60,12 @@ pub struct BrowserTabPage {
     pub cursor: CursorHandle,
     /// Focusable elements from the latest accessibility tree.
     pub focusables: Vec<crate::browser::cursor::Focusable>,
+    /// Document URL that produced `focusables`. Replay docking rejects a
+    /// tree from the pre-navigation document.
+    pub focusables_url: Option<String>,
+    /// Bumped on every page title change. Replay waits for selection/scroll
+    /// title reports before the next synthetic input.
+    pub title_generation: u64,
     pub scroll_y: f32,
     /// Viewport scroll offset the backend translated the tree with
     /// (`EngineEvent::ScrollOffset`). Debug overlay + shot correlation.
@@ -80,6 +86,9 @@ pub struct BrowserTabPage {
     /// Page text session state published to the hosted-app contract. Set by
     /// the engine's editable-focus signal; never opens the OSK by itself.
     pub text_session_active: bool,
+    /// Current engine load phase. Replay settle waits for Idle after a step
+    /// that may have started a navigation.
+    pub activity: crate::browser::engine::EngineActivity,
 }
 
 /// One background tab: stable id, page state, and whether a backend view

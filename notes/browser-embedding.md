@@ -130,7 +130,12 @@ meters still use the legacy per-surface bank.
   arrival, centre-snaps on fresh acquisition, holds in place while scrolling.
 - D-pad jumps spatially between page focusables (vertical cone, horizontal
   row-locked); the cursor stays page-local and does not dock to the header in
-  v0.
+  v0. Each nudge is a 150ms smoothstep that resets its own clock at the press
+  and integrates at most `MAX_CURSOR_DT` (32ms), so an idle canvas never
+  starts the tween with stale time. The Browser D-pad repeat is 180ms, longer
+  than the tween, so holding a direction lands each hop instead of retargeting
+  mid-flight; an explicit retarget keeps the current wrap rect as its morph
+  origin.
 - R2 turbo doubles cursor acceleration/cap and scroll speed while held and
   disables docking; release re-snaps in place.
 - Right stick scrolls only while the cursor is over the page. Scroll

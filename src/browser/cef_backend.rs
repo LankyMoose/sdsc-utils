@@ -864,7 +864,7 @@ cef::wrap_render_handler! {
 
         fn on_paint(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             type_: PaintElementType,
             _dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
@@ -892,9 +892,14 @@ cef::wrap_render_handler! {
                 rgba.push(px[0]);
                 rgba.push(px[3]);
             }
+            let url = browser
+                .as_ref()
+                .and_then(|browser| browser.main_frame())
+                .map(|frame| CefString::from(&frame.url()).to_string())
+                .unwrap_or_default();
             self.ctx
                 .frame
-                .write(width as u32, height as u32, rgba);
+                .write(width as u32, height as u32, rgba, &url);
         }
 
         fn on_scroll_offset_changed(
@@ -1540,6 +1545,11 @@ fn handle_dom_json(ctx: &TabContext, json: &str) {
         .and_then(|v| v.get("e"))
         .and_then(|v| v.as_u64())
         .is_some_and(|value| value != 0);
+    let url = root
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     let mut items = Vec::new();
     if let Some(rows) = root.get("nodes").and_then(|v| v.as_array()) {
@@ -1594,6 +1604,7 @@ fn handle_dom_json(ctx: &TabContext, json: &str) {
     }
     ctx.handle.emit(EngineEvent::A11yTree {
         tab: ctx.tab,
+        url,
         items,
     });
     if active != 0 && active != before_active {

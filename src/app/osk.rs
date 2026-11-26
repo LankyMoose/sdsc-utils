@@ -204,27 +204,29 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        std::thread::spawn(move || {
-            let dir = crate::persist::paths::data_dir().join("shots");
-            if let Err(err) = std::fs::create_dir_all(&dir) {
-                crate::platform::app_log::warn(format!(
-                    "osk-shot skipped: cannot create {dir:?}: {err}"
-                ));
-                return;
-            }
-            let path = dir.join(format!("osk-shot-{ms}.png"));
-            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
-                Ok(()) => crate::platform::app_log::info(format!(
-                    "osk-shot saved path={} size={w}x{h} scale={scale}",
-                    path.display()
-                )),
-                Err(err) => crate::platform::app_log::warn(format!(
-                    "osk-shot failed path={}: {err}",
-                    path.display()
-                )),
-            }
-        });
-        Task::none()
+        Task::perform(
+            super::spawn_blocking(move || {
+                let dir = crate::persist::paths::data_dir().join("shots");
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    crate::platform::app_log::warn(format!(
+                        "osk-shot skipped: cannot create {dir:?}: {err}"
+                    ));
+                    return;
+                }
+                let path = dir.join(format!("osk-shot-{ms}.png"));
+                match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                    Ok(()) => crate::platform::app_log::info(format!(
+                        "osk-shot saved path={} size={w}x{h} scale={scale}",
+                        path.display()
+                    )),
+                    Err(err) => crate::platform::app_log::warn(format!(
+                        "osk-shot failed path={}: {err}",
+                        path.display()
+                    )),
+                }
+            }),
+            |_| Message::ReplayCaptureDone,
+        )
     }
 
     /// Keyboard while OSK is open: close first, consume Escape, then hand the
@@ -423,13 +425,45 @@ impl App {
         }
     }
 
-    /// Debug replay: directional pad press for the manual-shortcut form.
+    /// Debug replay: directional pad press. Routes the manual-shortcut form,
+    /// else the Browser cursor stepper (one complete press/release).
     #[cfg(debug_assertions)]
     pub(crate) fn replay_pad_dir(&mut self, action: NavAction) -> Task<Message> {
         if self.launcher_state.manual_add.is_some() {
             return self.on_manual_add_pad_action(action);
         }
-        Task::none()
+        if self.home_visible || self.osk.state.open || !self.browser_visible {
+            return Task::none();
+        }
+        let (up, down, left, right) = match action {
+            NavAction::Up => (true, false, false, false),
+            NavAction::Down => (false, true, false, false),
+            NavAction::Left => (false, false, true, false),
+            NavAction::Right => (false, false, false, true),
+            _ => return Task::none(),
+        };
+        let pad = crate::domain::pad::PadId("replay".into());
+        let press = crate::ui::launcher::input::NavReading {
+            id: pad.clone(),
+            sample: PadSample {
+                dpad_up: up,
+                dpad_down: down,
+                dpad_left: left,
+                dpad_right: right,
+                ..PadSample::default()
+            },
+            source: "replay",
+        };
+        let release = crate::ui::launcher::input::NavReading {
+            id: pad,
+            sample: PadSample::default(),
+            source: "replay",
+        };
+        // Two real owner ticks: the press fires the jump, the release resets
+        // the stepper so the next synthetic press is a fresh First phase.
+        let jump = self.on_browser_pad(&[press], &[]);
+        let reset = self.on_browser_pad(&[release], &[]);
+        jump.chain(reset)
     }
 
     /// Debug replay: feed one split-stick sample through the live DQ path.

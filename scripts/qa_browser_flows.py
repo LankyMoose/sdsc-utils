@@ -21,6 +21,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+import qa_offscreen  # noqa: E402
 from qa_browser_visual import near, pixel, read_png  # noqa: E402
 
 # Header geometry mirrors src/ui/browser/state.rs.
@@ -359,8 +360,7 @@ def build_plan(session: Path) -> tuple[list[dict[str, object]], list[dict[str, o
 def run_replay(exe: Path, session: Path, keep: bool) -> Path:
     root = SCRIPT_DIR.parent
     env = os.environ.copy()
-    env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DEBUG_INPUT"] = "0"
+    qa_offscreen.apply_env(env)
     replay_root = Path(tempfile.gettempdir()) / "sdsc-replay"
     prefix = session.name
     before = set(replay_root.glob(f"{prefix}-*")) if replay_root.is_dir() else set()
@@ -372,6 +372,7 @@ def run_replay(exe: Path, session: Path, keep: bool) -> Path:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    offscreen = qa_offscreen.watch(proc.pid)
     sandbox = None
     done = False
     try:
@@ -390,8 +391,11 @@ def run_replay(exe: Path, session: Path, keep: bool) -> Path:
             time.sleep(0.5)
         if not done or sandbox is None:
             raise AssertionError("replay.done not observed before timeout")
+        if not offscreen.report():
+            raise AssertionError("offscreen QA failed")
         return sandbox
     finally:
+        offscreen.stop()
         if not keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(

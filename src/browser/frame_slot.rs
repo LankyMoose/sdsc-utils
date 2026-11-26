@@ -16,6 +16,9 @@ pub struct FrameData {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Document URL that produced this paint. Replay uses it to reject a
+    /// stale frame from the previous page.
+    pub url: String,
 }
 
 /// Latest frame for one tab. `write` moves the engine buffer in place and
@@ -42,7 +45,7 @@ impl Default for FrameSlot {
 impl FrameSlot {
     /// Install the newest frame. Frames that don't match the expected RGBA
     /// byte count are ignored (never upload a short/long buffer).
-    pub fn write(&self, width: u32, height: u32, rgba: Vec<u8>) {
+    pub fn write(&self, width: u32, height: u32, rgba: Vec<u8>, url: &str) {
         if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
             return;
         }
@@ -50,6 +53,7 @@ impl FrameSlot {
             width,
             height,
             rgba,
+            url: url.to_string(),
         });
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -70,6 +74,15 @@ impl FrameSlot {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Document URL of the latest paint, if any.
+    pub fn url(&self) -> Option<String> {
+        self.frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|frame| frame.url.clone())
     }
 
     /// Run `f` with the latest frame while holding the slot lock. The
@@ -101,7 +114,7 @@ mod tests {
         let slot = FrameSlot::default();
         assert!(!slot.has_frame());
         assert_eq!(slot.generation(), 0);
-        slot.write(2, 2, vec![0x11; 16]);
+        slot.write(2, 2, vec![0x11; 16], "https://a.test/");
         assert!(slot.has_frame());
         assert_eq!(slot.generation(), 1);
         let dims = slot
@@ -116,10 +129,10 @@ mod tests {
     #[test]
     fn malformed_frame_is_ignored() {
         let slot = FrameSlot::default();
-        slot.write(2, 2, vec![0; 15]);
+        slot.write(2, 2, vec![0; 15], "https://a.test/");
         assert!(!slot.has_frame());
         assert_eq!(slot.generation(), 0);
-        slot.write(0, 2, vec![0; 16]);
+        slot.write(0, 2, vec![0; 16], "https://a.test/");
         assert!(!slot.has_frame());
     }
 

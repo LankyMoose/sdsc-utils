@@ -306,6 +306,14 @@ pub enum Message {
     DebugOpen(String),
     /// Internal replay-driver tick (only armed by `--trace-replay`).
     ReplayStep,
+    /// Debug replay: one window presented a frame while a settle gate waited.
+    ReplayFrame,
+    /// Debug replay: event-driven settle timed out for this wait generation.
+    ReplayWaitTimeout(u64),
+    /// Debug replay: navigation grace elapsed for this wait generation.
+    ReplayWaitGrace(u64),
+    /// Debug replay: a screenshot finished writing to disk.
+    ReplayCaptureDone,
     /// Debug-only: flip the layout-bounding-box overlay (Diagnostics toggle or F9).
     #[cfg(debug_assertions)]
     ToggleDebugLayoutBounds,
@@ -421,6 +429,10 @@ impl Message {
             | Message::ReplayStep
             | Message::Exit
             | Message::PadInput(_) => None,
+            Message::ReplayFrame
+            | Message::ReplayWaitTimeout(_)
+            | Message::ReplayWaitGrace(_)
+            | Message::ReplayCaptureDone => None,
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick
             | Message::AmbientPreviewOpened(_)
@@ -506,6 +518,10 @@ impl Message {
             | Message::PresenceHint
             | Message::AbsenceRecheck
             | Message::ReplayStep => false,
+            Message::ReplayFrame
+            | Message::ReplayWaitTimeout(_)
+            | Message::ReplayWaitGrace(_)
+            | Message::ReplayCaptureDone => false,
             #[cfg(debug_assertions)]
             Message::EmulatorCommitTick | Message::BrowserDebugShotTick => false,
             Message::PollResult(_)
@@ -815,6 +831,18 @@ pub struct App {
     pending_history_travel: Option<crate::app::browser::PendingHistoryTravel>,
     /// In-process replay plan when launched with `--trace-replay`.
     replay: Option<crate::platform::trace::replay::ReplayPlan>,
+    /// Event-driven replay settle gate.
+    replay_wait: Option<crate::app::browser::ReplayWait>,
+    replay_wait_seq: u64,
+    /// Screenshot captures scheduled by replay and not yet handled.
+    replay_capture_pending: u32,
+    /// Replay screenshot retries while the current page paint is still old.
+    #[cfg(debug_assertions)]
+    replay_capture_retries: u32,
+    /// The plan has no more steps; one final engine settle runs before done.
+    replay_finished: bool,
+    /// The first replay step has waited for any boot/default page load.
+    replay_prime_done: bool,
     /// Surface receiving source-side tap actions.
     pad_input_owner: PadInputOwner,
     /// R2 rising-edge latch while the manual-shortcut form is open (R2 saves).
@@ -1201,7 +1229,7 @@ impl App {
                     engine: browser_engine,
                     ..Default::default()
                 };
-                browser.dpad_stepper = NavStepper::with_profile(NavProfile::DPAD);
+                browser.dpad_stepper = NavStepper::with_profile(NavProfile::BROWSER_DPAD);
                 browser
             },
             osk: osk::SystemOsk::new(osk_mode, osk_slot),
@@ -1224,6 +1252,13 @@ impl App {
             pending_browser_trace: None,
             pending_history_travel: None,
             replay,
+            replay_wait: None,
+            replay_wait_seq: 0,
+            replay_capture_pending: 0,
+            #[cfg(debug_assertions)]
+            replay_capture_retries: 0,
+            replay_finished: false,
+            replay_prime_done: false,
             pad_input_owner: PadInputOwner::None,
             manual_add_r2_latched: false,
             haptic_pad_serial: None,
@@ -1569,6 +1604,13 @@ impl App {
                 }
             }),
         ];
+
+        // Replay settle: wake the driver on the redraw that a step requested.
+        // Only alive while a gate actually needs a present, so normal idle
+        // sessions never subscribe to frames.
+        if self.replay_wants_frame() {
+            subscriptions.push(iced::window::frames().map(|_| Message::ReplayFrame));
+        }
 
         subscriptions.push(
             iced::time::every(
@@ -1994,12 +2036,17 @@ impl App {
             }
             return Task::none();
         }
+        let is_replay_step = matches!(&message, Message::ReplayStep);
         let trace = message.trace_action();
         let task = self.update_inner(message);
         if let Some(trace) = trace {
             trace.begin().finish("dispatched").emit();
         }
-        task
+        if is_replay_step {
+            task
+        } else {
+            task.chain(self.replay_kick())
+        }
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -2026,6 +2073,13 @@ impl App {
         match message {
             Message::Tick => self.on_tick(),
             Message::ReplayStep => self.on_replay_step(),
+            Message::ReplayFrame => {
+                self.replay_note_frame();
+                Task::none()
+            }
+            Message::ReplayWaitTimeout(id) => self.on_replay_wait_timeout(id),
+            Message::ReplayWaitGrace(id) => self.on_replay_wait_grace(id),
+            Message::ReplayCaptureDone => self.on_replay_capture_done(),
             Message::PresenceHint => self.on_presence_hint(),
             Message::AbsenceRecheck => self.on_absence_recheck(),
             #[cfg(debug_assertions)]

@@ -28,6 +28,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import qa_offscreen
+
 OPEN = {
     "osk": "browser,osk",
     "toast": "toast",
@@ -141,8 +143,7 @@ def main() -> int:
     log = data / "app.log"
     env = os.environ.copy()
     env["SDSC_DATA_DIR"] = str(data)
-    env["SDSC_DEBUG_QUIET"] = "1"
-    env["SDSC_DEBUG_INPUT"] = "0"
+    qa_offscreen.apply_env(env)
     env["SDSC_DEBUG_OPEN"] = OPEN[args.scenario]
     env["SDSC_DEBUG_REDRAW"] = "1"
     print(f"session={data}")
@@ -154,6 +155,7 @@ def main() -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    offscreen = qa_offscreen.watch(proc.pid)
     try:
         snaps = wait_for_log(log, time.time() + seconds)
         if len(snaps) < 2:
@@ -196,8 +198,11 @@ def main() -> int:
             if failures:
                 print("error: idle traffic: " + ", ".join(failures), file=sys.stderr)
                 return 1
+        if not offscreen.report():
+            return 1
         return 0
     finally:
+        offscreen.stop()
         if not args.keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(

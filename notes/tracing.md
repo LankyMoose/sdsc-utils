@@ -127,7 +127,9 @@ synthetic input steps for automation:
   page focusable under a point (QA setup for the Cross-opens-OSK path).
 - `pad.tap` — `{"button": "cross"}` injects one source-side pad tap through
   the live owner (OSK first, then Browser/Launcher manual form).
-- `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap).
+- `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap), or
+  fires one complete Browser D-pad cursor nudge (press + release) when the
+  Browser owns the pad.
 - `osk.stick` — `{"side": "left", "x": 0.65, "y": 0}` feeds the live Dual
   QWERTY stick path and moves that half's cursor. Send a zero sample before a
   same-direction move so the stepper's release grace can reset.
@@ -151,6 +153,17 @@ session. Targets resolve by URL first, then index (`pass_resolved` semantics).
 State mismatches are logged as `replay.mismatch` and replay continues
 best-effort; the trace records both the mismatch and the final landing.
 
+Replay settle is event-driven: each step installs a gate on its own signals
+(engine load/history settled, a paint for the current document URL, a fresh
+accessibility tree for the current document, a title/selection report, one
+window redraw, the OSK pull-model queue drained, or a screenshot capture
+written) and the next step is dispatched when the gate closes. The fixed 1.5s
+step delay is gone; `replay.settle_timeout` (1.5s) is only a liveness backstop
+and indicates a missing signal. Browser cursor QA additionally traces
+`cursor.jump` and per-tween `cursor.frame` events, so
+`scripts/qa_browser_cursor.py` can prove the first frame starts near zero and
+each flight lands before the next press.
+
 When the plan ends (`replay.done`), the driver closes the Browser window
 immediately so automated runs do not leave UI on the secondary display.
 Quiet sessions also suppress the tray-startup toast and controller auto-open
@@ -159,6 +172,9 @@ Home.
 `python scripts/qa_browser_input.py` is the checked-in smoke test: it builds a
 local page, runs these synthetic steps, asserts typed text / wheel scroll /
 drag selection / cursor-shape trace, and kills the process immediately.
+`python scripts/qa_browser_cursor.py` drives four D-pad nudges through the real
+Browser cursor stepper and asserts the tween clock and landings from
+`cursor.jump`/`cursor.frame` traces.
 `python scripts/qa_browser_popup.py` asserts target=_blank popups are denied
 (no second tab, source page intact, `browser.popup_denied` traced).
 `python scripts/qa_browser_visual.py` captures a debug screenshot and verifies
@@ -281,6 +297,18 @@ started after the CEF subprocess dispatch so renderer/GPU children do not write
 to the same log. `redraw_stats::snapshot("mark")` is available for a bracketed
 manual snapshot. Compiled out of release builds.
 
+## Offscreen QA
+
+Automated/quiet sessions set `SDSC_DEBUG_OFFSCREEN=1` (default while quiet).
+`ui::layout::quiet_show` places every window fully outside the virtual desktop
+with `win32::move_offscreen`, keeping it `WS_VISIBLE` so Win32 still paints and
+`iced::window::screenshot` works. The Rust side logs
+`ui-diag: offscreen violation` and debug-asserts if a shown window intersects a
+monitor. Independently, `scripts/qa_offscreen.py` samples every visible
+top-level window of the QA PID and fails the script if any rectangle ever
+overlaps a monitor (the winit event-target helper is ignored). `SDSC_DEBUG_OFFSCREEN=0`
+restores the old secondary-monitor placement for manual quiet QA.
+
 ## Pad trace
 
 `src/platform/trace` records `pad.action` (source-side taps/holds) with
@@ -306,6 +334,9 @@ python scripts/qa_idle_redraw.py --scenario browser
 # Post-migration budgets (fails on pad/OSK/toast/Launcher/Browser idle traffic)
 python scripts/qa_idle_redraw.py --scenario osk --assert
 python scripts/qa_idle_redraw.py --scenario launcher --assert
+
+# Browser cursor nudge flights (event clock + landing; offscreen watcher)
+python scripts/qa_browser_cursor.py
 
 # Action timeline / replay tracing
 sdsc-utils --trace-last

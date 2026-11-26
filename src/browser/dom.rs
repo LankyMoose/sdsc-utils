@@ -426,7 +426,7 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       aeInfo = {e: editable, t: tag, y: typ};
     }
   } catch (e) {}
-  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, ae: aeInfo, dt: S.doc};
+  return {nodes: out, total: total, truncated: els.length > n, culled: culled, ccull: ccull, skip: [skBox, skZero, skBig, skDis, skErr], hid: skHid, clip: skClip, boxA: skBoxA, boxKid: skBoxKid, boxAWrap: skBoxAWrap, boxAEmpty: skBoxAEmpty, forced: skForce, t: [Math.round(tQ), Math.round(tmM), Math.round(tmV), Math.round(tmC), Math.round(tmT)], sx: Math.round(sx), sy: Math.round(sy), dw: Math.round(dw), dh: Math.round(dh), ax: ax, ae: aeInfo, dt: S.doc, url: (function(){try{return String(location.href)}catch(e){return ""}})()};
 })()"###;
 
 pub fn dom_kind(tag: &str, role: &str, typ: &str) -> FocusKind {

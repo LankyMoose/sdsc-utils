@@ -28,6 +28,11 @@ they are not the integrator for analog state.
   actually changes (or a docked stick is inside the break-grace window).
   Meaningful stick changes arrive as edge wake-ups (`InputEdge::analog_changed`);
   steady held sticks stay in the snapshot. No `BrowserFrame` app message.
+  Discrete D-pad tweens reset the clock at the jump and integrate at most
+  `browser::cursor::MAX_CURSOR_DT` (32ms); a canvas waking after idle must not
+  treat the pre-press gap as flight progress. The Browser D-pad profile
+  (`NavProfile::BROWSER_DPAD`) repeats at 180ms so a held direction never
+  retargets a 150ms nudge mid-flight.
 - `ui::motion::Timeline` — wall-clock segment with pause support; pose is
   derived, never accumulated.
 - `InputHub::latest_reading(max_age)` — preferred live pad reading for

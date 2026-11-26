@@ -59,6 +59,11 @@ pub const HOLD_PAD: f32 = 24.0;
 /// independent: every jump takes the same 150ms, and the outline morph
 /// uses the same rate so the whole transition is one consistent beat.
 pub const NUDGE_SECS: f32 = 0.150;
+/// Maximum cursor integration step. Mirrors `ui::motion::MAX_FRAME_DT`: a
+/// stalled frame advances at most one display frame so a tween never skips its
+/// start. The old 100ms cap let the first nudge after an idle period begin
+/// 74% of the way to its target.
+pub const MAX_CURSOR_DT: f32 = 0.032;
 /// Dock-blend rate: the outline morphs free↔docked in [`NUDGE_SECS`],
 /// eased every analog tick so no frame pops.
 pub const DOCK_BLEND_PER_SEC: f32 = 1.0 / NUDGE_SECS;
@@ -639,8 +644,10 @@ impl Cursor {
 
     fn jump_to_with(&mut self, item: &Focusable, keep_row_y: bool) {
         // Capture the departure dock before clearing it: a jump from a
-        // docked target morphs wrap->wrap directly.
-        let departure = if self.attached.is_some() {
+        // docked target morphs wrap->wrap directly. A retarget that interrupts
+        // an in-flight docked nudge keeps the current interpolated rect as the
+        // departure, so the outline never collapses through the dot mid-air.
+        let departure = if self.attached.is_some() || self.nudge_morph.is_some() {
             self.last_dock
         } else {
             None
@@ -910,11 +917,17 @@ impl CursorRuntime {
         use crate::browser::cursor::SCROLL_SPEED;
         let dt = self
             .analog_at
-            .map(|t| now.saturating_duration_since(t).as_secs_f32().min(0.1))
+            .map(|t| {
+                now.saturating_duration_since(t)
+                    .as_secs_f32()
+                    .min(MAX_CURSOR_DT)
+            })
             .unwrap_or(0.0);
         self.analog_at = Some(now);
         self.cursor.turbo = sample.r2;
         self.last_stick = (sample.lstick_x, sample.lstick_y);
+        #[cfg(debug_assertions)]
+        let was_flying = self.cursor.fly_to.is_some();
         let before_pose = (
             self.cursor.x,
             self.cursor.y,
@@ -1022,6 +1035,22 @@ impl CursorRuntime {
                 self.cursor.last_dock,
             );
 
+        // Replay smoothness witness: every tween frame records its integration
+        // step and progress. QA asserts the first frame after a jump starts
+        // near zero instead of inheriting pre-press idle time.
+        #[cfg(debug_assertions)]
+        if (was_flying || self.cursor.fly_to.is_some())
+            && crate::platform::trace::replay::request().is_some()
+        {
+            crate::platform::trace::event(crate::platform::trace::Lane::Browser, "cursor.frame")
+                .field("x", self.cursor.x)
+                .field("y", self.cursor.y)
+                .field("dt", dt)
+                .field("elapsed", self.cursor.fly_elapsed)
+                .field("flying", self.cursor.fly_to.is_some())
+                .emit();
+        }
+
         CursorFrame {
             mouse,
             scroll,
@@ -1081,11 +1110,29 @@ impl CursorHandle {
 
     pub fn jump(&self, dir: JumpDir) -> bool {
         let mut rt = self.lock();
-        let was = rt.cursor.attached;
+        #[cfg(debug_assertions)]
+        let (from_x, from_y) = (rt.cursor.x, rt.cursor.y);
         let targets = rt.focusables.clone();
-        rt.cursor.jump(dir, &targets);
+        let jumped = rt.cursor.jump(dir, &targets);
         rt.dom_reseed_pending = true;
-        was != rt.cursor.attached || rt.cursor.fly_to.is_some()
+        if rt.cursor.fly_to.is_some() {
+            // A nudge starts its own tween. Do not integrate the idle gap
+            // since the last canvas update as flight progress: a 100ms stale
+            // delta would start a 150ms tween 74% complete.
+            rt.analog_at = Some(Instant::now());
+            #[cfg(debug_assertions)]
+            if crate::platform::trace::replay::request().is_some() {
+                let (to_x, to_y) = rt.cursor.fly_to.unwrap_or((from_x, from_y));
+                crate::platform::trace::event(crate::platform::trace::Lane::Browser, "cursor.jump")
+                    .field("dir", format!("{dir:?}"))
+                    .field("from_x", from_x)
+                    .field("from_y", from_y)
+                    .field("to_x", to_x)
+                    .field("to_y", to_y)
+                    .emit();
+            }
+        }
+        jumped
     }
 
     pub fn set_magnet(&self, magnet: bool) {
@@ -2245,5 +2292,77 @@ mod tests {
             t0 + std::time::Duration::from_millis(100),
         );
         assert!(!frame.pose_changed, "zero-dt neutral frame is static");
+    }
+
+    #[test]
+    fn jump_resets_the_idle_clock() {
+        let handle = CursorHandle::default();
+        let items = [link(1, 100.0, 100.0), link(2, 400.0, 100.0)];
+        {
+            let mut rt = handle.lock();
+            rt.focusables = items.to_vec();
+            rt.cursor.x = 110.0;
+            rt.cursor.y = 115.0;
+            rt.cursor.snap(&items);
+            // The canvas slept for two seconds before the nudge.
+            rt.analog_at = Some(Instant::now() - std::time::Duration::from_secs(2));
+        }
+        assert!(handle.jump(JumpDir::Right));
+        let now = Instant::now();
+        {
+            let mut rt = handle.lock();
+            let _ = rt.advance(&crate::domain::pad::PadSample::default(), now);
+        }
+        let cursor = handle.snapshot();
+        // Without the clock reset the first frame would already be ~12% (or
+        // 74% under the old 100ms cap) across the 300px gap from x=150.
+        assert!(
+            cursor.x < 175.0,
+            "first nudge frame skipped ahead to x={}",
+            cursor.x
+        );
+    }
+
+    #[test]
+    fn retarget_mid_flight_keeps_the_dock_morph() {
+        let items = [
+            link(1, 100.0, 100.0),
+            link(2, 400.0, 100.0),
+            link(3, 100.0, 300.0),
+        ];
+        let mut c = Cursor::new();
+        c.x = 110.0;
+        c.y = 115.0;
+        c.snap(&items);
+        assert_eq!(c.attached, Some(1));
+        assert!(c.jump(JumpDir::Right, &items));
+        for _ in 0..4 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        let mid = c.last_dock.expect("interpolated rect");
+        assert!(c.jump(JumpDir::Down, &items));
+        assert!(
+            c.nudge_morph.is_some(),
+            "retarget must keep a wrap->wrap morph"
+        );
+        assert_eq!(c.dock_blend, 1.0);
+        for _ in 0..3 {
+            c.advance(0.0, 0.0, 0.016, &items);
+        }
+        assert_eq!(c.dock_blend, 1.0, "outline collapsed to the dot mid-air");
+        assert_ne!(
+            c.last_dock,
+            Some(mid),
+            "rect stopped tracking the new target"
+        );
+    }
+
+    #[test]
+    fn browser_dpad_repeat_outlasts_the_nudge() {
+        let repeat = crate::domain::pad::NavProfile::BROWSER_DPAD.repeat_interval;
+        assert!(
+            repeat.as_secs_f32() >= NUDGE_SECS,
+            "repeat={repeat:?} nudge={NUDGE_SECS}s"
+        );
     }
 }

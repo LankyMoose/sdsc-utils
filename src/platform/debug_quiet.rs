@@ -3,13 +3,16 @@
 //! Enabled when `SDSC_DEBUG_OPEN` is set (debug builds only), unless
 //! `SDSC_DEBUG_QUIET=0` explicitly opts out. `SDSC_DEBUG_QUIET=1` also enables
 //! quiet mode on its own, so an automated launch that auto-opens a window
-//! without `SDSC_DEBUG_OPEN` still goes to the secondary monitor. While quiet:
-//! windows never take focus and are relocated from the primary monitor to a
-//! secondary one (`ui::layout::{focus_window, show_window, move_window}`), real
-//! keyboard/mouse/touch input is locked out, pad edges are dropped, and UI
-//! sounds / Launcher haptics are muted — so a debug session cannot interrupt a
-//! game running on the primary monitor. Set `SDSC_DEBUG_INPUT=1` to keep real
-//! input live in quiet mode (manual QA). Release builds always return `false`.
+//! without `SDSC_DEBUG_OPEN` still stays out of the way. While quiet:
+//! windows never take focus, real keyboard/mouse/touch input is locked out,
+//! pad edges are dropped, and UI sounds / Launcher haptics are muted — so a
+//! debug session cannot interrupt a game running on the primary monitor.
+//! Automated QA sessions also set `SDSC_DEBUG_OFFSCREEN=1` (the default when
+//! quiet): windows are placed fully outside the virtual desktop but kept
+//! `WS_VISIBLE` so Win32 still paints them and `iced::window::screenshot`
+//! works. Set `SDSC_DEBUG_OFFSCREEN=0` to keep the old secondary-monitor
+//! placement for manual quiet QA. Set `SDSC_DEBUG_INPUT=1` to keep real input
+//! live in quiet mode (manual QA). Release builds always return `false`.
 
 /// Env var that opens windows at boot; turns quiet mode on by default.
 pub const DEBUG_OPEN_ENV: &str = "SDSC_DEBUG_OPEN";
@@ -17,6 +20,11 @@ pub const DEBUG_OPEN_ENV: &str = "SDSC_DEBUG_OPEN";
 /// Opt out of quiet mode while keeping [`DEBUG_OPEN_ENV`] auto-open.
 /// Set to `0`, `false`, or `off`.
 pub const DEBUG_QUIET_ENV: &str = "SDSC_DEBUG_QUIET";
+
+/// Place quiet-mode windows fully outside every monitor instead of on the
+/// first secondary monitor. Defaults to on while quiet; set to `0` for manual
+/// quiet QA that wants the window visible on the secondary display.
+pub const DEBUG_OFFSCREEN_ENV: &str = "SDSC_DEBUG_OFFSCREEN";
 
 /// Keep real keyboard/mouse/touch/pad input live while quiet mode still owns
 /// window placement/focus. Set to `1`, `true`, or `on`.
@@ -32,6 +40,24 @@ pub fn enabled() -> bool {
             let open = std::env::var_os(DEBUG_OPEN_ENV).is_some();
             let quiet = std::env::var(DEBUG_QUIET_ENV).ok();
             quiet_from_env(open, quiet.as_deref())
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// True when quiet-mode windows should be placed outside every monitor.
+pub fn offscreen() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static OFFSCREEN: OnceLock<bool> = OnceLock::new();
+        *OFFSCREEN.get_or_init(|| {
+            let quiet = enabled();
+            let offscreen = std::env::var(DEBUG_OFFSCREEN_ENV).ok();
+            offscreen_from_env(quiet, offscreen.as_deref())
         })
     }
     #[cfg(not(debug_assertions))]
@@ -67,6 +93,17 @@ fn quiet_from_env(open: bool, quiet: Option<&str>) -> bool {
 }
 
 #[cfg(any(debug_assertions, test))]
+fn offscreen_from_env(quiet: bool, offscreen: Option<&str>) -> bool {
+    match offscreen.map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on") => true,
+        Some("0" | "false" | "off") => false,
+        // Automated quiet sessions are offscreen by default so QA never
+        // appears on the secondary monitor either.
+        _ => quiet,
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
 fn input_dropped_from_env(quiet: bool, input: Option<&str>) -> bool {
     match input.map(str::to_ascii_lowercase).as_deref() {
         // Explicit opt-in/opt-out, even outside quiet mode. This lets the QA
@@ -81,7 +118,7 @@ fn input_dropped_from_env(quiet: bool, input: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_dropped_from_env, quiet_from_env};
+    use super::{input_dropped_from_env, offscreen_from_env, quiet_from_env};
 
     #[test]
     fn auto_open_defaults_to_quiet() {
@@ -122,5 +159,20 @@ mod tests {
         assert!(input_dropped_from_env(false, Some("0")));
         assert!(input_dropped_from_env(false, Some("off")));
         assert!(!input_dropped_from_env(false, Some("1")));
+    }
+
+    #[test]
+    fn quiet_defaults_to_offscreen() {
+        assert!(offscreen_from_env(true, None));
+        assert!(!offscreen_from_env(false, None));
+    }
+
+    #[test]
+    fn offscreen_can_be_disabled_for_manual_quiet_qa() {
+        assert!(!offscreen_from_env(true, Some("0")));
+        assert!(!offscreen_from_env(true, Some("false")));
+        assert!(!offscreen_from_env(true, Some("OFF")));
+        assert!(offscreen_from_env(false, Some("1")));
+        assert!(offscreen_from_env(false, Some("TRUE")));
     }
 }

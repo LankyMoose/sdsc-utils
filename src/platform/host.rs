@@ -194,6 +194,37 @@ pub fn move_to_secondary_monitor(hwnd: isize) {
     }
 }
 
+/// Move `hwnd` fully outside every monitor (debug quiet QA: windows stay
+/// visible to Win32 so paints/screenshots work, but nothing is displayed).
+pub fn move_offscreen(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        // SAFETY: same contract as [`show_window`].
+        unsafe {
+            crate::platform::win32::move_offscreen(hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
+/// True when the live window rectangle overlaps no monitor. Always true on
+/// non-Windows (offscreen placement is a Windows debug-QA contract).
+pub fn window_is_offscreen(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        // SAFETY: same contract as [`show_window`].
+        unsafe { crate::platform::win32::window_is_offscreen(hwnd) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        true
+    }
+}
+
 /// Force Win32 to repaint `hwnd` (helps iced pick up a new toast view).
 pub fn invalidate_hwnd(hwnd: isize) {
     #[cfg(windows)]

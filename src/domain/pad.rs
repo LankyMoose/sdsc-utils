@@ -1045,6 +1045,14 @@ impl NavProfile {
         ..Self::MENU
     };
 
+    /// Browser cursor jumps. Every hop is a fixed `NUDGE_SECS` tween, so the
+    /// repeat must outlast it; a menu-rate 90ms repeat would retarget mid-flight
+    /// and reset the smoothstep velocity.
+    pub const BROWSER_DPAD: Self = Self {
+        repeat_interval: Duration::from_millis(180),
+        ..Self::DPAD
+    };
+
     /// Browser virtual cursor: soft proportional stick, no per-step cue.
     pub const CURSOR: Self = Self {
         axis_deadzone: 0.12,

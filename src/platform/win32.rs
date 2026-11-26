@@ -49,7 +49,7 @@ pub struct Point {
     pub y: i32,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
 pub struct Rect {
     pub left: i32,
@@ -321,6 +321,76 @@ pub unsafe fn move_to_secondary_monitor(hwnd: isize) {
     }
 }
 
+/// True when `win` overlaps any monitor rectangle. QA uses this to prove a
+/// debug window is fully outside the virtual desktop (not merely unfocused).
+pub fn window_intersects_monitors(win: Rect, monitors: &[(Rect, bool)]) -> bool {
+    monitors.iter().any(|(monitor, _)| {
+        win.left < monitor.right
+            && win.right > monitor.left
+            && win.top < monitor.bottom
+            && win.bottom > monitor.top
+    })
+}
+
+/// Target top-left that places `win` fully outside every monitor, with a
+/// small margin so DWM cannot keep a sliver on-screen. Uses the window's own
+/// size so full-screen Launcher/Browser covers are included.
+pub fn offscreen_target(win: Rect, monitors: &[(Rect, bool)]) -> (i32, i32) {
+    const MARGIN: i32 = 64;
+    let Some((min_left, min_top)) = monitors
+        .iter()
+        .map(|(r, _)| (r.left, r.top))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+    else {
+        return (-10_000, -10_000);
+    };
+    let w = (win.right - win.left).max(0);
+    let h = (win.bottom - win.top).max(0);
+    (
+        min_left.saturating_sub(w).saturating_sub(MARGIN),
+        min_top.saturating_sub(h).saturating_sub(MARGIN),
+    )
+}
+
+/// Move `hwnd` fully outside every monitor without resizing or activating it.
+///
+/// The window stays `WS_VISIBLE`: Win32 still delivers paints and iced's
+/// offscreen screenshot path still works, but nothing intersects a display.
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
+pub unsafe fn move_offscreen(hwnd: isize) {
+    let mut win = Rect::default();
+    if unsafe { GetWindowRect(hwnd, &mut win) } == 0 {
+        return;
+    }
+    let monitors = monitor_bounds();
+    let (x, y) = offscreen_target(win, &monitors);
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            0,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// True when the live window rectangle overlaps no monitor.
+///
+/// # Safety
+/// `hwnd` must be a valid Win32 window handle owned by this process.
+pub unsafe fn window_is_offscreen(hwnd: isize) -> bool {
+    let mut win = Rect::default();
+    if unsafe { GetWindowRect(hwnd, &mut win) } == 0 {
+        return true;
+    }
+    !window_intersects_monitors(win, &monitor_bounds())
+}
+
 #[cfg(test)]
 mod relocate_tests {
     use super::*;
@@ -360,6 +430,39 @@ mod relocate_tests {
             relocate_to_secondary(r(-1000, 100, -600, 500), primary, secondary),
             None
         );
+    }
+
+    #[test]
+    fn offscreen_target_clears_every_monitor() {
+        let one = (r(0, 0, 1920, 1080), true);
+        let two = (r(-1920, 0, 0, 1080), false);
+        let monitors = [one, two];
+        for win in [r(0, 0, 800, 600), r(0, 0, 1920, 1080), r(-1920, 0, 0, 1080)] {
+            let (x, y) = offscreen_target(win, &monitors);
+            let moved = r(x, y, x + (win.right - win.left), y + (win.bottom - win.top));
+            assert!(
+                !window_intersects_monitors(moved, &monitors),
+                "moved={moved:?} monitors={monitors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn intersects_detects_partial_overlap() {
+        let monitors = [(r(0, 0, 1920, 1080), true)];
+        assert!(window_intersects_monitors(
+            r(-100, 100, 100, 200),
+            &monitors
+        ));
+        assert!(window_intersects_monitors(
+            r(1800, 900, 2000, 1000),
+            &monitors
+        ));
+        assert!(!window_intersects_monitors(r(-500, -500, 0, 0), &monitors));
+        assert!(!window_intersects_monitors(
+            r(1920, 0, 2200, 500),
+            &monitors
+        ));
     }
 }
 

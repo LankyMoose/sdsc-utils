@@ -46,8 +46,10 @@ zips, the CEF DLC zip, installed copies, and private `APPDATA` dirs.
 - **Display target.** Manual launches (`Automated` unchecked) use the primary
   monitor with normal focus and `SDSC_DEBUG_QUIET=0`. Automated launches
   (checkbox on, or `controller_input: false` via the API) set
-  `SDSC_DEBUG_QUIET=1` for quiet secondary-monitor placement with no focus
-  steal. `SDSC_DEBUG_INPUT=0` drops pad edges in either mode.
+  `SDSC_DEBUG_QUIET=1` + `SDSC_DEBUG_OFFSCREEN=1` for fully-hidden placement
+  outside every monitor with no focus steal; the console runs the same
+  `scripts/qa_offscreen.py` watcher and reports `last_offscreen_ok`.
+  `SDSC_DEBUG_INPUT=0` drops pad edges in either mode.
 
 ## Why an engine-less exe starts
 
