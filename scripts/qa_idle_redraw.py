@@ -42,7 +42,12 @@ ASSERT_MSGS = {
     "launcher": ("launcher_frame",),
     "browser": ("browser_frame",),
 }
-ASSERT_VIEWS: dict[str, tuple[str, ...]] = {}
+TARGET_VIEW = {
+    "osk": "osk",
+    "toast": "toast",
+    "launcher": "launcher",
+    "browser": "browser",
+}
 
 TOKEN = re.compile(r"([a-z_]+)=(\d+)")
 
@@ -163,9 +168,17 @@ def main() -> int:
             for key in ASSERT_MSGS[args.scenario]:
                 if delta.get(f"msg.{key}", 0) > 0:
                     failures.append(f"msg.{key}={delta[f'msg.{key}']}")
-            for key in ASSERT_VIEWS.get(args.scenario, ()):
-                if delta.get(f"view.{key}", 0) > 0:
-                    failures.append(f"view.{key}={delta[f'view.{key}']}")
+            # Every dispatched message rebuilds every window, so the target
+            # window's view count must equal the total message count. An extra
+            # view means an uncounted redraw source remains.
+            total_messages = sum(
+                value for key, value in delta.items() if key.startswith("msg.")
+            )
+            target_view = delta.get(f"view.{TARGET_VIEW[args.scenario]}", 0)
+            if target_view > total_messages:
+                failures.append(
+                    f"view.{TARGET_VIEW[args.scenario]}={target_view} > msgs={total_messages}"
+                )
             if failures:
                 print("error: idle traffic: " + ", ".join(failures), file=sys.stderr)
                 return 1
