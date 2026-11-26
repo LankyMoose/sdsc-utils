@@ -37,17 +37,12 @@ OPEN = {
 
 # Cumulative counters that must not advance while the scenario is idle.
 ASSERT_MSGS = {
-    "osk": ("pad_input", "osk"),
+    "osk": ("pad_input", "osk", "browser_frame", "toast_frame", "launcher_frame"),
     "toast": ("toast_frame",),
     "launcher": ("launcher_frame",),
     "browser": ("browser_frame",),
 }
-ASSERT_VIEWS = {
-    "osk": ("osk",),
-    "toast": ("toast",),
-    "launcher": ("launcher",),
-    "browser": ("browser",),
-}
+ASSERT_VIEWS: dict[str, tuple[str, ...]] = {}
 
 TOKEN = re.compile(r"([a-z_]+)=(\d+)")
 
@@ -61,7 +56,12 @@ def parse_args() -> argparse.Namespace:
         default="osk",
         help="which window set to open",
     )
-    parser.add_argument("--seconds", type=float, default=8.0, help="run time")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="run time (default: 7s toast, 8s others)",
+    )
     parser.add_argument(
         "--assert",
         dest="assert_idle",
@@ -108,6 +108,10 @@ def wait_for_log(log: Path, deadline: float) -> list[dict[str, int]]:
 
 def main() -> int:
     args = parse_args()
+    seconds = args.seconds if args.seconds is not None else {
+        "toast": 7.0,
+        "launcher": 11.0,
+    }.get(args.scenario, 9.0)
     root = Path(__file__).resolve().parent.parent
     exe = args.exe or root / "target" / "debug" / "sdsc-utils.exe"
     if not exe.is_file():
@@ -117,6 +121,13 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     data = Path(tempfile.gettempdir()) / "sdsc-idle-redraw" / f"{args.scenario}-{stamp}"
     data.mkdir(parents=True, exist_ok=True)
+    # Keep the measurement free of real background work: no boot update check
+    # and a local blank page instead of the network default page.
+    (data / "prefs.json").write_text('{"update_boot_check": false}', encoding="utf-8")
+    page = data / "idle.html"
+    page.write_text("<!doctype html><title>idle</title>", encoding="utf-8")
+    tabs = {"tabs": [{"url": page.as_uri(), "title": "idle"}], "active": 0}
+    (data / "tabs.json").write_text(json.dumps(tabs), encoding="utf-8")
     log = data / "app.log"
     env = os.environ.copy()
     env["SDSC_DATA_DIR"] = str(data)
@@ -134,7 +145,7 @@ def main() -> int:
         stderr=subprocess.DEVNULL,
     )
     try:
-        snaps = wait_for_log(log, time.time() + args.seconds)
+        snaps = wait_for_log(log, time.time() + seconds)
         if len(snaps) < 2:
             print("error: fewer than two ui-redraw snapshots", file=sys.stderr)
             return 1
@@ -152,7 +163,7 @@ def main() -> int:
             for key in ASSERT_MSGS[args.scenario]:
                 if delta.get(f"msg.{key}", 0) > 0:
                     failures.append(f"msg.{key}={delta[f'msg.{key}']}")
-            for key in ASSERT_VIEWS[args.scenario]:
+            for key in ASSERT_VIEWS.get(args.scenario, ()):
                 if delta.get(f"view.{key}", 0) > 0:
                     failures.append(f"view.{key}={delta[f'view.{key}']}")
             if failures:

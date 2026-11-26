@@ -5,7 +5,7 @@ use iced::mouse;
 use iced::widget::shader::{self, Viewport};
 use iced::{Color, Rectangle};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static PIPELINE_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -430,6 +430,11 @@ pub struct AmbientProgram {
     pub uniforms: AmbientUniforms,
     /// Logical corner radius for transparent rounded windows (0 = square).
     pub corner_radius: f32,
+    /// Pull-model wall clock: the shader widget advances `time` itself and
+    /// requests per-window redraws instead of relying on an app tick.
+    animate: bool,
+    /// Frozen while Home covers the Launcher (resumes on the next view build).
+    paused: bool,
 }
 
 impl AmbientProgram {
@@ -437,7 +442,16 @@ impl AmbientProgram {
         Self {
             uniforms: AmbientUniforms::from_theme(time, dock_progress, veil, aperture),
             corner_radius: 0.0,
+            animate: false,
+            paused: false,
         }
+    }
+
+    /// Opt into the pull-model wall clock. `paused` freezes time (Home overlay).
+    pub fn animate(mut self, paused: bool) -> Self {
+        self.animate = true;
+        self.paused = paused;
+        self
     }
 
     /// Mask the output to a rounded rect (transparent corners).
@@ -447,18 +461,64 @@ impl AmbientProgram {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct AmbientState {
+    time: f32,
+    last: Option<Instant>,
+    initialized: bool,
+    paused: bool,
+}
+
 impl<Message> shader::Program<Message> for AmbientProgram {
-    type State = ();
+    type State = AmbientState;
     type Primitive = AmbientPrimitive;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        _event: &iced::Event,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Option<iced::widget::Action<Message>> {
+        if !self.animate {
+            return None;
+        }
+        let now = Instant::now();
+        if !state.initialized {
+            state.time = self.uniforms.time;
+            state.initialized = true;
+            state.last = Some(now);
+        }
+        if self.paused {
+            state.paused = true;
+            state.last = Some(now);
+            return None;
+        }
+        if state.paused {
+            state.paused = false;
+            state.last = Some(now);
+        }
+        if let Some(last) = state.last {
+            state.time += ambient_dt_for_elapsed(now.saturating_duration_since(last));
+        }
+        state.last = Some(now);
+        Some(iced::widget::Action::request_redraw_at(
+            now + Duration::from_millis(16),
+        ))
+    }
 
     fn draw(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         _cursor: mouse::Cursor,
         _bounds: Rectangle,
     ) -> Self::Primitive {
+        let mut uniforms = self.uniforms;
+        if self.animate && state.initialized {
+            uniforms.time = state.time;
+        }
         AmbientPrimitive {
-            uniforms: self.uniforms,
+            uniforms,
             corner_radius: self.corner_radius,
         }
     }
@@ -593,6 +653,58 @@ impl shader::Pipeline for AmbientPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animated_program_requests_its_own_redraw_and_pauses() {
+        let program = AmbientProgram::new(2.0, 0.0, 0.0, 1.0).animate(false);
+        let mut state = AmbientState::default();
+        let event = iced::Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 100.0));
+        let action: Option<iced::widget::Action<()>> =
+            <AmbientProgram as iced::widget::shader::Program<()>>::update(
+                &program,
+                &mut state,
+                &event,
+                bounds,
+                mouse::Cursor::Unavailable,
+            );
+        assert!(action.is_some(), "live ambient owns a redraw clock");
+        assert!(state.initialized);
+        assert!((state.time - 2.0).abs() < 1e-6, "starts at the passed pose");
+
+        let paused = AmbientProgram::new(2.0, 0.0, 0.0, 1.0).animate(true);
+        let mut paused_state = AmbientState::default();
+        let paused_action: Option<iced::widget::Action<()>> =
+            <AmbientProgram as iced::widget::shader::Program<()>>::update(
+                &paused,
+                &mut paused_state,
+                &event,
+                bounds,
+                mouse::Cursor::Unavailable,
+            );
+        assert!(paused_action.is_none());
+        assert!(static_program_has_no_clock());
+    }
+
+    fn static_program_has_no_clock() -> bool {
+        let program = AmbientProgram::new(0.0, 0.0, 0.0, 1.0);
+        let mut state = AmbientState::default();
+        let event = iced::Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 100.0));
+        let action: Option<iced::widget::Action<()>> =
+            <AmbientProgram as iced::widget::shader::Program<()>>::update(
+                &program,
+                &mut state,
+                &event,
+                bounds,
+                mouse::Cursor::Unavailable,
+            );
+        action.is_none()
+    }
 
     #[test]
     fn uniforms_clamp_dock_veil_aperture() {

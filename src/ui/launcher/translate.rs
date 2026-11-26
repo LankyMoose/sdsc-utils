@@ -16,6 +16,11 @@ pub struct BackdropArt<Message, Theme = iced::Theme, Renderer = iced::Renderer> 
     scale: f32,
     ox_norm: f32,
     oy_norm: f32,
+    /// Pull-model ken-burns: draw-time pose from `started + base_ms`.
+    animate: bool,
+    reduced_motion: bool,
+    started: iced::time::Instant,
+    base_ms: u64,
     width: Length,
     height: Length,
     _message: std::marker::PhantomData<Message>,
@@ -36,6 +41,42 @@ pub fn backdrop_art<Message, Theme, Renderer>(
         scale: scale.max(1.0),
         ox_norm,
         oy_norm,
+        animate: false,
+        reduced_motion: false,
+        started: iced::time::Instant::now(),
+        base_ms: 0,
+        width: Length::Fill,
+        height: Length::Fill,
+        _message: std::marker::PhantomData,
+        _theme: std::marker::PhantomData,
+        _renderer: std::marker::PhantomData,
+    }
+}
+
+/// Incoming splash with a wall-clock ken-burns pose. `base_ms` is the elapsed
+/// pose at view build; the widget adds its own elapsed time and requests
+/// per-window redraws while motion is live.
+#[allow(clippy::too_many_arguments)]
+pub fn backdrop_art_animated<Message, Theme, Renderer>(
+    handle: Handle,
+    opacity: f32,
+    scale: f32,
+    ox_norm: f32,
+    oy_norm: f32,
+    reduced_motion: bool,
+    started: iced::time::Instant,
+    base_ms: u64,
+) -> BackdropArt<Message, Theme, Renderer> {
+    BackdropArt {
+        handle,
+        opacity: opacity.clamp(0.0, 1.0),
+        scale: scale.max(1.0),
+        ox_norm,
+        oy_norm,
+        animate: true,
+        reduced_motion,
+        started,
+        base_ms,
         width: Length::Fill,
         height: Length::Fill,
         _message: std::marker::PhantomData,
@@ -69,6 +110,24 @@ where
         layout::Node::new(limits.resolve(self.width, self.height, Size::ZERO))
     }
 
+    fn update(
+        &mut self,
+        _tree: &mut Tree,
+        _event: &iced::Event,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        _clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        if self.animate && !self.reduced_motion {
+            shell.request_redraw_at(
+                iced::time::Instant::now() + iced::time::Duration::from_millis(16),
+            );
+        }
+    }
+
     fn draw(
         &self,
         _tree: &Tree,
@@ -91,12 +150,25 @@ where
             .measure_image(&self.handle)
             .map(|s| Size::new(s.width as f32, s.height as f32))
             .unwrap_or(Size::new(1.0, 1.0));
+        let (scale, ox_norm, oy_norm) = if self.animate && !self.reduced_motion {
+            use crate::ui::launcher::mode::{backdrop_pose_offset, backdrop_pose_scale};
+            use crate::ui::motion::{movement_offset, movement_scale};
+            let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
+            let (ox, oy) = backdrop_pose_offset(elapsed);
+            (
+                movement_scale(backdrop_pose_scale(elapsed), false).max(1.0),
+                movement_offset(ox, false),
+                movement_offset(oy, false),
+            )
+        } else {
+            (self.scale, self.ox_norm, self.oy_norm)
+        };
         let fitted = ContentFit::Cover.fit(natural, bounds.size());
-        let drawn = Size::new(fitted.width * self.scale, fitted.height * self.scale);
+        let drawn = Size::new(fitted.width * scale, fitted.height * scale);
         // Pan within the Cover+zoom overflow only — clip is the stage rect.
         let (px, py) = backdrop_pose_pixels(
-            self.ox_norm,
-            self.oy_norm,
+            ox_norm,
+            oy_norm,
             drawn.width,
             drawn.height,
             bounds.width,

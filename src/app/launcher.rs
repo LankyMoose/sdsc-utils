@@ -795,10 +795,9 @@ impl App {
     }
 
     /// Per-poll analog layer for the engine browser: left stick moves the
-    /// virtual cursor (magnetic snap), right stick scrolls. Runs on every
-    /// pad tick — including neutral ones — so friction always decays the
-    /// cursor velocity; otherwise a released stick would freeze mid-glide
-    /// and resume in the stale direction on the next push.
+    /// virtual cursor (magnetic snap), right stick scrolls. Runs on pad edges
+    /// and on the Browser wall clock; neutral ticks let friction and docking
+    /// settle even after the pad stream stops.
     pub(crate) fn tick_browser_cursor(
         &mut self,
         readings: &[launcher_input::NavReading],
@@ -807,7 +806,34 @@ impl App {
         let Some(reading) = launcher_input::preferred_reading(readings) else {
             return;
         };
-        let sample = &reading.sample;
+        let sample = reading.sample.clone();
+        self.browser.last_pad_sample = sample.clone();
+        self.browser.last_pad_at = Some(now);
+        self.advance_browser_cursor(&sample, now);
+    }
+
+    /// Analog sample the Browser wall clock should integrate: the last pad
+    /// state while it is fresh, neutral once the stream has been quiet past
+    /// the release grace. Prevents a disconnected/held stick from steering
+    /// through the frame clock forever.
+    pub(crate) fn browser_frame_sample(&self, now: Instant) -> crate::domain::pad::PadSample {
+        if self.browser.last_pad_at.is_some_and(|t| {
+            now.saturating_duration_since(t) <= std::time::Duration::from_millis(100)
+        }) {
+            self.browser.last_pad_sample.clone()
+        } else {
+            crate::domain::pad::PadSample::default()
+        }
+    }
+
+    /// Integrate one analog sample into the cursor/scroll state. The Browser
+    /// frame clock feeds a neutral sample while `needs_frames()` is true, so
+    /// glide/decay no longer depends on a 250Hz neutral pad stream.
+    pub(crate) fn advance_browser_cursor(
+        &mut self,
+        sample: &crate::domain::pad::PadSample,
+        now: Instant,
+    ) {
         #[cfg(debug_assertions)]
         let was_docked = self.browser.panel.cursor.attached.is_some();
         let (dx, dy) = self.browser.panel.advance_stick(
@@ -2406,8 +2432,10 @@ impl App {
             Some(
                 crate::platform::trace::action(crate::platform::trace::Lane::Input, "pad.action")
                     .source("pad")
+                    .field("kind", "action")
                     .field("edge_seq", edge.seq)
                     .field("reason", edge.reason.as_str())
+                    .field("readings", edge.readings.len())
                     .field("actions", actions)
                     .begin(),
             )
@@ -2484,10 +2512,14 @@ impl App {
             self.home_face_latch_until = None;
         }
         // System keyboard owns the pad above the active app; PS/Home is still
-        // handled inside the OSK session (it closes the keyboard and opens
-        // Home).
+        // global. Analog movement is handled by the pull-model OSK surface;
+        // only source-side taps (and the PS chord) cross the app boundary.
         if self.osk.state.open {
-            return self.on_osk_pad(&readings, tap_actions);
+            if self.home_chord_fires(&readings) {
+                crate::controller::hid::diag::diag_info("ui-diag: PS opens home over OSK");
+                return self.close_osk("home").chain(self.toggle_home());
+            }
+            return self.on_osk_tap_actions(tap_actions);
         }
         if self.browser_visible {
             return self.on_browser_pad(&readings, tap_actions);
@@ -2682,8 +2714,6 @@ impl App {
         } else {
             Task::none()
         };
-
-        self.launcher_state.tick_anim(now);
 
         let replace_confirm = self.launcher_state.replace_confirm.is_some();
         let manual_add = self.launcher_state.manual_add.is_some();

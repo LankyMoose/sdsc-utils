@@ -48,6 +48,7 @@ pub fn view<'a>(
     stage_w: f32,
     settings_snapshot: &crate::ui::launcher::settings::LauncherSettingsSnapshot,
     immersive_layout: ImmersiveLayout,
+    paused: bool,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, LauncherMessage> {
     let veil = transition_top_veil(state, now);
@@ -56,7 +57,7 @@ pub fn view<'a>(
     // Any Float under a veil paints above it — flatten stage scale + hint presses.
     let flat = veil > 0.001 || idle_veil > 0.001 || settings_p > 0.001;
     // Chrome stays fully lit; one top veil handles the enter (no per-panel dims).
-    let program = AmbientProgram::new(state.ambient_time, 0.0, 0.0, 1.0);
+    let program = AmbientProgram::new(state.ambient_time, 0.0, 0.0, 1.0).animate(paused);
     let atmosphere = shader(program).width(Fill).height(Fill);
 
     // Debug R3 hide: pure ambient background, no chrome at all (tuning panel
@@ -82,6 +83,7 @@ pub fn view<'a>(
         stage_h,
         stage_w,
         immersive_layout,
+        paused,
         #[cfg(debug_assertions)]
         debug_bounds,
     );
@@ -307,26 +309,61 @@ fn transition_top_veil(state: &State, now: Instant) -> f32 {
     }
 }
 
-fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, LauncherMessage>> {
+fn stage_backdrop_layers<'a>(
+    state: &'a State,
+    now: Instant,
+    paused: bool,
+) -> Vec<Element<'a, LauncherMessage>> {
     let selected = state.game_selected.min(state.rows.len().saturating_sub(1));
     let mut layers: Vec<Element<'_, LauncherMessage>> = Vec::new();
     // Dim tracks splash opacity so ambient→art does not pop a full wash.
     let mut dim_amount = 0.0_f32;
+    let incoming = state
+        .rows
+        .get(selected)
+        .and_then(|row| row.backdrop_icon())
+        .and_then(|art| {
+            state
+                .backdrop_incoming_motion(now)
+                .map(|(opacity, scale, ox, oy, elapsed_ms)| {
+                    (art, opacity, scale, ox, oy, elapsed_ms)
+                })
+        });
 
-    if let Some((key, opacity, scale, ox, oy)) = state.backdrop_outgoing_visual(now)
+    let incoming_opaque = incoming
+        .as_ref()
+        .is_some_and(|(_, opacity, ..)| *opacity >= 0.99);
+    if !incoming_opaque
+        && let Some((key, opacity, scale, ox, oy)) = state.backdrop_outgoing_visual(now)
         && let Some(art) = state.backdrop_icon_for_key(key)
     {
         // Parked pose stays frozen (scale + pan) — resetting pan looked like a navigate glitch.
-        layers.push(backdrop_layer(art, opacity, scale, ox, oy));
+        layers.push(backdrop_layer(
+            art,
+            opacity,
+            scale,
+            ox,
+            oy,
+            None,
+            now,
+            state.reduced_motion,
+        ));
         dim_amount = dim_amount.max(opacity);
     }
 
-    if let Some(row) = state.rows.get(selected)
-        && let Some(art) = row.backdrop_icon()
-        && let Some((opacity, scale, ox, oy)) = state.backdrop_incoming_visual(now)
+    if let Some((art, opacity, scale, ox, oy, elapsed_ms)) = incoming
         && opacity > 0.01
     {
-        layers.push(backdrop_layer(art, opacity, scale, ox, oy));
+        layers.push(backdrop_layer(
+            art,
+            opacity,
+            scale,
+            ox,
+            oy,
+            (!paused).then_some(elapsed_ms),
+            now,
+            state.reduced_motion,
+        ));
         dim_amount = dim_amount.max(opacity);
     }
 
@@ -352,16 +389,33 @@ fn stage_backdrop_layers<'a>(state: &'a State, now: Instant) -> Vec<Element<'a, 
     layers
 }
 
+#[allow(clippy::too_many_arguments)]
 fn backdrop_layer(
     art: crate::ui::launcher::view::LauncherIcon,
     opacity: f32,
     scale: f32,
     ox_norm: f32,
     oy_norm: f32,
+    animated_ms: Option<u64>,
+    now: Instant,
+    reduced_motion: bool,
 ) -> Element<'static, LauncherMessage> {
     // One-shot Cover draw: zoom then pan inside headroom, clipped to the stage.
     // (Translating an iced Image after its own bounds-clip reveals black edges.)
-    backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into()
+    match animated_ms {
+        Some(base_ms) => crate::ui::launcher::translate::backdrop_art_animated(
+            art.0,
+            opacity,
+            scale,
+            ox_norm,
+            oy_norm,
+            reduced_motion,
+            now,
+            base_ms,
+        )
+        .into(),
+        None => backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -372,6 +426,7 @@ fn stage_view<'a>(
     stage_h: f32,
     stage_w: f32,
     immersive_layout: ImmersiveLayout,
+    paused: bool,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, LauncherMessage> {
     let scale = crate::ui::motion::movement_scale(1.0, state.reduced_motion);
@@ -394,7 +449,7 @@ fn stage_view<'a>(
                 .into(),
         ]
     } else if list_op > 0.01 {
-        stage_backdrop_layers(state, now)
+        stage_backdrop_layers(state, now, paused)
     } else {
         Vec::new()
     };

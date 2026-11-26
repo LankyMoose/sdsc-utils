@@ -6,7 +6,11 @@
 
 pub mod dual;
 pub mod grid;
+pub mod surface;
 
+pub use surface::surface;
+
+use crate::domain::pad::{NavAction, NavHalf, PadId};
 use crate::persist::prefs::OskMode;
 use crate::ui::theme;
 use dual::{Cursor, DualKeyboard, Half};
@@ -61,11 +65,25 @@ pub enum Output {
     Enter,
 }
 
-/// The overlay view has no mouse/controller callbacks: pad input is routed by
-/// the system session, and real mouse input dismisses the OSK. The message
-/// type exists only to keep the view in iced's message-map shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OskMessage {}
+/// Discrete output from the pull-model OSK surface. The app changes cursor or
+/// dispatches text/feedback only on these messages; analog samples stay in the
+/// shared input slot.
+#[derive(Debug, Clone)]
+pub enum OskMessage {
+    Step {
+        pad: PadId,
+        half: NavHalf,
+        direction: NavAction,
+    },
+    Commit {
+        pad: PadId,
+        half: NavHalf,
+    },
+    GridStep {
+        pad: PadId,
+        direction: NavAction,
+    },
+}
 
 /// System-owned OSK UI state. No Browser or app dependencies.
 #[derive(Debug, Clone)]

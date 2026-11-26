@@ -22,6 +22,7 @@ pub mod popup;
 pub mod reveal;
 pub mod scale;
 pub mod shader;
+pub mod spinner;
 pub mod svg_icon;
 pub mod text_fit;
 pub mod theme;

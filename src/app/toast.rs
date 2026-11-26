@@ -12,7 +12,7 @@ use crate::session::notify::NotifyEvent;
 use crate::ui::layout::{
     focus_window, hide_toast, invalidate_toast, move_window, overlay_platform_specific,
     raise_toast_topmost, raise_window_topmost, remount_toast_surface, show_toast_without_activate,
-    slide_y, toast_local_in_cover, toast_placement,
+    toast_local_in_cover, toast_placement,
 };
 use crate::ui::motion::MAX_FRAME_DT;
 use crate::ui::toast::ToastMessage;
@@ -78,6 +78,17 @@ impl App {
     /// Opacity for toast cards (card opacity pref, 0.2–1.0).
     pub(crate) fn toast_opacity(&self) -> f32 {
         f32::from(self.session.prefs.toast_opacity) / 100.0
+    }
+
+    /// Wall-clock content offset for the fixed toast window (0 at rest).
+    pub(crate) fn toast_slide_offset(&self) -> f32 {
+        let Some(placement) = self.toast_placement else {
+            return 0.0;
+        };
+        let Some((progress, dismissing)) = self.toast_machine.slide_pose() else {
+            return 0.0;
+        };
+        crate::ui::layout::slide_y(placement, progress, dismissing) - placement.target_y
     }
 
     /// One-shot "running in the tray" toast on manual starts.
@@ -227,6 +238,7 @@ impl App {
             self.toast_generation,
             Message::ToastDismiss(self.toast_generation),
             self.toast_opacity(),
+            0.0,
         );
         // Layout at (0,0), then Float-translate into cover-local pose. Non-zero
         // translate (or a tiny nudge) puts the card in the overlay band above the
@@ -279,19 +291,10 @@ impl App {
         open.map(move |id| Message::PlaceToast { id, generation })
     }
 
-    pub(crate) fn effect_toast_move(&self, progress: f32, dismissing: bool) -> Task<Message> {
-        // Immersive composite owns the slide pose; leave the toast HWND alone.
-        if self.immersive_hosts_toast() {
-            return Task::none();
-        }
-        let Some(id) = self.toast_window else {
-            return Task::none();
-        };
-        let Some(placement) = self.toast_placement else {
-            return Task::none();
-        };
-        let y = slide_y(placement, progress, dismissing);
-        move_window(id, Point::new(placement.x, y))
+    pub(crate) fn effect_toast_move(&self, _progress: f32, _dismissing: bool) -> Task<Message> {
+        // Fixed window: the card slides via a draw-time content offset, not an
+        // OS window move. Raising/z-order stays event-driven.
+        Task::none()
     }
 
     pub(crate) fn effect_open_home(&mut self) -> Task<Message> {
@@ -455,8 +458,7 @@ impl App {
         let Some(placement) = self.toast_placement else {
             return Task::none();
         };
-        let (progress, dismissing) = self.toast_machine.slide_pose().unwrap_or((1.0, false));
-        let y = slide_y(placement, progress, dismissing);
+        let y = placement.target_y;
         remount_toast_surface(id, self.toast_generation)
             .chain(move_window(id, Point::new(placement.x, y)))
             .chain(show_toast_without_activate(id))
@@ -485,7 +487,7 @@ impl App {
         // Sync placement (Win32 work area on Windows); no monitor_size hop.
         let placement = toast_placement(self.session.prefs.toast_position, None);
         self.toast_placement = Some(placement);
-        let start = Point::new(placement.x, placement.outside_y);
+        let start = Point::new(placement.x, placement.target_y);
         let percent = self
             .toast_message
             .as_ref()

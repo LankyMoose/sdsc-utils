@@ -8,7 +8,7 @@ use crate::controller::hid::policy::Policy;
 use crate::domain::gesture::{GestureControl, GestureDetector};
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Per-axis deadzone applied to each stick before combining (kills rest bias).
@@ -40,13 +40,35 @@ pub struct InputHub {
     snapshot: Mutex<InputSnapshot>,
     /// Async bridge: hid-worker `try_send`s edges; iced subscription drains them.
     edge_tx: Mutex<Option<iced::futures::channel::mpsc::Sender<InputEdge>>>,
+    /// Display-rate / meaningful-change gate for analog edges (actions bypass).
+    gate: Mutex<EdgeGate>,
+    /// Latest all-pad analog snapshot for the pull-model OSK widget.
+    osk_slot: Arc<OskInputSlot>,
 }
+
+/// Analog edge gate state (hid-worker side).
+#[derive(Debug, Default)]
+struct EdgeGate {
+    last: std::collections::HashMap<PadId, PadSample>,
+    last_push: Option<Instant>,
+    neutral_tail_until: Option<Instant>,
+}
+
+/// One display-rate analog publication plus release-tail bookkeeping.
+const ANALOG_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
+/// Keep publishing neutral samples long enough for [`NavProfile::neutral_grace`]
+/// (100ms) to expire on a stepper that only sees pad edges.
+const ANALOG_NEUTRAL_TAIL: Duration = Duration::from_millis(140);
+/// Stick movement below this is report noise, not a meaningful change.
+const ANALOG_STICK_EPSILON: f32 = 0.02;
 
 impl InputHub {
     pub fn new() -> Self {
         Self {
             snapshot: Mutex::new(InputSnapshot::default()),
             edge_tx: Mutex::new(None),
+            gate: Mutex::new(EdgeGate::default()),
+            osk_slot: Arc::new(OskInputSlot::default()),
         }
     }
 
@@ -64,6 +86,7 @@ impl InputHub {
             guard.published_at = Instant::now();
             guard.reason = reason;
             guard.readings = readings;
+            self.osk_slot.publish(&guard.readings, guard.seq);
             SnapshotMeta {
                 published_at: guard.published_at,
                 seq: guard.seq,
@@ -114,6 +137,11 @@ impl InputHub {
         if let Ok(mut guard) = self.edge_tx.lock() {
             *guard = Some(tx);
         }
+        // A fresh listener must see the next sample even if the worker state
+        // has not changed (e.g. OSK opens while a stick is held at rest).
+        if let Ok(mut gate) = self.gate.lock() {
+            *gate = EdgeGate::default();
+        }
     }
 
     /// Clear the iced-side sender (subscription end / shutdown).
@@ -124,7 +152,58 @@ impl InputHub {
     }
 
     /// Push a sample edge to the UI bridge (no-op when nothing is listening).
+    ///
+    /// Actions (taps/holds) publish immediately. Analog state is gated to
+    /// display rate plus meaningful change; a neutral tail keeps release
+    /// semantics intact for steppers that only see edges.
     pub fn push_edge(&self, edge: InputEdge) {
+        self.push_edge_at(edge, Instant::now());
+    }
+
+    fn push_edge_at(&self, edge: InputEdge, now: Instant) {
+        if self.edge_tx.lock().map(|g| g.is_none()).unwrap_or(true) {
+            return;
+        }
+        let Ok(mut gate) = self.gate.lock() else {
+            return;
+        };
+        let digital_change = digital_changed(&gate.last, &edge.readings);
+        let stick_change = stick_changed(&gate.last, &edge.readings);
+        let all_resting = edge
+            .readings
+            .iter()
+            .all(|reading| sample_nav_resting(&reading.sample));
+        let was_resting = gate.last.values().all(sample_nav_resting);
+        if !all_resting && was_resting {
+            gate.neutral_tail_until = None;
+        } else if all_resting && !was_resting {
+            gate.neutral_tail_until = Some(now + ANALOG_NEUTRAL_TAIL);
+        }
+        let immediate = !edge.actions.is_empty()
+            || !matches!(
+                edge.reason,
+                SnapshotReason::Sample | SnapshotReason::SamplePartial
+            )
+            || digital_change;
+        let due = gate
+            .last_push
+            .is_none_or(|last| now.saturating_duration_since(last) >= ANALOG_PUBLISH_INTERVAL);
+        let tail_active = gate.neutral_tail_until.is_some_and(|until| now <= until);
+        let should_push = immediate
+            || (due && (!all_resting || tail_active) && (stick_change || !all_resting))
+            || (due && tail_active);
+        if !should_push {
+            return;
+        }
+        gate.last = edge
+            .readings
+            .iter()
+            .map(|reading| (reading.id.clone(), reading.sample.clone()))
+            .collect();
+        gate.last_push = Some(now);
+        if all_resting && !tail_active {
+            gate.neutral_tail_until = None;
+        }
         if let Ok(mut guard) = self.edge_tx.lock()
             && let Some(tx) = guard.as_mut()
         {
@@ -132,6 +211,128 @@ impl InputHub {
             let _ = tx.try_send(edge);
         }
     }
+
+    /// Pull-model OSK source. Enabled while the overlay is open; the keyboard
+    /// widget polls it directly instead of receiving `PadInput` messages.
+    pub fn osk_slot(&self) -> Arc<OskInputSlot> {
+        Arc::clone(&self.osk_slot)
+    }
+
+    /// Toggle analog publication into the pull-model OSK slot.
+    pub fn set_osk_listening(&self, enabled: bool) {
+        self.osk_slot.set_enabled(enabled);
+    }
+}
+
+/// Latest all-pad analog state for the pull-model OSK widget.
+///
+/// Fed from every HID publication (not the gated edge stream): the OSK needs
+/// the current stick/trigger state at display rate without a global message.
+#[derive(Debug, Default)]
+pub struct OskInputSlot {
+    state: Mutex<OskSlotState>,
+    enabled: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct OskSlotState {
+    seq: u64,
+    readings: Vec<NavReading>,
+    /// Debug replay frames, consumed one per widget poll (press then release).
+    replay: std::collections::VecDeque<Vec<NavReading>>,
+}
+
+impl OskInputSlot {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn publish(&self, readings: &[NavReading], seq: u64) {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut guard) = self.state.lock() {
+            guard.seq = seq;
+            guard.readings = readings.to_vec();
+        }
+    }
+
+    /// Debug replay: queue a synthetic frame for the pull-model widget.
+    #[cfg(debug_assertions)]
+    pub fn push_replay(&self, readings: Vec<NavReading>) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.replay.push_back(readings);
+        }
+    }
+
+    /// Latest `(sequence, readings)`; a sequence change means new analog data.
+    pub fn read(&self) -> (u64, Vec<NavReading>) {
+        match self.state.lock() {
+            Ok(mut guard) => {
+                if let Some(readings) = guard.replay.pop_front() {
+                    guard.seq = guard.seq.saturating_add(1);
+                    return (guard.seq, readings);
+                }
+                (guard.seq, guard.readings.clone())
+            }
+            Err(_) => (0, Vec::new()),
+        }
+    }
+}
+
+fn digital_changed(
+    last: &std::collections::HashMap<PadId, PadSample>,
+    readings: &[NavReading],
+) -> bool {
+    if last.len() != readings.len() {
+        return true;
+    }
+    readings.iter().any(|reading| {
+        let Some(previous) = last.get(&reading.id) else {
+            return true;
+        };
+        let a = previous;
+        let b = &reading.sample;
+        a.cross != b.cross
+            || a.circle != b.circle
+            || a.square != b.square
+            || a.triangle != b.triangle
+            || a.options != b.options
+            || a.create != b.create
+            || a.l1 != b.l1
+            || a.r1 != b.r1
+            || a.l3 != b.l3
+            || a.l2 != b.l2
+            || a.r2 != b.r2
+            || a.dpad_up != b.dpad_up
+            || a.dpad_down != b.dpad_down
+            || a.dpad_left != b.dpad_left
+            || a.dpad_right != b.dpad_right
+            || a.held != b.held
+    })
+}
+
+fn stick_changed(
+    last: &std::collections::HashMap<PadId, PadSample>,
+    readings: &[NavReading],
+) -> bool {
+    if last.len() != readings.len() {
+        return true;
+    }
+    readings.iter().any(|reading| {
+        let Some(previous) = last.get(&reading.id) else {
+            return true;
+        };
+        let a = previous;
+        let b = &reading.sample;
+        (a.stick_x - b.stick_x).abs() > ANALOG_STICK_EPSILON
+            || (a.stick_y - b.stick_y).abs() > ANALOG_STICK_EPSILON
+            || (a.lstick_x - b.lstick_x).abs() > ANALOG_STICK_EPSILON
+            || (a.lstick_y - b.lstick_y).abs() > ANALOG_STICK_EPSILON
+            || (a.rstick_x - b.rstick_x).abs() > ANALOG_STICK_EPSILON
+            || (a.rstick_y - b.rstick_y).abs() > ANALOG_STICK_EPSILON
+    })
 }
 
 impl Default for InputHub {
@@ -2946,6 +3147,224 @@ mod tests {
             },
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    fn edge_at(
+        readings: Vec<NavReading>,
+        actions: Vec<PadAction>,
+        seq: u64,
+        reason: SnapshotReason,
+    ) -> InputEdge {
+        InputEdge::from_snapshot(
+            readings,
+            actions,
+            &SnapshotMeta {
+                published_at: Instant::now(),
+                seq,
+                reason,
+                pad_count: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn input_hub_gates_resting_neutral_edges() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(16);
+        hub.bind(tx);
+        let t0 = Instant::now();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                1,
+                SnapshotReason::Sample,
+            ),
+            t0,
+        );
+        assert!(rx.try_recv().is_ok(), "first sample publishes");
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                2,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(1),
+        );
+        assert!(rx.try_recv().is_err(), "resting neutral produces no edge");
+    }
+
+    #[test]
+    fn input_hub_throttles_stick_changes_to_display_rate() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(16);
+        hub.bind(tx);
+        let t0 = Instant::now();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                1,
+                SnapshotReason::Sample,
+            ),
+            t0,
+        );
+        let _ = rx.try_recv();
+        let held = PadSample {
+            lstick_x: -0.95,
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", held.clone())],
+                Vec::new(),
+                2,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(1),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "change inside the frame is coalesced"
+        );
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", held.clone())],
+                Vec::new(),
+                3,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(20),
+        );
+        assert!(rx.try_recv().is_ok(), "display-rate sample publishes");
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", held)],
+                Vec::new(),
+                4,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(40),
+        );
+        assert!(rx.try_recv().is_ok(), "held analog keeps repeat cadence");
+    }
+
+    #[test]
+    fn input_hub_keeps_neutral_tail_then_stops() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(16);
+        hub.bind(tx);
+        let t0 = Instant::now();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                1,
+                SnapshotReason::Sample,
+            ),
+            t0,
+        );
+        let _ = rx.try_recv();
+        let held = PadSample {
+            lstick_x: -0.95,
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", held)],
+                Vec::new(),
+                2,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(20),
+        );
+        let _ = rx.try_recv();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                3,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(40),
+        );
+        assert!(rx.try_recv().is_ok(), "release publishes at once");
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                4,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(60),
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "neutral tail keeps the stepper ticking"
+        );
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                5,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(240),
+        );
+        assert!(rx.try_recv().is_err(), "tail ends after the grace window");
+    }
+
+    #[test]
+    fn input_hub_actions_bypass_analog_throttle() {
+        let hub = InputHub::new();
+        let (tx, mut rx) = iced::futures::channel::mpsc::channel::<InputEdge>(16);
+        hub.bind(tx);
+        let t0 = Instant::now();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                Vec::new(),
+                1,
+                SnapshotReason::Sample,
+            ),
+            t0,
+        );
+        let _ = rx.try_recv();
+        hub.push_edge_at(
+            edge_at(
+                vec![reading("a", PadSample::default())],
+                vec![PadAction {
+                    pad: PadId("a".into()),
+                    button: PadButton::Cross,
+                    action: PadButtonAction::Tap,
+                }],
+                2,
+                SnapshotReason::Sample,
+            ),
+            t0 + Duration::from_millis(1),
+        );
+        assert!(rx.try_recv().is_ok(), "taps are never delayed");
+    }
+
+    #[test]
+    fn osk_slot_tracks_every_hid_publication() {
+        let hub = InputHub::new();
+        hub.set_osk_listening(true);
+        hub.publish(
+            vec![reading("a", PadSample::default())],
+            SnapshotReason::Sample,
+        );
+        let slot = hub.osk_slot();
+        let (seq, readings) = slot.read();
+        assert_eq!(seq, 1);
+        assert_eq!(readings.len(), 1);
+        hub.publish(Vec::new(), SnapshotReason::ClearedPowerOff);
+        let (seq, readings) = slot.read();
+        assert_eq!(seq, 2);
+        assert!(readings.is_empty());
     }
 
     fn chord_sample(controls: &[GestureControl]) -> PadSample {

@@ -1758,13 +1758,17 @@ impl State {
         self.strip_anim.is_some()
     }
 
+    fn games_reveal_active(&self) -> bool {
+        self.games_list_reveal_at.is_some_and(|started| {
+            started.elapsed().as_millis()
+                < u128::from(crate::ui::launcher::mode::GAMES_LIST_FADE_MS)
+        })
+    }
+
     pub fn needs_frames(&self) -> bool {
         self.strip_anim.is_some()
             || self.layout_transition.is_some()
             || self.transition_phase.is_some()
-            || self.backdrop_current.is_some()
-            || self.backdrop_outgoing.is_some()
-            || !self.perf_throttle_immersive
             || self.debug_tuning_keepalive()
             || self.ambient_tuning_active()
             || self.cold_load_active
@@ -1778,7 +1782,7 @@ impl State {
             || self.hint_anims_need_frames()
             || self.art_awaiting_paint
             || !self.chrome_status.is_empty()
-            || self.games_list_reveal_at.is_some()
+            || self.games_reveal_active()
             || self.position_section.is_some()
             || self.position_bar_slide.is_some()
             || (self.position_bar_last_scroll.is_some() && !self.navbar_pinned)
@@ -1788,38 +1792,67 @@ impl State {
             || self.enter_splash_fade
     }
 
-    /// True while Launcher has anim/visual work that must keep frames
-    /// flowing under the idle throttle (excludes the bare idle arm).
-    /// Used to document the gated-vs-ungated `needs_frames()` contract; the
-    /// subscription itself consults `needs_frames()` (which gates only the
-    /// bare arm behind `perf_throttle_immersive`).
+    /// Debug-only first-true arm for frame-clock diagnostics.
+    #[cfg(debug_assertions)]
+    pub fn frames_reason(&self) -> &'static str {
+        if self.strip_anim.is_some() {
+            "strip"
+        } else if self.layout_transition.is_some() {
+            "layout"
+        } else if self.transition_phase.is_some() {
+            "transition"
+        } else if self.debug_tuning_keepalive() {
+            "tuning"
+        } else if self.ambient_tuning_active() {
+            "ambient_tuning"
+        } else if self.cold_load_active {
+            "cold"
+        } else if self.triangle_progress > 0.0 {
+            "triangle"
+        } else if self.cross_progress > 0.0 {
+            "cross"
+        } else if self.replace_confirm.is_some() {
+            "replace"
+        } else if self.manual_add.is_some() {
+            "manual"
+        } else if self.edit_confirm.is_some() {
+            "edit_confirm"
+        } else if self.settings.open {
+            "settings"
+        } else if self.settings.anim.is_some() {
+            "settings_anim"
+        } else if self.hint_anims_need_frames() {
+            "hints"
+        } else if self.art_awaiting_paint {
+            "art_paint"
+        } else if !self.chrome_status.is_empty() {
+            "chrome_status"
+        } else if self.games_reveal_active() {
+            "games_reveal"
+        } else if self.position_section.is_some() {
+            "position_section"
+        } else if self.position_bar_slide.is_some() {
+            "position_slide"
+        } else if self.position_bar_last_scroll.is_some() && !self.navbar_pinned {
+            "position_timer"
+        } else if self.idle_dim_anim.is_some() {
+            "idle_dim"
+        } else if self.enter_reveal.is_some() {
+            "enter_reveal"
+        } else if self.splash_reveal_pending {
+            "splash_pending"
+        } else if self.enter_splash_fade {
+            "splash_fade"
+        } else {
+            "none"
+        }
+    }
+
+    /// True while Launcher has state/visual work that must keep global frames
+    /// flowing. Ambient/ken-burns no longer appear here: their widgets own a
+    /// per-window wall clock (see `AmbientProgram::animate`/`BackdropArt`).
     pub fn immersive_anim_active(&self) -> bool {
-        self.strip_anim.is_some()
-            || self.layout_transition.is_some()
-            || self.transition_phase.is_some()
-            || self.backdrop_current.is_some()
-            || self.backdrop_outgoing.is_some()
-            || self.debug_tuning_keepalive()
-            || self.ambient_tuning_active()
-            || self.cold_load_active
-            || self.triangle_progress > 0.0
-            || self.cross_progress > 0.0
-            || self.replace_confirm.is_some()
-            || self.manual_add.is_some()
-            || self.edit_confirm.is_some()
-            || self.settings.open
-            || self.settings.anim.is_some()
-            || self.hint_anims_need_frames()
-            || self.art_awaiting_paint
-            || !self.chrome_status.is_empty()
-            || self.games_list_reveal_at.is_some()
-            || self.position_section.is_some()
-            || self.position_bar_slide.is_some()
-            || (self.position_bar_last_scroll.is_some() && !self.navbar_pinned)
-            || self.idle_dim_anim.is_some()
-            || self.enter_reveal.is_some()
-            || self.splash_reveal_pending
-            || self.enter_splash_fade
+        self.needs_frames()
     }
 
     /// Sync the immersive idle-throttle gate from prefs (no anim snapping;
@@ -3160,6 +3193,14 @@ impl State {
     /// Reduced motion freezes the ken-burns pose at rest (Cover, centered);
     /// the selection crossfade opacity is unchanged.
     pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
+        self.backdrop_incoming_motion(now)
+            .map(|(opacity, scale, ox, oy, _)| (opacity, scale, ox, oy))
+    }
+
+    /// Incoming backdrop pose plus the wall-clock elapsed used to compute it.
+    /// The splash widget adds its own elapsed time so ken-burns no longer
+    /// depends on a global Launcher frame.
+    pub fn backdrop_incoming_motion(&self, now: Instant) -> Option<(f32, f32, f32, f32, u64)> {
         use crate::ui::launcher::mode::{
             art_fade_progress, backdrop_pose_offset, backdrop_pose_scale, enter_art_fade_progress,
         };
@@ -3178,7 +3219,7 @@ impl State {
         match &self.backdrop_current {
             Some((key, None)) if key == &row.play_key => {
                 let (scale, ox, oy) = still(0);
-                Some((0.0, scale, ox, oy))
+                Some((0.0, scale, ox, oy, 0))
             }
             Some((key, Some(started))) if key == &row.play_key => {
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
@@ -3190,10 +3231,10 @@ impl State {
                     art_fade_progress(elapsed)
                 };
                 let (scale, ox, oy) = still(elapsed);
-                Some((opacity, scale, ox, oy))
+                Some((opacity, scale, ox, oy, elapsed))
             }
             // No state, or stale key after nav — still paint current art.
-            None | Some(_) => Some((1.0, still(0).0, 0.0, 0.0)),
+            None | Some(_) => Some((1.0, still(0).0, 0.0, 0.0, 0)),
         }
     }
 
@@ -3886,6 +3927,7 @@ pub fn view<'a>(
     stage_h: f32,
     stage_w: f32,
     settings_snapshot: &crate::ui::launcher::settings::LauncherSettingsSnapshot,
+    paused: bool,
     #[cfg(debug_assertions)] debug_bounds: bool,
 ) -> Element<'a, LauncherMessage> {
     crate::ui::launcher::immersive::view(
@@ -3896,6 +3938,7 @@ pub fn view<'a>(
         stage_w,
         settings_snapshot,
         settings_snapshot.immersive_layout,
+        paused,
         #[cfg(debug_assertions)]
         debug_bounds,
     )
@@ -4050,17 +4093,18 @@ mod tests {
     }
 
     #[test]
-    fn throttle_gates_idle_but_not_anims() {
-        // Idle: ungated needs frames, gated does not.
+    fn idle_needs_no_frames_but_anims_do() {
+        // Idle: ambient/ken-burns are pull-model widgets, so neither the
+        // normal nor the immersive-throttle gate keeps a Launcher frame clock.
         let idle = State { ..State::default() };
         assert!(!idle.perf_throttle_immersive);
-        assert!(idle.needs_frames());
+        assert!(!idle.needs_frames());
         assert!(!idle.immersive_anim_active());
         let mut throttled = State { ..State::default() };
         throttled.sync_perf_throttle(true);
         assert!(!throttled.needs_frames());
         assert!(!throttled.immersive_anim_active());
-        // Any anim keeps frames in both modes.
+        // Any real anim keeps frames in both modes.
         let now = Instant::now();
         let mut ungated = State { ..State::default() };
         ungated.game_selected = 1;

@@ -31,15 +31,17 @@ use crate::ui::svg_icon;
 use crate::ui::{chrome, theme};
 #[cfg(debug_assertions)]
 use iced::Degrees;
+#[cfg(debug_assertions)]
+use iced::Radians;
 use iced::font::Weight;
 use iced::mouse;
 use iced::widget::{
     Column, Row, button, canvas as canvas_widget, column, container, hover, mouse_area, pick_list,
     row, scrollable, slider, space, stack, svg, text, toggler, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Font, Length, Radians};
+use iced::{Alignment, Color, Element, Fill, Font, Length};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Logical width of the configure window.
 pub const WIDTH: f32 = 720.0;
@@ -1144,38 +1146,11 @@ fn reload_button(queued: bool) -> Element<'static, ConfigureMessage> {
         .into()
 }
 
-/// Wall-clock indeterminate spinner for the queued reload button. The
-/// `RendererReloadTick` subscription redraws at 60Hz while queued, so the
-/// SVG rotation sweeps smoothly for the short feedback delay. Phase comes
-/// from a process-local epoch: `Instant::now().elapsed()` at view time is
-/// always ~zero and would render a frozen spinner.
-///
-/// `rotation()` takes radians: one steady turn per [`SPINNER_PERIOD_MS`].
-/// Passing degrees here aliased backwards at these frame rates.
+/// Wall-clock indeterminate spinner for the queued reload button. The canvas
+/// owns its own redraw clock, so no global `RendererReloadTick` subscription
+/// is needed while queued.
 fn reload_spinner() -> Element<'static, ConfigureMessage> {
-    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    let elapsed_ms = Instant::now().saturating_duration_since(epoch).as_millis();
-    svg(svg::Handle::from_memory(svg_icon::SPINNER_SVG.as_bytes()))
-        .width(Length::Fixed(14.0))
-        .height(Length::Fixed(14.0))
-        .rotation(spinner_radians(elapsed_ms))
-        .style(|_theme, _status| svg::Style {
-            color: Some(theme::MUTED),
-        })
-        .into()
-}
-
-/// One spinner revolution period. Slow enough to read as rotation at the
-/// 20Hz update-check tick (and the 60Hz reload tick).
-const SPINNER_PERIOD_MS: u64 = 1200;
-
-/// Wall-clock spinner phase in radians (pure, unit-tested).
-fn spinner_radians(elapsed_ms: u128) -> Radians {
-    Radians(
-        elapsed_ms.rem_euclid(u128::from(SPINNER_PERIOD_MS)) as f32 / SPINNER_PERIOD_MS as f32
-            * std::f32::consts::TAU,
-    )
+    crate::ui::spinner::spinner(14.0, theme::MUTED)
 }
 
 /// Dim explanatory paragraph.
@@ -2892,21 +2867,6 @@ fn segmented_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spinner_radians_sweeps_one_turn_per_period() {
-        assert_eq!(spinner_radians(0).0, 0.0);
-        let half = spinner_radians(u128::from(SPINNER_PERIOD_MS) / 2).0;
-        assert!((half - std::f32::consts::PI).abs() < 1e-4);
-        // Wraps exactly: no jump at the cycle boundary.
-        assert_eq!(spinner_radians(u128::from(SPINNER_PERIOD_MS)).0, 0.0);
-        assert_eq!(
-            spinner_radians(u128::from(SPINNER_PERIOD_MS) + 100).0,
-            spinner_radians(100).0
-        );
-        // Monotonic within a period (no backwards aliasing).
-        assert!(spinner_radians(100).0 < spinner_radians(200).0);
-    }
 
     #[test]
     fn sidebar_groups_debug_sections_last_in_debug_builds_only() {

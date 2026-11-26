@@ -18,8 +18,6 @@ pub const RELEASES_API_URL: &str =
 /// Delay after tray boot before the automatic check (lets cold start settle,
 /// without making fast Settings openers wait on "Never checked").
 pub const UPDATE_BOOT_DELAY: Duration = Duration::from_secs(5);
-/// Spinner redraw cadence while a check is in flight.
-pub const UPDATE_SPIN_TICK: Duration = Duration::from_millis(50);
 /// Network timeout for the release API call.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest release payload we will parse (the real one is a few KB).

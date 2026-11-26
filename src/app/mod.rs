@@ -177,6 +177,11 @@ pub enum Message {
     Browser(crate::ui::browser::BrowserMessage),
     /// 60Hz Browser window tick (cursor/scroll/mouse sync/shots).
     BrowserFrame,
+    /// Poll a pending history jump that never reported landing/error.
+    BrowserHistoryTimeout,
+    /// Debug-only: 5s Browser frame-shot cadence + settled-dock capture.
+    #[cfg(debug_assertions)]
+    BrowserDebugShotTick,
     /// System OSK overlay window opened.
     OskOpened(window::Id),
     /// System OSK overlay message (no interactive keys; reserved).
@@ -264,6 +269,8 @@ pub enum Message {
     FinishStartClose,
     /// Drive launcher animation frames.
     LauncherFrame,
+    /// Low-rate idle timer (cursor hide / sleep) while no animation needs frames.
+    LauncherIdleTick,
     /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
     LauncherCursorActivity(window::Id),
     /// Single-flight art worker milestone (selected / near / job done).
@@ -319,8 +326,6 @@ pub enum Message {
     ToastFrame,
     /// Redraw the controller popup while an Identify ring flash is running.
     IdentifyFrame,
-    /// Drive the reload-button spinner while a renderer reload is queued.
-    RendererReloadTick,
     /// Fire the queued renderer reload (short feedback delay after the click).
     RendererReloadDue,
     /// Slow utility-ambient drift tick (≤2fps, only while a utility window is
@@ -338,8 +343,6 @@ pub enum Message {
     BootUpdateCheck,
     /// Result of a background GitHub release fetch.
     UpdateCheckDone(AppResult<crate::platform::updater::ReleaseInfo>),
-    /// Spinner redraw while an update check is in flight.
-    UpdateSpin,
     /// Native update notification delivered (fire-and-forget).
     UpdateNotifyDone(AppResult<()>),
 
@@ -383,6 +386,7 @@ impl Message {
             | Message::ConfigureOpened(_)
             | Message::BrowserOpened(_)
             | Message::BrowserFrame
+            | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
             | Message::Osk(_)
             | Message::EngineInstallDone { .. }
@@ -396,6 +400,7 @@ impl Message {
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
             | Message::LauncherFrame
+            | Message::LauncherIdleTick
             | Message::LauncherCursorActivity(_)
             | Message::LauncherArtEvent(_)
             | Message::BrowserEngine(_)
@@ -405,7 +410,6 @@ impl Message {
             | Message::ToastShown { .. }
             | Message::ToastFrame
             | Message::IdentifyFrame
-            | Message::RendererReloadTick
             | Message::RendererReloadDue
             | Message::UtilityAmbientTick
             | Message::ToastDismiss(_)
@@ -413,7 +417,6 @@ impl Message {
             | Message::SpectrumCommit(_)
             | Message::BootUpdateCheck
             | Message::UpdateCheckDone(_)
-            | Message::UpdateSpin
             | Message::UpdateNotifyDone(_)
             | Message::ReplayStep
             | Message::Exit
@@ -422,6 +425,7 @@ impl Message {
             Message::EmulatorCommitTick
             | Message::AmbientPreviewOpened(_)
             | Message::AmbientPreviewTick
+            | Message::BrowserDebugShotTick
             | Message::OskCapture
             | Message::OskShot(_) => None,
             #[cfg(feature = "cef-engine")]
@@ -503,7 +507,7 @@ impl Message {
             | Message::AbsenceRecheck
             | Message::ReplayStep => false,
             #[cfg(debug_assertions)]
-            Message::EmulatorCommitTick => false,
+            Message::EmulatorCommitTick | Message::BrowserDebugShotTick => false,
             Message::PollResult(_)
             | Message::ProcessEnumResult(_)
             | Message::RunningBadgeTick
@@ -522,9 +526,10 @@ impl Message {
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
             | Message::LauncherFrame
+            | Message::LauncherIdleTick
             | Message::BrowserFrame
+            | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
-            | Message::Osk(_)
             | Message::EngineInstallDone { .. }
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
@@ -551,6 +556,7 @@ impl Message {
             | Message::BrowserRawKey { .. }
             | Message::BrowserIme { .. }
             | Message::LauncherCursorActivity(_)
+            | Message::Osk(_)
             | Message::PadInput(_) => true,
             Message::LauncherKey { .. } => true,
             Message::ManualFilePicked(_)
@@ -570,7 +576,6 @@ impl Message {
             | Message::ToastShown { .. }
             | Message::ToastFrame
             | Message::IdentifyFrame
-            | Message::RendererReloadTick
             | Message::RendererReloadDue
             | Message::UtilityAmbientTick
             | Message::ToastDismiss(_)
@@ -578,7 +583,6 @@ impl Message {
             | Message::SpectrumCommit(_)
             | Message::BootUpdateCheck
             | Message::UpdateCheckDone(_)
-            | Message::UpdateSpin
             | Message::UpdateNotifyDone(_) => false,
             Message::Exit => false,
         }
@@ -1105,6 +1109,7 @@ impl App {
         let install_limit = session.prefs.apps_download_limit_kbps;
         let replay = crate::platform::trace::replay::request()
             .and_then(crate::platform::trace::replay::plan);
+        let osk_slot = input_hub.osk_slot();
         let mut app = Self {
             session,
             games,
@@ -1200,7 +1205,7 @@ impl App {
                 browser.dpad_stepper = NavStepper::with_profile(NavProfile::DPAD);
                 browser
             },
-            osk: osk::SystemOsk::new(osk_mode),
+            osk: osk::SystemOsk::new(osk_mode, osk_slot),
             install_policy: installs::AppInstallPolicy::new(install_limit),
             home_apps: home::HomeApps::new(),
             launcher_monitor_cover: None,
@@ -1603,33 +1608,19 @@ impl App {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
         }
 
-        if self.toast_message.is_some() || self.toast_machine.wants_frames() {
-            // Tick for the whole toast lifetime so content swaps present, and while
-            // Placing so the placement failsafe can fire without a Shown event.
+        if self.toast_message.is_some() && !self.toast_machine.is_resting() {
+            // Placing/slide only: a resting card is static and expiry is a
+            // one-shot task, so it must not keep a global 60Hz clock alive.
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ToastFrame));
         }
 
         // The local uninstall is almost instant, but the inline meter still
         // animates while the worker closes and the pointer is dropped.
-        if self.home_state.uninstalling {
+        if self.home_visible && self.home_state.uninstalling {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeProgressTick));
         }
         if self.home_visible && self.home_state.controller_anim_needs_frames() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::HomeControllerTick));
-        }
-
-        // Transient: animate the reload-button spinner until the queued exit.
-        if self.renderer_reload_queued {
-            subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::RendererReloadTick));
-        }
-
-        // Transient: redraw the Version-card spinner while a release check
-        // is in flight (the message itself is a no-op).
-        if matches!(self.update_status, UpdateStatus::Checking) {
-            subscriptions.push(
-                iced::time::every(crate::platform::updater::UPDATE_SPIN_TICK)
-                    .map(|_| Message::UpdateSpin),
-            );
         }
 
         if self.popup_state.identify_flash_active()
@@ -1641,11 +1632,16 @@ impl App {
 
         let pad_input_live =
             self.configure_window.is_some() && self.configure_state.section == Section::PadInput;
-        let pad_listening = pad_input_live
-            || self.home_visible
-            || self.browser_visible
-            || (self.session.prefs.home_enabled && !self.session.controllers.is_empty());
+        let pad_listening = !crate::platform::debug_quiet::input_dropped()
+            && (pad_input_live
+                || self.home_visible
+                || self.browser_visible
+                || self.osk.state.open
+                || (self.session.prefs.home_enabled && !self.session.controllers.is_empty()));
         self.hid_worker.set_input_hot(pad_listening);
+        self.input_hub.set_osk_listening(
+            self.osk.state.open && !crate::platform::debug_quiet::input_dropped(),
+        );
         if pad_listening {
             subscriptions.push(Subscription::run_with(
                 self.input_hub.clone(),
@@ -1666,10 +1662,49 @@ impl App {
             && !self.home_visible
             && (self.launcher_state.needs_frames() || self.steam_scan_in_flight())
         {
+            #[cfg(debug_assertions)]
+            if self.launcher_state.needs_frames() && std::env::var_os("SDSC_DEBUG_FRAMES").is_some()
+            {
+                use std::sync::Mutex;
+                static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+                let now = Instant::now();
+                if let Ok(mut guard) = LAST.lock() {
+                    let due =
+                        guard.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+                    if due {
+                        *guard = Some(now);
+                        app_log::info(format!(
+                            "ui-frames: launcher reason={}",
+                            self.launcher_state.frames_reason()
+                        ));
+                    }
+                }
+            }
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::LauncherFrame));
+        } else if self.launcher_visible && !self.home_visible {
+            // No animation needs frames: keep the wall-clock idle/sleep and
+            // cursor-hide state moving at 2Hz instead of a 60Hz ambient tick.
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(500)).map(|_| Message::LauncherIdleTick),
+            );
         }
-        if self.browser_visible {
+        if self.browser_visible && self.browser.needs_frames() {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::BrowserFrame));
+        }
+        // A history jump that never reports a landing/error must still settle.
+        // Independent of BrowserFrame so an idle cursor cannot strand it.
+        if self.pending_history_travel.is_some() {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250))
+                    .map(|_| Message::BrowserHistoryTimeout),
+            );
+        }
+        #[cfg(debug_assertions)]
+        if self.browser_visible && self.debug_browser {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250))
+                    .map(|_| Message::BrowserDebugShotTick),
+            );
         }
 
         if self.popup_window.is_some() || self.configure_window.is_some() {
@@ -1768,7 +1803,8 @@ impl App {
         }
 
         if Some(window) == self.osk.window {
-            return crate::ui::osk::view(&self.osk.state).map(Message::Osk);
+            return crate::ui::osk::surface(&self.osk.state, Arc::clone(&self.osk.slot))
+                .map(Message::Osk);
         }
 
         if Some(window) == self.browser_window {
@@ -1853,6 +1889,13 @@ impl App {
             let stage_w = cover.map(|(w, _)| w).unwrap_or(1920.0);
             let stage_h = cover.map(|(_, h)| h).unwrap_or(1080.0);
             let settings_snapshot = self.launcher_settings_snapshot();
+            // Ambient/ken-burns freeze while Home covers the Launcher and
+            // under the immersive performance throttle when no real animation
+            // needs frames (the old bare-idle gate semantics).
+            let ambient_paused = !self.launcher_visible
+                || self.home_visible
+                || (self.session.prefs.perf_throttle_immersive
+                    && !self.launcher_state.needs_frames());
             let start = launcher_view::view(
                 &self.launcher_state,
                 Instant::now(),
@@ -1860,6 +1903,7 @@ impl App {
                 stage_h,
                 stage_w,
                 &settings_snapshot,
+                ambient_paused,
                 #[cfg(debug_assertions)]
                 self.debug_layout_bounds,
             )
@@ -1899,6 +1943,7 @@ impl App {
                     self.toast_generation,
                     Message::ToastDismiss(self.toast_generation),
                     self.toast_opacity(),
+                    self.toast_slide_offset(),
                 ),
                 None => toast_view::empty(),
             };
@@ -1979,7 +2024,6 @@ impl App {
                 }
             }
             Message::UpdateCheckDone(result) => self.on_update_check_done(result),
-            Message::UpdateSpin => Task::none(),
             Message::UpdateNotifyDone(_) => self.on_update_notify_done(),
             Message::ProcessEnumResult(result) => self.on_process_enum_result(result),
             Message::SteamAppsChanged => self.on_steam_apps_changed(),
@@ -2040,8 +2084,14 @@ impl App {
             Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserFrame => self.on_browser_frame(),
+            Message::BrowserHistoryTimeout => {
+                self.check_history_travel_timeout();
+                Task::none()
+            }
+            #[cfg(debug_assertions)]
+            Message::BrowserDebugShotTick => self.shoot_browser_window(false),
             Message::OskOpened(id) => self.on_osk_opened(id),
-            Message::Osk(_) => Task::none(),
+            Message::Osk(message) => self.on_osk_message(message),
             #[cfg(debug_assertions)]
             Message::OskCapture => self.capture_osk_window(),
             #[cfg(debug_assertions)]
@@ -2153,19 +2203,17 @@ impl App {
             Message::LauncherOpened(id) => self.on_start_opened(id),
             Message::FinishStartClose => self.finish_start_close(),
             Message::LauncherArtEvent(ev) => self.on_start_art_event(ev),
-            Message::LauncherFrame => {
-                // Debug frame shots used to ride the per-frame engine event;
-                // the shader now pulls frames from the slot, so the 5s shot
-                // cadence lives on the Launcher frame tick.
-                #[cfg(debug_assertions)]
-                {
-                    let shot = self.shoot_browser_window(false);
-                    self.on_start_frame().chain(shot)
+            Message::LauncherFrame => self.on_start_frame(),
+            Message::LauncherIdleTick => {
+                let now = Instant::now();
+                self.tick_start_cursor_idle(now);
+                if self.tick_start_idle(now) {
+                    self.pad_nav.prepare_on_open(false);
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: launcher idle pad re-arm after sleep wake",
+                    );
                 }
-                #[cfg(not(debug_assertions))]
-                {
-                    self.on_start_frame()
-                }
+                Task::none()
             }
             Message::LauncherCursorActivity(id) => {
                 if !crate::platform::debug_quiet::input_dropped() {
@@ -2264,7 +2312,6 @@ impl App {
                 Task::none()
             }
             // Redraw only: the wall-clock spinner phase advances in `view`.
-            Message::RendererReloadTick => Task::none(),
             Message::RendererReloadDue => self.restart_app_for_renderer(),
             Message::UtilityAmbientTick => {
                 crate::ui::backdrop::note_utility_tick();
@@ -3360,10 +3407,10 @@ fn redraw_message_source(message: &Message) -> crate::platform::redraw_stats::Me
         Message::HomeProgressTick => Source::HomeProgress,
         Message::HomeControllerTick => Source::HomeController,
         Message::ShellFadeTick => Source::ShellFade,
-        Message::RendererReloadTick => Source::RendererReload,
-        Message::UpdateSpin => Source::UpdateSpin,
         Message::UtilityAmbientTick => Source::UtilityAmbient,
         Message::EmulatorCommitTick => Source::EmulatorCommit,
+        Message::BrowserDebugShotTick => Source::BrowserFrame,
+        Message::BrowserHistoryTimeout => Source::BrowserFrame,
         Message::AmbientPreviewTick => Source::AmbientPreview,
         Message::Tick => Source::Tick,
         Message::PresenceHint | Message::AbsenceRecheck => Source::PresenceHint,
@@ -3375,7 +3422,9 @@ fn redraw_message_source(message: &Message) -> crate::platform::redraw_stats::Me
             Source::Browser
         }
         Message::Home(_) => Source::Home,
-        Message::Launcher(_) | Message::LauncherKey { .. } => Source::Launcher,
+        Message::Launcher(_) | Message::LauncherKey { .. } | Message::LauncherIdleTick => {
+            Source::Launcher
+        }
         _ => Source::Other,
     }
 }
@@ -3809,7 +3858,6 @@ mod tests {
         assert!(!Message::TrayMenu(crate::ui::tray::QUIT_ID.into()).is_user_input());
         assert!(!Message::Exit.is_user_input());
         assert!(!Message::Tick.is_user_input());
-        assert!(!Message::RendererReloadTick.is_user_input());
         assert!(!Message::RendererReloadDue.is_user_input());
     }
 

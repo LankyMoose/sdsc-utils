@@ -140,6 +140,25 @@ pub struct BrowserAppState {
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
     pub tabs_restored: bool,
+    /// Latest analog sample seen on a pad edge (for the Browser wall clock).
+    pub last_pad_sample: crate::domain::pad::PadSample,
+    pub last_pad_at: Option<Instant>,
+}
+
+impl BrowserAppState {
+    /// True while the Browser window has visual state that changes without an
+    /// app message: cursor velocity/flight/dock morph or an unsent mouse
+    /// position. Gates `BrowserFrame`; CEF presentation is pull-model.
+    pub(crate) fn needs_frames(&self) -> bool {
+        let cursor = &self.panel.cursor;
+        let moving = cursor.vx.abs() > 0.5 || cursor.vy.abs() > 0.5 || cursor.fly_to.is_some();
+        let dock_target = if cursor.attached.is_some() { 1.0 } else { 0.0 };
+        let morphing = (cursor.dock_blend - dock_target).abs() > 0.001;
+        let (qx, qy) = (cursor.x as i32, cursor.y.max(0.0) as i32);
+        let mouse_pending = self.panel.last_sent_mouse != Some((qx, qy));
+        let scroll_pending = self.pending_scroll.0 != 0.0 || self.pending_scroll.1 != 0.0;
+        moving || morphing || mouse_pending || scroll_pending
+    }
 }
 
 use iced::Task;
@@ -1594,7 +1613,12 @@ impl super::App {
         if !self.browser_visible {
             return Task::none();
         }
-        self.check_history_travel_timeout();
+        // Wall clock, not pad stream: friction, D-pad flights, and dock morphs
+        // settle even after the HID edges stop. History timeout and debug
+        // shots have their own timers now.
+        let now = Instant::now();
+        let sample = self.browser_frame_sample(now);
+        self.advance_browser_cursor(&sample, now);
         // Cursor glides and script-driven scroll still need one mouse sync
         // per paint even when no new pad edge arrived.
         if let Some(engine) = &self.browser.engine {
@@ -1610,16 +1634,7 @@ impl super::App {
                 });
             }
         }
-        let sync = self.sync_browser_mouse();
-        #[cfg(debug_assertions)]
-        {
-            let shot = self.shoot_browser_window(false);
-            sync.chain(shot)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            sync
-        }
+        self.sync_browser_mouse()
     }
 }
 
