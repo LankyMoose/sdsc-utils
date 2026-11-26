@@ -1413,7 +1413,8 @@ impl App {
                 // focus/autofocus event never opens it (Cross is the only
                 // opener).
                 if !editable {
-                    self.close_osk_if_target(crate::ui::osk::OskTarget::BrowserPage, "page_blur");
+                    return self
+                        .close_osk_if_target(crate::ui::osk::OskTarget::BrowserPage, "page_blur");
                 }
             }
             EngineEvent::LoadFinished {

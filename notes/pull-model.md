@@ -45,7 +45,9 @@ they are not the integrator for analog state.
   unrelated frame.
 - Overlays shown with raw `ShowWindow(SW_SHOWNOACTIVATE)` must hide with raw
   `host::hide` (`hide_overlay_without_activate`); `set_mode(Hidden)` no-ops
-  because winit still thinks the window is hidden.
+  because winit still thinks the window is hidden. Event-driven close helpers
+  must **return** the hide `Task`; never `let _ = close_osk(...)`, or the
+  window stays topmost after a page-blur/search navigation.
 
 ## Checklist for a new animated surface
 

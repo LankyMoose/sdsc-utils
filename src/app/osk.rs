@@ -147,10 +147,17 @@ impl App {
     }
 
     /// Close only when the OSK is currently targeting `target` (e.g. the page
-    /// text session blurred).
-    pub(crate) fn close_osk_if_target(&mut self, target: OskTarget, reason: &'static str) {
+    /// text session blurred). Returns the hide task so event-driven callers do
+    /// not drop the raw `ShowWindow(SW_HIDE)` (the window would stay topmost).
+    pub(crate) fn close_osk_if_target(
+        &mut self,
+        target: OskTarget,
+        reason: &'static str,
+    ) -> Task<Message> {
         if self.osk.state.open && self.osk.state.target == Some(target) {
-            let _ = self.close_osk(reason);
+            self.close_osk(reason)
+        } else {
+            Task::none()
         }
     }
 
