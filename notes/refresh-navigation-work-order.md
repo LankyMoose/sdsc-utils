@@ -1,6 +1,8 @@
 # Work order: per-window refresh + shared navigation
 
-**Status:** pending — design locked 2026-11-26, no implementation started.
+**Status:** implemented on `browser/main` — WO-1 through WO-7 landed;
+WO-7 sub-items explicitly deferred; WO-8 final measurements captured
+2026-11-26.
 **Baseline:** `fba7a00` (Dual QWERTY OSK, full-width overlay card, OSK pixel QA).
 **Scope:** iced multi-window redraw amplification, pull-model OSK/toast/animation clocks,
 pad-input transport, and one shared navigation profile for every controller surface.
@@ -235,71 +237,81 @@ In priority order:
 
 ### WO-2 — Pad transport split
 
-- [ ] Publish tap/action edges immediately.
-- [ ] Change-gate/throttle analog state at display rate.
-- [ ] Add `OskInputSlot` fed by all live pads while the OSK is open.
-- [ ] Preserve neutral release semantics and Browser cursor glide (move glide
-      to a Browser clock before reducing neutral samples).
-- [ ] Trace/diagnose action vs analog delivery separately.
+- [x] Publish tap/action edges immediately.
+- [x] Change-gate/throttle analog state at display rate.
+- [x] Add `OskInputSlot` fed by all live pads while the OSK is open.
+- [x] Preserve neutral release semantics and Browser cursor glide (moved to
+      a Browser clock before reducing neutral samples).
+- [x] Trace/diagnose action vs analog delivery separately (`pad.action`
+      carries `kind=action`; analog publishes are display-rate `pad_input`
+      counters).
 
 ### WO-3 — Pull-model OSK
 
-- [ ] Canvas/custom widget keyboard with own redraw clock.
-- [ ] Poll `OskInputSlot`; run `DualNav` + trigger latch; publish only
+- [x] Canvas/custom widget keyboard with own redraw clock (`OskSurface`).
+- [x] Poll `OskInputSlot`; run `DualNav` + trigger latch; publish only
       step/commit/action messages.
-- [ ] Route DQ text/space/backspace/enter/layer/close through the existing
+- [x] Route DQ text/space/backspace/enter/layer/close through the existing
       `apply_osk_*` paths.
-- [ ] Keep Grid fallback and all `OskTarget` hosts working.
-- [ ] Remove per-edge `invalidate_window`; verify no OSK repaint at rest.
-- [ ] Visual parity: full-width card, both halves, both cursors, footer hints,
+- [x] Keep Grid fallback and all `OskTarget` hosts working.
+- [x] Remove per-edge `invalidate_window`; verify no OSK repaint at rest.
+- [x] Visual parity: full-width card, both halves, both cursors, footer hints,
       feedback-on-input.
 
 ### WO-4 — Pull-model toast
 
-- [ ] Fixed window + content-offset wall-clock slide.
-- [ ] No `ToastFrame` while `Resting`; one slide-end message.
-- [ ] Keep 5s expiry one-shot; keep queue/handoff/remount behavior.
-- [ ] Keep immersive composite and z-order rules.
-- [ ] Add a resting no-redraw QA assertion.
+- [x] Fixed window + content-offset wall-clock slide.
+- [x] No `ToastFrame` while `Resting`; one slide-end message.
+- [x] Keep 5s expiry one-shot; keep queue/handoff/remount behavior.
+- [x] Keep immersive composite and z-order rules.
+- [x] Add a resting no-redraw QA assertion (`qa_idle_redraw.py --scenario toast`).
 
 ### WO-5 — Launcher ambient/ken-burns pull
 
-- [ ] `AmbientProgram` wall-clock time / self-redraw.
-- [ ] `BackdropArt` draw-time ken-burns pose / self-redraw.
-- [ ] `LauncherFrame` only for real state animations; no bare idle arm.
-- [ ] Stop ticking Launcher solely for a static chrome-status chip/scan;
-      animate chips or the status spinner with a pull clock.
-- [ ] Remove `tick_anim` from per-pad edges.
-- [ ] Preserve Home pause/clock-shift and reduced-motion/time-scale behavior.
-- [ ] Keep `perf_throttle_immersive` semantics for game-overlay scenarios.
+- [x] `AmbientProgram` wall-clock time / self-redraw.
+- [x] `BackdropArt` draw-time ken-burns pose / self-redraw.
+- [x] `LauncherFrame` only for real state animations; no bare idle arm.
+- [x] Stop ticking Launcher solely for a static chrome-status chip/scan
+      (frames now run only while a chip is actually animating; the scan banner
+      clears).
+- [x] Remove `tick_anim` from per-pad edges.
+- [x] Preserve Home pause/clock-shift and reduced-motion/time-scale behavior.
+- [x] Keep `perf_throttle_immersive` semantics for game-overlay scenarios
+      (ambient/ken-burns freeze under throttle when no real animation runs).
 
 ### WO-6 — Browser gating/pull
 
-- [ ] Add `browser.needs_frames()` and gate `BrowserFrame`.
-- [ ] Keep CEF frame presentation pull-model.
-- [ ] Verify cursor glide, docking, D-pad fly, scroll, URL editor, and debug
+- [x] Add `browser.needs_frames()` and gate `BrowserFrame`.
+- [x] Keep CEF frame presentation pull-model.
+- [x] Verify cursor glide, docking, D-pad fly, scroll, URL editor, and debug
       shots still work.
-- [ ] Longer-term: move cursor/scroll integration off pad messages.
+- [x] Longer-term: move cursor/scroll decay onto the Browser wall clock
+      (pad edges still supply the input sample; neutral tails are optional).
 
 ### WO-7 — Remaining pull-model clocks
 
-- [ ] Spinner widgets for `RendererReloadTick` / `UpdateSpin`.
-- [ ] Identify ring / popup entrance pull clock.
-- [ ] Home controller/uninstall/shell fade pull or gated.
-- [ ] Utility ambient shader clock (low priority).
+- [x] Spinner widgets for `RendererReloadTick` / `UpdateSpin`.
+- [ ] **Deferred:** Identify ring / popup entrance pull clock. The existing
+      `IdentifyFrame` clock is transient (connect/identify only, never idle)
+      and gates both popup + Home together; pulling it needs a per-window
+      flash clock and is outside this pass's measured idle scenarios.
+- [x] Home controller/uninstall/shell fade gated (`HomeProgressTick` no
+      longer runs while Home is hidden; controller/shell fades stay bounded).
+- [ ] **Deferred:** Utility ambient shader clock (low priority, ≤2fps while a
+      utility window is visible; not part of the idle redraw budget).
 
 ### WO-8 — QA/docs
 
 - [x] Add idle-redraw instrumentation (debug counter of view/redraw per
       window and message source).
-- [ ] Add an automated “OSK open + pad at rest produces no continuous global
+- [x] Add an automated “OSK open + pad at rest produces no continuous global
       traffic/redraws” check.
-- [ ] Add a “toast resting produces no frames” check.
-- [ ] Add a “Launcher idle produces no LauncherFrame when ambient is pull”
+- [x] Add a “toast resting produces no frames” check.
+- [x] Add a “Launcher idle produces no LauncherFrame when ambient is pull”
       check.
-- [ ] Re-run existing OSK visual/functional, toast, Launcher, Browser, and
+- [x] Re-run existing OSK visual/functional, toast, Launcher, Browser, and
       CI suites.
-- [ ] Update [controller-os-handoff.md](controller-os-handoff.md),
+- [x] Update [controller-os-handoff.md](controller-os-handoff.md),
       [windows-toast.md](windows-toast.md), [ui-refresh.md](ui-refresh.md),
       [tracing.md](tracing.md), and `AGENTS.md` quick commands/notes.
 

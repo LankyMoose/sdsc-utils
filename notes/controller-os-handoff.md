@@ -395,9 +395,12 @@ LEFT                          RIGHT
 
 - Cursors start on **D** and **K** (home row, middle column).
 - Movement is one key per stick step; edges clamp, they do not wrap.
-- The shared `NavStepper` supplies the repeat schedule (280ms initial delay,
-  90ms repeat, 100ms neutral release grace).
-- Both cursors move independently and are always highlighted.
+- The shared `NavProfile::MENU` supplies the gate/repeat schedule (per-axis
+  `0.9` + residual `0.15`, 280ms initial delay, 90ms repeat, 100ms neutral
+  release grace). DQ applies it per stick; the old light-touch `0.12` path is
+  gone by design.
+- Both cursors move independently and are always highlighted. Every live pad
+  arms independently and the first step per half wins each tick.
 - Symbol layer preserves both cursor positions (same 3x5 index):
 
 ```text
@@ -416,8 +419,14 @@ LEFT                          RIGHT
 - **Cross** is Space, **Triangle** Backspace, **Square** Alpha/Symbols,
   **Options** Enter, **Circle** Close.
 - Opening/closing/layer reset the cursor state; layer changes keep positions.
-- `PadSample.lstick_x/y` and `rstick_x/y` use the soft `0.12` deadzone; the
-  sticks are navigation only, not text commit gestures.
+- `PadSample.lstick_x/y` and `rstick_x/y` are shaped by `NavProfile::MENU`
+  before the DQ stepper; the sticks are navigation only, not text commit
+  gestures.
+- Pull model: the overlay's `OskSurface` widget polls `OskInputSlot` at redraw
+  time and runs `DualNav`/`NavBank`. The app only receives discrete
+  `OskMessage::{Step,Commit,GridStep}` plus immediate source-side taps; there
+  is no per-sample `PadInput` navigation and no per-edge OSK invalidation.
+  While the pad is at rest the OSK gets no messages and does not repaint.
 
 ### Controls
 
@@ -698,6 +707,10 @@ Replay/pixel QA:
 - System OSK QA — first Cross on a page field opens; DQ types from both halves;
   Grid fallback via `SDSC_OSK_MODE=grid`; mouse/keyboard close + hand-off;
   `qa_osk_visual.py` screenshots the overlay and asserts both halves/cursors.
+- Idle-redraw QA — `qa_idle_redraw.py` opens Browser+OSK / toast / Launcher /
+  Browser with `SDSC_DEBUG_REDRAW=1` and asserts no pad-driven global traffic
+  or OSK repaint at rest, no resting `ToastFrame`, no idle `LauncherFrame`, and
+  no idle `BrowserFrame`.
 - Non-browser OSK QA — Launcher Settings Title/Args editing; save/add path.
 - Manual controller playtest for DQ cursor feel, overlay z-order, no-activate
   focus, Home/OSK interaction.

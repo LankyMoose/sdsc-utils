@@ -13,6 +13,7 @@ Goal: bring the tray popup, Settings (configure), toasts up to the visual langua
 2. **Window sizes may grow.** Settings ~720×520 (from 420×400); Launcher may grow too.
 3. **Font:** keep iced's default font. Hierarchy comes from size/weight/color only.
 4. **Utility-window backdrop: nearly static.** Ambient shader with frozen (or ~2 fps) time in popup / Settings; no continuous redraw from idle utility windows. Full-motion ambient stays Launcher-only.
+5. **Per-window clocks (refresh work order).** High-frequency visuals own a pull-model widget clock (`Shell::request_redraw_at` / canvas/shader `Action::request_redraw_at`) instead of a global iced subscription: Launcher ambient (`AmbientProgram::animate`) and ken-burns (`BackdropArt`), Browser cursor/scroll (`BrowserAppState::needs_frames`), toast slide, OSK input (`OskSurface`), and spinners. A global `time::every` still rebuilds every window, so keep those for real state only. Idle checks: `python scripts/qa_idle_redraw.py --assert`.
 
 ## Immersive language (source of truth)
 

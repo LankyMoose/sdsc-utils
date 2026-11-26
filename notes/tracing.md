@@ -254,3 +254,59 @@ Rules:
   surface-specific semantic actions are instrumented.
 - Replay currently covers browser navigation/history. Add adapters per app;
   do not grow the trace core per app.
+
+## Idle-redraw counters (debug builds)
+
+`src/platform/redraw_stats.rs` counts, per process:
+
+- `view.<window>` — how many times iced rebuilt that window's view
+  (`popup`, `settings`, `osk`, `browser`, `home`, `launcher`, `toast`,
+  `preview`, `shell`).
+- `msg.<source>` — dispatched app messages by class. Focus counters:
+  `pad_input`, `launcher_frame`, `browser_frame`, `toast_frame`,
+  `identify_frame`, `home_progress`, `home_controller`, `shell_fade`,
+  `renderer_reload`, `update_spin`, `utility_ambient`, `tick`,
+  `browser_engine`, `osk`, `browser`, `home`, `launcher`, `other`.
+
+Opt in with `SDSC_DEBUG_REDRAW=1`. A plain OS thread appends a cumulative
+snapshot to `app.log` every 2s without touching the iced loop:
+
+```text
+ui-redraw: reason=periodic t_ms=4000 views[osk=12 ...] msgs[pad_input=0 ...]
+```
+
+Compare two snapshots (the QA script uses the last two). The counter thread is
+started after the CEF subprocess dispatch so renderer/GPU children do not write
+to the same log. `redraw_stats::snapshot("mark")` is available for a bracketed
+manual snapshot. Compiled out of release builds.
+
+## Pad trace
+
+`src/platform/trace` records `pad.action` (source-side taps/holds) with
+`kind=action`, `edge_seq`, `reason`, `readings`, and the ordered action list.
+Analog delivery is deliberately not traced per sample; measure it with the
+`msg.pad_input` counter instead. While the OSK is open, analog data goes to
+`OskInputSlot` and is polled by `OskSurface`; the app receives only discrete
+`OskMessage` steps/commits plus immediate taps.
+
+## Commands
+
+```bash
+# Manual snapshots for one scenario (OSK, toast, launcher, browser)
+python scripts/qa_idle_redraw.py --scenario osk
+python scripts/qa_idle_redraw.py --scenario toast
+python scripts/qa_idle_redraw.py --scenario launcher
+python scripts/qa_idle_redraw.py --scenario browser
+
+# Post-migration budgets (fails on pad/OSK/toast/Launcher/Browser idle traffic)
+python scripts/qa_idle_redraw.py --scenario osk --assert
+python scripts/qa_idle_redraw.py --scenario launcher --assert
+
+# Action timeline / replay tracing
+sdsc-utils --trace-last
+sdsc-utils --trace-failures
+```
+
+The QA script seeds its own `SDSC_DATA_DIR`, disables the boot update check and
+points the Browser at a local blank page, so only presence ticks (and the
+scenario's own clocks) can appear in a quiet window.
