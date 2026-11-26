@@ -111,6 +111,10 @@ pub(crate) struct ReplayWait {
     /// Wait for a nonempty focusable set for the current document
     /// (cursor.dock).
     pub needs_focusables: bool,
+    /// Wait for a focusable tree newer than this generation. A cursor nudge
+    /// culls the next tree around the landing point; the following
+    /// directional step must read that tree, not the pre-jump one.
+    pub focusables_after: Option<u64>,
     /// Wait for a new CEF paint generation after a navigation.
     pub needs_frame: bool,
     pub frame_mark: u64,
@@ -492,6 +496,14 @@ impl super::App {
             "pad.dir" => {
                 wait.needs_redraw = true;
                 wait.needs_cursor_idle = true;
+                // A nudge ends with a DOM reseed around the landing point. The
+                // next direction reads the freshly culled target set, so wait
+                // for that tree instead of the pre-jump one. A no-op press
+                // leaves the cursor in place and needs no reseed.
+                if self.browser.panel.cursor.snapshot().fly_to.is_some() {
+                    wait.needs_focusables = true;
+                    wait.focusables_after = Some(self.browser.panel.page.focusables_generation);
+                }
             }
             _ => {
                 wait.needs_redraw = true;
@@ -539,6 +551,9 @@ impl super::App {
             let current_url = self.browser.panel.session.url();
             if self.browser.panel.page.focusables.is_empty()
                 || self.browser.panel.page.focusables_url.as_deref() != Some(current_url)
+                || wait
+                    .focusables_after
+                    .is_some_and(|mark| self.browser.panel.page.focusables_generation <= mark)
             {
                 return false;
             }

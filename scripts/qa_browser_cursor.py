@@ -45,6 +45,32 @@ PAGE = """<!doctype html>
 </body></html>
 """
 
+# Wide top bar: the far-right link is >500px from the left pair, and the
+# decoy sits down-left of it. The DOM cull used to keep only the decoy as the
+# "nearest left" target, which the cursor's directional test then rejected
+# (out of the row band), so Left stopped working after a Right nudge.
+PAGE_ROW = """<!doctype html>
+<html><head><meta charset="utf-8"><title>cursor row qa</title>
+<style>
+  html, body { margin:0; width:100%; height:100%; background:#f4f1ea; }
+  a { position:absolute; display:block; height:26px; color:#fff;
+      font:16px sans-serif; line-height:26px; text-align:center;
+      text-decoration:none; background:#34495e; }
+  #l1 { left:21px; top:17px; width:47px; }
+  #l2 { left:78px; top:17px; width:43px; }
+  #r1 { left:1484px; top:17px; width:34px; height:24px; line-height:24px; }
+  #r2 { left:1533px; top:17px; width:43px; height:24px; line-height:24px; }
+  #decoy { left:1105px; top:384px; width:97px; height:36px; line-height:36px; }
+</style></head>
+<body>
+<a id="l1" href="#l1">L1</a>
+<a id="l2" href="#l2">L2</a>
+<a id="r1" href="#r1">R1</a>
+<a id="r2" href="#r2">R2</a>
+<a id="decoy" href="#decoy">D</a>
+</body></html>
+"""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -78,6 +104,8 @@ def main() -> int:
     session.mkdir(parents=True, exist_ok=True)
     page = session / "cursor.html"
     page.write_text(PAGE, encoding="utf-8")
+    row_page = session / "cursor-row.html"
+    row_page.write_text(PAGE_ROW, encoding="utf-8")
     actions = [
         {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
         {"app": "browser", "action": "cursor.dock", "params": {"x": 150, "y": 100}},
@@ -85,6 +113,10 @@ def main() -> int:
         {"app": "browser", "action": "pad.dir", "params": {"dir": "down"}},
         {"app": "browser", "action": "pad.dir", "params": {"dir": "left"}},
         {"app": "browser", "action": "pad.dir", "params": {"dir": "up"}},
+        {"app": "browser", "action": "navigate", "params": {"url": row_page.as_uri()}},
+        {"app": "browser", "action": "cursor.dock", "params": {"x": 100, "y": 30}},
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "right"}},
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "left"}},
         {"app": "browser", "action": "wait", "params": {}},
     ]
     with (session / "actions.jsonl").open("w", encoding="utf-8") as out:
@@ -153,10 +185,10 @@ def main() -> int:
         timeouts = [row for row in platform if row.get("event") == "replay.settle_timeout"]
         print(f"sandbox={sandbox}")
         print(f"jumps={len(jumps)} frames={len(frames)} timeouts={len(timeouts)}")
-        if len(jumps) != 4:
-            print(f"error: expected 4 D-pad jumps, got {len(jumps)}", file=sys.stderr)
+        if len(jumps) != 6:
+            print(f"error: expected 6 D-pad jumps, got {len(jumps)}", file=sys.stderr)
             return 1
-        if len(frames) < 8:
+        if len(frames) < 12:
             print(f"error: expected tween frames, got {len(frames)}", file=sys.stderr)
             return 1
         if timeouts:
@@ -166,9 +198,27 @@ def main() -> int:
             )
             return 1
 
+        # The wide top-bar flow: Right must reach the far right link and Left
+        # must come back to the same row's left link, not a no-op.
+        right, left = jumps[-2], jumps[-1]
+        if right.get("dir") != "Right" or float(right.get("to_x", 0)) < 1400:
+            print(f"error: row Right nudge did not reach the far link: {right}", file=sys.stderr)
+            return 1
+        if left.get("dir") != "Left" or float(left.get("to_x", 1e9)) > 200:
+            print(
+                "error: row Left nudge after Right did not return to the left link: "
+                f"{left}",
+                file=sys.stderr,
+            )
+            return 1
+
         # Every jump must land before the next press starts, or the test is
-        # measuring a mid-flight retarget rather than a clean nudge.
+        # measuring a mid-flight retarget rather than a clean nudge. Jump 4
+        # (index 4) starts the second page after a dock reset, so it is not a
+        # continuation of the first page's final landing.
         for index in range(1, len(jumps)):
+            if index == 4:
+                continue
             prev = jumps[index - 1]
             cur = jumps[index]
             dx = abs(float(cur.get("from_x", 0)) - float(prev.get("to_x", 0)))

@@ -53,7 +53,9 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 - `src/browser/dom.rs` — DOM target query JS. CEF polls it from the page's
   V8 context through a renderer-process message bridge; the browser process
   parses the JSON. Stable per-document ids, viewport boxes, visibility,
-  overflow clipping, scroll truth, document extent, and autofocus id.
+  overflow clipping, scroll truth, document extent, and autofocus id. The
+  500px cursor cull always keeps a target sharing the cursor's row/column
+  band per direction, not merely the nearest diagonal one.
 - `src/browser/cursor.rs` — controller cursor: analog free point, magnet
   dock with hysteresis/break-free, D-pad flights, unified page+header space,
   row-locked horizontals, R2 turbo.
@@ -69,7 +71,9 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 - `src/ui/browser/state.rs` / `view.rs` — panel state + standalone-window
   rendering and `BrowserMessage`. The header is one centred row inside the
   16:9 card: `‹ L1 · BACK` · URL well · `FORWARD · R1 ›`. Each history cluster
-  is one capsule; labels are 10px dim, keys monospace accent, separator `·`.
+  is one capsule; labels are 10px dim, keys monospace accent, and the
+  separator is a 3px filled circle centred on the key/label line (not a font
+  glyph, which would ride the baseline).
   The URL well is 420–680px wide; equal side slots keep it centred with an 8px
   gap to each capsule. `BrowserPanel` owns the URL draft/edit state; the page
   starts below a 44px row + 1px rule.
@@ -136,7 +140,9 @@ meters still use the legacy per-surface bank.
   starts the tween with stale time. The Browser D-pad repeat is 180ms, longer
   than the tween, so holding a direction lands each hop instead of retargeting
   mid-flight; an explicit retarget keeps the current wrap rect as its morph
-  origin.
+  origin. The 500px DOM cull keeps a band-aligned target per direction, so a
+  right hop onto a far top-bar link still leaves its same-row left neighbour
+  in the live set for the return hop.
 - R2 turbo doubles cursor acceleration/cap and scroll speed while held and
   disables docking; release re-snaps in place.
 - Right stick scrolls only while the cursor is over the page. Scroll

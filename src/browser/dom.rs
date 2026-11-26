@@ -311,18 +311,47 @@ const DOM_QUERY_BODY: &str = r###"(function(){
     } catch (e) { skErr++; }
   })(boxless[bi][0], boxless[bi][1]); }
   // Pass 2: cursor cull (500px radius) + directional keep. The live set is
-  // what the cursor can actually reach; the nearest target strictly in each
-  // direction always survives so arrow-key jumps never strand. No cursor yet
+  // what the cursor can actually reach; one target per direction always
+  // survives so arrow-key jumps never strand — a target sharing the cursor's
+  // row/column band wins over a nearer diagonal. No cursor yet
   // (__sdsc_cc false) keeps everything. Verdicts, clip walks, and text
   // extraction all stay in the emit below so geometrically-culled rows pay
-  // for none of them. Cursor-culled ids ride along in `ccull` so the
-  // backend retains them with translated rects instead of churning
-  // fresh/drop every pull (the set would never stabilize while scrolling).
+  // for none of them. Cursor-culled ids ride along in `ccull` for
+  // diagnostics; the next pull around the landing point re-admits them.
   var R2 = 500 * 500;
   var best = {up: null, down: null, left: null, right: null};
   var ccull = [];
   var ci, cr, cdx, cdy, dirs, di, dd, score;
   if (__sdsc_cc) {
+    // Row/column band of the target under the cursor. The cursor centre is
+    // the docked target's centre after a jump/acquire, so the nearest-centred
+    // candidate containing the point is that target. Raw nearest-per-
+    // direction culling without this discarded the actual same-row link in
+    // favour of a diagonal target below (Google's top bar: the far-left link
+    // is farther than a result link down-left), which left Left/Right with
+    // nothing the directional jump accepts.
+    var band = null, bandD = Infinity;
+    for (ci = 0; ci < cands.length; ci++) {
+      cr = cands[ci][3];
+      if (cr.x <= __sdsc_cx && __sdsc_cx <= cr.x + cr.width &&
+          cr.y <= __sdsc_cy && __sdsc_cy <= cr.y + cr.height) {
+        cdx = (cr.x + cr.width / 2) - __sdsc_cx;
+        cdy = (cr.y + cr.height / 2) - __sdsc_cy;
+        score = cdx * cdx + cdy * cdy;
+        if (score < bandD) {
+          bandD = score;
+          band = [cr.x, cr.x + cr.width, cr.y, cr.y + cr.height];
+        }
+      }
+    }
+    function sameBand(dir, r) {
+      if (dir === 'left' || dir === 'right') {
+        if (r.y <= __sdsc_cy && __sdsc_cy <= r.y + r.height) return true;
+        return !!(band && r.y < band[3] && band[2] < r.y + r.height);
+      }
+      if (r.x <= __sdsc_cx && __sdsc_cx <= r.x + r.width) return true;
+      return !!(band && r.x < band[1] && band[0] < r.x + r.width);
+    }
     for (ci = 0; ci < cands.length; ci++) {
       cr = cands[ci][3];
       cdx = (cr.x + cr.width / 2) - __sdsc_cx;
@@ -335,7 +364,10 @@ const DOM_QUERY_BODY: &str = r###"(function(){
       if (cdx > 0) dirs.push(['right', cdx, Math.abs(cdy)]);
       for (di = 0; di < dirs.length; di++) {
         dd = dirs[di];
-        score = dd[1] + 2 * dd[2];
+        // Prefer a target sharing the cursor's band, matching the cursor's
+        // own band-first jump ranking; fall back to the nearest diagonal so
+        // every direction still has a step.
+        score = (sameBand(dd[0], cr) ? 0 : 1e7) + dd[1] + 2 * dd[2];
         if (!best[dd[0]] || score < best[dd[0]][1]) best[dd[0]] = [ci, score];
       }
       cands[ci].push(false);

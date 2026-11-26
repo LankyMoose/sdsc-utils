@@ -1275,6 +1275,12 @@ impl App {
             EngineEvent::A11yTree { tab: _, url, items } => {
                 self.browser.panel.page.focusables = items;
                 self.browser.panel.page.focusables_url = Some(url);
+                self.browser.panel.page.focusables_generation = self
+                    .browser
+                    .panel
+                    .page
+                    .focusables_generation
+                    .wrapping_add(1);
                 let targets = self.browser.panel.page.focusables.clone();
                 self.browser.panel.page.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
@@ -1416,6 +1422,8 @@ impl App {
                 EngineEvent::A11yTree { url, items, .. } => {
                     stored.page.focusables = items;
                     stored.page.focusables_url = Some(url);
+                    stored.page.focusables_generation =
+                        stored.page.focusables_generation.wrapping_add(1);
                     let all = stored.page.focusables.clone();
                     stored.page.cursor.retarget(&all);
                 }

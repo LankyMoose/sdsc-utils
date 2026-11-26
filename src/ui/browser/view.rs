@@ -212,16 +212,42 @@ fn history_hint(
         parts.push(header_icon(icon, ICON_SIZE, icon_color));
     }
     let key_text = || {
-        text(key)
-            .size(KEY_SIZE)
-            .font(Font::MONOSPACE)
-            .color(theme::scale_alpha(theme::ACCENT, alpha))
-            .into()
+        // The monospace key's cap is one pixel taller than the label's. Row
+        // centre aligns line boxes, which leaves the taller cap optically
+        // high; two pixels of top padding shifts the ink down one pixel
+        // without moving any other part of the cluster.
+        container(
+            text(key)
+                .size(KEY_SIZE)
+                .font(Font::MONOSPACE)
+                .color(theme::scale_alpha(theme::ACCENT, alpha)),
+        )
+        .padding(Padding {
+            top: 2.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .into()
     };
-    let dot_text = || {
-        text("·")
-            .size(12.0)
-            .color(theme::scale_alpha(theme::MUTED, alpha * 0.8))
+    let dot = || {
+        // A real circle, not a font glyph: `·` rides the baseline and reads
+        // low inside a centre-aligned row. The 3px box centres exactly with
+        // the key/label/icon line.
+        container(space())
+            .width(Length::Fixed(3.0))
+            .height(Length::Fixed(3.0))
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(theme::scale_alpha(
+                    theme::MUTED,
+                    alpha * 0.8,
+                ))),
+                border: iced::Border {
+                    radius: 1.5.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            })
             .into()
     };
     let label_text = || {
@@ -231,9 +257,9 @@ fn history_hint(
             .into()
     };
     if key_first {
-        parts.extend([key_text(), dot_text(), label_text()]);
+        parts.extend([key_text(), dot(), label_text()]);
     } else {
-        parts.extend([label_text(), dot_text(), key_text()]);
+        parts.extend([label_text(), dot(), key_text()]);
     }
     if !icon_first {
         parts.push(header_icon(icon, ICON_SIZE, icon_color));

@@ -63,6 +63,10 @@ pub struct BrowserTabPage {
     /// Document URL that produced `focusables`. Replay docking rejects a
     /// tree from the pre-navigation document.
     pub focusables_url: Option<String>,
+    /// Bumped on every accessibility tree. Replay waits for the tree culled
+    /// around a finished cursor nudge before starting the next directional
+    /// step, so the step reads the target set it will actually navigate.
+    pub focusables_generation: u64,
     /// Bumped on every page title change. Replay waits for selection/scroll
     /// title reports before the next synthetic input.
     pub title_generation: u64,
