@@ -1422,6 +1422,7 @@ impl App {
                 }
                 "home" => tasks.push(self.open_home()),
                 "browser" => tasks.push(self.open_browser_window()),
+                "osk" => tasks.push(self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage)),
                 "launcher" => tasks.push(self.open_launcher()),
                 "launcher-edit" => {
                     tasks.push(self.open_launcher());
@@ -1725,6 +1726,8 @@ impl App {
     }
 
     fn view_inner(&self, window: window::Id) -> Element<'_, Message> {
+        #[cfg(debug_assertions)]
+        crate::platform::redraw_stats::note_view(self.redraw_window_kind(window));
         if Some(window) == self.popup_window {
             return popup_view::view(
                 &self.popup_state,
@@ -1920,6 +1923,8 @@ impl App {
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
+        #[cfg(debug_assertions)]
+        crate::platform::redraw_stats::note_message(redraw_message_source(&message));
         // Effective reduce-motion gate (prefs choice vs OS "Show animations"
         // toggle): synced on every update so pad/keyboard/mouse-initiated
         // anims gate instantly, even with an idle Launcher (no LauncherFrame) or
@@ -3310,6 +3315,64 @@ impl App {
             ToastMessage::enqueue(&mut self.toast_queue, message);
         }
         self.show_next_toast()
+    }
+
+    /// Coarse window identity for the debug redraw counters (Phase 0 / WO-8).
+    #[cfg(debug_assertions)]
+    fn redraw_window_kind(&self, window: window::Id) -> crate::platform::redraw_stats::WindowKind {
+        use crate::platform::redraw_stats::WindowKind;
+        if Some(window) == self.popup_window {
+            WindowKind::Popup
+        } else if Some(window) == self.configure_window {
+            WindowKind::Settings
+        } else if Some(window) == self.osk.window {
+            WindowKind::Osk
+        } else if Some(window) == self.browser_window {
+            WindowKind::Browser
+        } else if Some(window) == self.home_window {
+            WindowKind::Home
+        } else if Some(window) == self.launcher_window {
+            WindowKind::Launcher
+        } else if Some(window) == self.toast_window {
+            WindowKind::Toast
+        } else if Some(window) == self.preview_window {
+            WindowKind::Preview
+        } else {
+            WindowKind::Shell
+        }
+    }
+}
+
+/// Debug-only source class for the idle-redraw counters.
+#[cfg(debug_assertions)]
+fn redraw_message_source(message: &Message) -> crate::platform::redraw_stats::MessageSource {
+    use crate::platform::redraw_stats::MessageSource as Source;
+    match message {
+        Message::PadInput(_) => Source::PadInput,
+        Message::LauncherFrame => Source::LauncherFrame,
+        Message::BrowserFrame => Source::BrowserFrame,
+        Message::ToastFrame => Source::ToastFrame,
+        Message::IdentifyFrame => Source::IdentifyFrame,
+        Message::HomeProgressTick => Source::HomeProgress,
+        Message::HomeControllerTick => Source::HomeController,
+        Message::ShellFadeTick => Source::ShellFade,
+        Message::RendererReloadTick => Source::RendererReload,
+        Message::UpdateSpin => Source::UpdateSpin,
+        Message::UtilityAmbientTick => Source::UtilityAmbient,
+        Message::EmulatorCommitTick => Source::EmulatorCommit,
+        Message::AmbientPreviewTick => Source::AmbientPreview,
+        Message::Tick => Source::Tick,
+        Message::PresenceHint | Message::AbsenceRecheck => Source::PresenceHint,
+        Message::PollResult(_) => Source::PollResult,
+        Message::LauncherArtEvent(_) => Source::LauncherArt,
+        Message::BrowserEngine(_) => Source::BrowserEngine,
+        Message::Osk(_) => Source::Osk,
+        Message::Browser(_) | Message::BrowserRawKey { .. } | Message::BrowserIme { .. } => {
+            Source::Browser
+        }
+        Message::Home(_) => Source::Home,
+        Message::Launcher(_) | Message::LauncherKey { .. } => Source::Launcher,
+        _ => Source::Other,
     }
 }
 

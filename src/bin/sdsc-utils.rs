@@ -43,6 +43,9 @@ fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
 
+    #[cfg(debug_assertions)]
+    sdsc_utils::platform::redraw_stats::init();
+
     // Pin the rustls provider before the updater (or any other TLS client)
     // touches it; no-op if a default is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

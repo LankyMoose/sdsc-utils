@@ -290,7 +290,7 @@ In priority order:
 
 ### WO-8 — QA/docs
 
-- [ ] Add idle-redraw instrumentation (debug counter of view/redraw per
+- [x] Add idle-redraw instrumentation (debug counter of view/redraw per
       window and message source).
 - [ ] Add an automated “OSK open + pad at rest produces no continuous global
       traffic/redraws” check.

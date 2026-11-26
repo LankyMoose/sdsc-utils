@@ -9,6 +9,8 @@ pub mod file_icon;
 pub mod host;
 pub mod packaged;
 pub mod prev_instance;
+#[cfg(debug_assertions)]
+pub mod redraw_stats;
 pub mod steam_watch;
 pub mod trace;
 pub mod ui_sound;
