@@ -1769,6 +1769,14 @@ pub fn soft_stick(x: f32, y: f32) -> (f32, f32) {
     (x, y)
 }
 
+/// Right-stick scroll shaping (same soft touch as the cursor, separate profile).
+pub fn soft_scroll(x: f32, y: f32) -> (f32, f32) {
+    let deadzone = NavProfile::SCROLL.axis_deadzone;
+    let x = if x.abs() < deadzone { 0.0 } else { x };
+    let y = if y.abs() < deadzone { 0.0 } else { y };
+    (x, y)
+}
+
 /// Per-pad edge / hold / arming state for launcher navigation.
 #[derive(Debug, Clone, Default)]
 struct PadSlot {

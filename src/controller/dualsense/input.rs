@@ -1,7 +1,7 @@
 //! DualSense input-report parsing into the shared [`PadSample`] nav contract.
 
 use crate::domain::gesture::GestureControl;
-use crate::domain::pad::{PadSample, combined_stick, soft_stick};
+use crate::domain::pad::{PadSample, combined_stick, soft_scroll, soft_stick};
 use std::collections::BTreeSet;
 
 const TRIGGER_ANALOG_THRESHOLD: u8 = 30;
@@ -26,7 +26,7 @@ pub fn parse_report(buf: &[u8], base: usize) -> PadSample {
     // Split vectors for the browser cursor/scroll: proportional from a light
     // touch, independent per stick. Games keep the combined pair above.
     let (lstick_x, lstick_y) = soft_stick(lx, ly);
-    let (rstick_x, rstick_y) = soft_stick(rx, ry);
+    let (rstick_x, rstick_y) = soft_scroll(rx, ry);
 
     let dpad = buttons0 & 0x0F;
     let (dpad_up, dpad_down, dpad_left, dpad_right) = match dpad {
