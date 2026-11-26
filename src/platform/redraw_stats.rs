@@ -133,6 +133,21 @@ impl MessageSource {
     }
 }
 
+static REDRAWS: [AtomicU64; VIEW_WINDOWS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+static WINDOW_KINDS: std::sync::Mutex<Option<std::collections::HashMap<iced::window::Id, usize>>> =
+    std::sync::Mutex::new(None);
+
 static VIEWS: [AtomicU64; VIEW_WINDOWS.len()] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -212,10 +227,16 @@ fn snapshot_at(reason: &str, elapsed: Duration) {
         .zip(MESSAGES.iter())
         .map(|(name, counter)| format!("{name}={}", counter.load(Ordering::Relaxed)))
         .collect();
+    let redraws: Vec<String> = VIEW_WINDOWS
+        .iter()
+        .zip(REDRAWS.iter())
+        .map(|(name, counter)| format!("{name}={}", counter.load(Ordering::Relaxed)))
+        .collect();
     app_log::info(format!(
-        "ui-redraw: reason={reason} t_ms={} views[{}] msgs[{}]",
+        "ui-redraw: reason={reason} t_ms={} views[{}] redraws[{}] msgs[{}]",
         elapsed.as_millis(),
         views.join(" "),
+        redraws.join(" "),
         messages.join(" "),
     ));
 }
@@ -227,9 +248,30 @@ fn env_enabled() -> bool {
     )
 }
 
-pub fn note_view(kind: WindowKind) {
+pub fn note_view(window: iced::window::Id, kind: WindowKind) {
     if ENABLED.load(Ordering::Relaxed) {
         VIEWS[kind.index()].fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = WINDOW_KINDS.lock() {
+            guard
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(window, kind.index());
+        }
+    }
+}
+
+/// Count an actual `RedrawRequested` for a window (present/repaint proof).
+pub fn note_redraw(window: iced::window::Id) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let index = WINDOW_KINDS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(&window).copied()));
+    if let Some(index) = index
+        && let Some(counter) = REDRAWS.get(index)
+    {
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 

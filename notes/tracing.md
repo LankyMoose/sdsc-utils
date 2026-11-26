@@ -262,17 +262,18 @@ Rules:
 - `view.<window>` — how many times iced rebuilt that window's view
   (`popup`, `settings`, `osk`, `browser`, `home`, `launcher`, `toast`,
   `preview`, `shell`).
+- `redraw.<window>` — actual `RedrawRequested` presents counted by the
+  debug-only `ui::redraw_probe` wrapper (one per window root).
 - `msg.<source>` — dispatched app messages by class. Focus counters:
   `pad_input`, `launcher_frame`, `browser_frame`, `toast_frame`,
-  `identify_frame`, `home_progress`, `home_controller`, `shell_fade`,
-  `renderer_reload`, `update_spin`, `utility_ambient`, `tick`,
+  `identify_frame`, `home_progress`, `home_controller`, `shell_fade`, `tick`,
   `browser_engine`, `osk`, `browser`, `home`, `launcher`, `other`.
 
 Opt in with `SDSC_DEBUG_REDRAW=1`. A plain OS thread appends a cumulative
 snapshot to `app.log` every 2s without touching the iced loop:
 
 ```text
-ui-redraw: reason=periodic t_ms=4000 views[osk=12 ...] msgs[pad_input=0 ...]
+ui-redraw: reason=periodic t_ms=4000 views[osk=12 ...] redraws[osk=1 ...] msgs[pad_input=0 ...]
 ```
 
 Compare two snapshots (the QA script uses the last two). The counter thread is
@@ -286,8 +287,9 @@ manual snapshot. Compiled out of release builds.
 `kind=action`, `edge_seq`, `reason`, `readings`, and the ordered action list.
 Analog delivery is deliberately not traced per sample; measure it with the
 `msg.pad_input` counter instead. While the OSK is open, analog data goes to
-`OskInputSlot` and is polled by `OskSurface`; the app receives only discrete
-`OskMessage` steps/commits plus immediate taps.
+`OskInputSlot` and is polled by `OskSurface`; the edge stream forwards only
+rest↔active wakes, PS-held edges, non-sample snapshots, and immediate taps.
+The app receives only discrete `OskMessage` steps/commits plus taps.
 
 ## Commands
 

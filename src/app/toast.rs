@@ -88,7 +88,8 @@ impl App {
         let Some((progress, dismissing)) = self.toast_machine.slide_pose() else {
             return 0.0;
         };
-        crate::ui::layout::slide_y(placement, progress, dismissing) - placement.target_y
+        let (window_y, _) = crate::ui::layout::toast_window_geometry(placement);
+        crate::ui::layout::slide_y(placement, progress, dismissing) - window_y
     }
 
     /// One-shot "running in the tray" toast on manual starts.
@@ -129,7 +130,7 @@ impl App {
 
     pub(crate) fn create_toast_window(&mut self) -> (window::Id, Task<window::Id>) {
         let (id, open) = window::open(window::Settings {
-            size: Size::new(toast_view::WIDTH, toast_view::HEIGHT),
+            size: Size::new(toast_view::WIDTH, toast_view::WINDOW_HEIGHT),
             position: window::Position::Default,
             visible: false,
             resizable: false,
@@ -458,7 +459,7 @@ impl App {
         let Some(placement) = self.toast_placement else {
             return Task::none();
         };
-        let y = placement.target_y;
+        let (y, _h) = crate::ui::layout::toast_window_geometry(placement);
         remount_toast_surface(id, self.toast_generation)
             .chain(move_window(id, Point::new(placement.x, y)))
             .chain(show_toast_without_activate(id))
@@ -487,7 +488,8 @@ impl App {
         // Sync placement (Win32 work area on Windows); no monitor_size hop.
         let placement = toast_placement(self.session.prefs.toast_position, None);
         self.toast_placement = Some(placement);
-        let start = Point::new(placement.x, placement.target_y);
+        let (window_y, _window_h) = crate::ui::layout::toast_window_geometry(placement);
+        let start = Point::new(placement.x, window_y);
         let percent = self
             .toast_message
             .as_ref()

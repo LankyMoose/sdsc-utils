@@ -7,6 +7,13 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{Tree, Widget, tree};
 use iced::widget::image::Handle;
 use iced::{ContentFit, Element, Length, Radians, Rectangle, Size};
+
+/// Which splash opacity curve the pull-model widget advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtFade {
+    Art,
+    Enter,
+}
 use iced::{Point, mouse};
 
 /// Cover-fit splash that zooms then pans inside the zoom headroom (no black edges).
@@ -21,6 +28,8 @@ pub struct BackdropArt<Message, Theme = iced::Theme, Renderer = iced::Renderer> 
     reduced_motion: bool,
     started: iced::time::Instant,
     base_ms: u64,
+    /// Animated opacity curve; `None` uses the captured `opacity`.
+    fade: Option<ArtFade>,
     width: Length,
     height: Length,
     _message: std::marker::PhantomData<Message>,
@@ -45,6 +54,7 @@ pub fn backdrop_art<Message, Theme, Renderer>(
         reduced_motion: false,
         started: iced::time::Instant::now(),
         base_ms: 0,
+        fade: None,
         width: Length::Fill,
         height: Length::Fill,
         _message: std::marker::PhantomData,
@@ -66,6 +76,7 @@ pub fn backdrop_art_animated<Message, Theme, Renderer>(
     reduced_motion: bool,
     started: iced::time::Instant,
     base_ms: u64,
+    fade: Option<ArtFade>,
 ) -> BackdropArt<Message, Theme, Renderer> {
     BackdropArt {
         handle,
@@ -77,6 +88,7 @@ pub fn backdrop_art_animated<Message, Theme, Renderer>(
         reduced_motion,
         started,
         base_ms,
+        fade,
         width: Length::Fill,
         height: Length::Fill,
         _message: std::marker::PhantomData,
@@ -121,10 +133,15 @@ where
         shell: &mut iced::advanced::Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        if self.animate && !self.reduced_motion {
-            shell.request_redraw_at(
-                iced::time::Instant::now() + iced::time::Duration::from_millis(16),
-            );
+        if self.animate {
+            let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
+            let fade_active =
+                self.fade.is_some() && elapsed < crate::ui::launcher::mode::ART_FADE_MS;
+            if !self.reduced_motion || fade_active {
+                shell.request_redraw_at(
+                    iced::time::Instant::now() + iced::time::Duration::from_millis(16),
+                );
+            }
         }
     }
 
@@ -150,10 +167,10 @@ where
             .measure_image(&self.handle)
             .map(|s| Size::new(s.width as f32, s.height as f32))
             .unwrap_or(Size::new(1.0, 1.0));
+        let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
         let (scale, ox_norm, oy_norm) = if self.animate && !self.reduced_motion {
             use crate::ui::launcher::mode::{backdrop_pose_offset, backdrop_pose_scale};
             use crate::ui::motion::{movement_offset, movement_scale};
-            let elapsed = self.base_ms + self.started.elapsed().as_millis() as u64;
             let (ox, oy) = backdrop_pose_offset(elapsed);
             (
                 movement_scale(backdrop_pose_scale(elapsed), false).max(1.0),
@@ -162,6 +179,16 @@ where
             )
         } else {
             (self.scale, self.ox_norm, self.oy_norm)
+        };
+        // Opacity clocks keep running under reduced motion (movement freezes).
+        let opacity = if self.animate {
+            match self.fade {
+                Some(ArtFade::Art) => crate::ui::launcher::mode::art_fade_progress(elapsed),
+                Some(ArtFade::Enter) => crate::ui::launcher::mode::enter_art_fade_progress(elapsed),
+                None => self.opacity,
+            }
+        } else {
+            self.opacity
         };
         let fitted = ContentFit::Cover.fit(natural, bounds.size());
         let drawn = Size::new(fitted.width * scale, fitted.height * scale);
@@ -188,7 +215,7 @@ where
                 border_radius: 0.0.into(),
                 filter_method: FilterMethod::default(),
                 rotation: Radians(0.0),
-                opacity: self.opacity,
+                opacity,
                 snap: true,
             },
             drawing_bounds,

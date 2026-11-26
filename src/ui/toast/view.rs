@@ -17,6 +17,8 @@ pub const WIDTH: f32 = 360.0;
 pub const HEIGHT: f32 = 100.0;
 /// Gap kept between the toast and the screen edge.
 pub const MARGIN: f32 = 16.0;
+/// Fixed toast HWND height: covers both slide extremes (rest and fully out).
+pub const WINDOW_HEIGHT: f32 = HEIGHT * 2.0 + MARGIN;
 
 const RAIL_WIDTH: f32 = 3.0;
 const PADDING: f32 = 12.0;

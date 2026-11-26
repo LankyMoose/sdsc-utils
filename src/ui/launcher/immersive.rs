@@ -325,8 +325,8 @@ fn stage_backdrop_layers<'a>(
         .and_then(|art| {
             state
                 .backdrop_incoming_motion(now)
-                .map(|(opacity, scale, ox, oy, elapsed_ms)| {
-                    (art, opacity, scale, ox, oy, elapsed_ms)
+                .map(|(opacity, scale, ox, oy, elapsed_ms, fade)| {
+                    (art, opacity, scale, ox, oy, elapsed_ms, fade)
                 })
         });
 
@@ -345,15 +345,14 @@ fn stage_backdrop_layers<'a>(
             ox,
             oy,
             None,
+            None,
             now,
             state.reduced_motion,
         ));
         dim_amount = dim_amount.max(opacity);
     }
 
-    if let Some((art, opacity, scale, ox, oy, elapsed_ms)) = incoming
-        && opacity > 0.01
-    {
+    if let Some((art, opacity, scale, ox, oy, elapsed_ms, fade)) = incoming {
         layers.push(backdrop_layer(
             art,
             opacity,
@@ -361,6 +360,7 @@ fn stage_backdrop_layers<'a>(
             ox,
             oy,
             (!paused).then_some(elapsed_ms),
+            (!paused).then_some(fade).flatten(),
             now,
             state.reduced_motion,
         ));
@@ -397,6 +397,7 @@ fn backdrop_layer(
     ox_norm: f32,
     oy_norm: f32,
     animated_ms: Option<u64>,
+    fade: Option<crate::ui::launcher::translate::ArtFade>,
     now: Instant,
     reduced_motion: bool,
 ) -> Element<'static, LauncherMessage> {
@@ -412,6 +413,7 @@ fn backdrop_layer(
             reduced_motion,
             now,
             base_ms,
+            fade,
         )
         .into(),
         None => backdrop_art(art.0, opacity, scale, ox_norm, oy_norm).into(),

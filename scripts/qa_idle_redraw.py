@@ -81,14 +81,19 @@ def parse_snapshot(line: str) -> dict[str, int] | None:
     if "ui-redraw:" not in line:
         return None
     views = re.search(r"views\[([^\]]*)\]", line)
+    redraws = re.search(r"redraws\[([^\]]*)\]", line)
     msgs = re.search(r"msgs\[([^\]]*)\]", line)
-    if not views or not msgs:
+    if not views or not redraws or not msgs:
         return None
     out = {"t_ms": 0}
     t = re.search(r"t_ms=(\d+)", line)
     if t:
         out["t_ms"] = int(t.group(1))
-    for prefix, body in (("view", views.group(1)), ("msg", msgs.group(1))):
+    for prefix, body in (
+        ("view", views.group(1)),
+        ("redraw", redraws.group(1)),
+        ("msg", msgs.group(1)),
+    ):
         for name, value in TOKEN.findall(body):
             out[f"{prefix}.{name}"] = int(value)
     return out
@@ -159,7 +164,7 @@ def main() -> int:
         delta = {
             key: after[key] - before.get(key, 0)
             for key in after
-            if key != "t_ms" and key.startswith(("view.", "msg."))
+            if key != "t_ms" and key.startswith(("view.", "redraw.", "msg."))
         }
         window = (after["t_ms"] - before["t_ms"]) / 1000.0
         print(json.dumps({"scenario": args.scenario, "window_s": window, "delta": delta}, indent=2))
@@ -174,11 +179,20 @@ def main() -> int:
             total_messages = sum(
                 value for key, value in delta.items() if key.startswith("msg.")
             )
-            target_view = delta.get(f"view.{TARGET_VIEW[args.scenario]}", 0)
+            target = TARGET_VIEW[args.scenario]
+            target_view = delta.get(f"view.{target}", 0)
             if target_view > total_messages:
-                failures.append(
-                    f"view.{TARGET_VIEW[args.scenario]}={target_view} > msgs={total_messages}"
-                )
+                failures.append(f"view.{target}={target_view} > msgs={total_messages}")
+            # Browser CEF presentation and Launcher ambient/ken-burns are
+            # intentionally per-window 60Hz clocks; their acceptance is the
+            # message counters above. OSK/toast must not repaint beyond global
+            # messages at rest.
+            if target in ("osk", "toast"):
+                target_redraws = delta.get(f"redraw.{target}", 0)
+                if target_redraws > total_messages:
+                    failures.append(
+                        f"redraw.{target}={target_redraws} > msgs={total_messages}"
+                    )
             if failures:
                 print("error: idle traffic: " + ", ".join(failures), file=sys.stderr)
                 return 1

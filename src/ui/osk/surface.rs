@@ -19,12 +19,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Wrap the OSK view in the pull-model analog widget.
-pub fn surface<'a>(state: &'a OskState, slot: Arc<OskInputSlot>) -> Element<'a, OskMessage> {
+pub fn surface<'a>(
+    state: &'a OskState,
+    slot: Arc<OskInputSlot>,
+    epoch: u64,
+) -> Element<'a, OskMessage> {
     OskSurface {
         content: view(state),
         slot,
         open: state.open,
         mode: state.mode,
+        epoch,
     }
     .into()
 }
@@ -34,6 +39,7 @@ pub struct OskSurface<'a> {
     slot: Arc<OskInputSlot>,
     open: bool,
     mode: OskMode,
+    epoch: u64,
 }
 
 #[derive(Default)]
@@ -46,6 +52,7 @@ pub struct SurfaceState {
     /// Last poll saw a non-neutral pad; keep polling even if the slot seq
     /// stalls so repeat cadence still fires from the widget clock.
     last_active: bool,
+    epoch: Option<u64>,
 }
 
 impl SurfaceState {
@@ -55,6 +62,7 @@ impl SurfaceState {
         self.last_seq = 0;
         self.last_active = false;
         self.mode = Some(mode);
+        self.epoch = None;
     }
 }
 
@@ -103,8 +111,9 @@ impl Widget<OskMessage, iced::Theme, iced::Renderer> for OskSurface<'_> {
     ) {
         let state = tree.state.downcast_mut::<SurfaceState>();
         if self.open {
-            if !state.was_open || state.mode != Some(self.mode) {
+            if !state.was_open || state.mode != Some(self.mode) || state.epoch != Some(self.epoch) {
                 state.reset(self.mode);
+                state.epoch = Some(self.epoch);
             }
             state.was_open = true;
             let (seq, readings) = self.slot.read();
@@ -123,6 +132,7 @@ impl Widget<OskMessage, iced::Theme, iced::Renderer> for OskSurface<'_> {
             state.mode = None;
             state.last_seq = 0;
             state.last_active = false;
+            state.epoch = None;
             state.dual.reset();
             state.grid.reset();
         }
@@ -213,6 +223,7 @@ impl OskSurface<'_> {
                         pad: step.pad,
                         half: step.half,
                         direction: step.step.direction,
+                        phase: step.step.phase,
                     });
                 }
                 for edge in tick.triggers {

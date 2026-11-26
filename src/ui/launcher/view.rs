@@ -3194,16 +3194,24 @@ impl State {
     /// the selection crossfade opacity is unchanged.
     pub fn backdrop_incoming_visual(&self, now: Instant) -> Option<(f32, f32, f32, f32)> {
         self.backdrop_incoming_motion(now)
-            .map(|(opacity, scale, ox, oy, _)| (opacity, scale, ox, oy))
+            .map(|(opacity, scale, ox, oy, _, _)| (opacity, scale, ox, oy))
     }
 
     /// Incoming backdrop pose plus the wall-clock elapsed used to compute it.
     /// The splash widget adds its own elapsed time so ken-burns no longer
     /// depends on a global Launcher frame.
-    pub fn backdrop_incoming_motion(&self, now: Instant) -> Option<(f32, f32, f32, f32, u64)> {
-        use crate::ui::launcher::mode::{
-            art_fade_progress, backdrop_pose_offset, backdrop_pose_scale, enter_art_fade_progress,
-        };
+    pub fn backdrop_incoming_motion(
+        &self,
+        now: Instant,
+    ) -> Option<(
+        f32,
+        f32,
+        f32,
+        f32,
+        u64,
+        Option<crate::ui::launcher::translate::ArtFade>,
+    )> {
+        use crate::ui::launcher::mode::{backdrop_pose_offset, backdrop_pose_scale};
         use crate::ui::motion::{movement_offset, movement_scale};
         let row = self.rows.get(self.game_selected)?;
         row.backdrop_icon()?;
@@ -3219,22 +3227,31 @@ impl State {
         match &self.backdrop_current {
             Some((key, None)) if key == &row.play_key => {
                 let (scale, ox, oy) = still(0);
-                Some((0.0, scale, ox, oy, 0))
+                Some((0.0, scale, ox, oy, 0, None))
             }
             Some((key, Some(started))) if key == &row.play_key => {
+                use crate::ui::launcher::mode::{art_fade_progress, enter_art_fade_progress};
+                use crate::ui::launcher::translate::ArtFade;
                 let elapsed = now.saturating_duration_since(*started).as_millis() as u64;
-                let opacity = if self.splash_opaque {
-                    1.0
-                } else if self.enter_splash_fade {
-                    enter_art_fade_progress(elapsed)
-                } else {
-                    art_fade_progress(elapsed)
-                };
                 let (scale, ox, oy) = still(elapsed);
-                Some((opacity, scale, ox, oy, elapsed))
+                if self.splash_opaque {
+                    Some((1.0, scale, ox, oy, elapsed, None))
+                } else {
+                    let opacity = if self.enter_splash_fade {
+                        enter_art_fade_progress(elapsed)
+                    } else {
+                        art_fade_progress(elapsed)
+                    };
+                    let fade = if self.enter_splash_fade {
+                        ArtFade::Enter
+                    } else {
+                        ArtFade::Art
+                    };
+                    Some((opacity, scale, ox, oy, elapsed, Some(fade)))
+                }
             }
             // No state, or stale key after nav — still paint current art.
-            None | Some(_) => Some((1.0, still(0).0, 0.0, 0.0, 0)),
+            None | Some(_) => Some((1.0, still(0).0, 0.0, 0.0, 0, None)),
         }
     }
 

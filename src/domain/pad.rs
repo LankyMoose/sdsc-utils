@@ -222,6 +222,11 @@ impl InputHub {
     pub fn set_osk_listening(&self, enabled: bool) {
         self.osk_slot.set_enabled(enabled);
     }
+
+    /// True while the OSK owns the pad (edge stream becomes wake-only).
+    pub fn osk_listening(&self) -> bool {
+        self.osk_slot.is_enabled()
+    }
 }
 
 /// Latest all-pad analog state for the pull-model OSK widget.
@@ -246,6 +251,10 @@ impl OskInputSlot {
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn publish(&self, readings: &[NavReading], seq: u64) {
@@ -1754,9 +1763,9 @@ pub fn combined_stick(lx: f32, ly: f32, rx: f32, ry: f32) -> (f32, f32) {
 /// control from a light touch, not a 90%-throw gate. No residual term —
 /// each stick stands alone.
 pub fn soft_stick(x: f32, y: f32) -> (f32, f32) {
-    const DEADZONE: f32 = 0.12;
-    let x = if x.abs() < DEADZONE { 0.0 } else { x };
-    let y = if y.abs() < DEADZONE { 0.0 } else { y };
+    let deadzone = NavProfile::CURSOR.axis_deadzone;
+    let x = if x.abs() < deadzone { 0.0 } else { x };
+    let y = if y.abs() < deadzone { 0.0 } else { y };
     (x, y)
 }
 
@@ -1884,9 +1893,11 @@ impl DualNav {
                 NavStick::Right,
                 self.profile,
             );
-            let mut left_sample = left.to_sample();
-            let mut right_sample = right.to_sample();
+            let left_sample = left.to_sample();
+            let right_sample = right.to_sample();
             // DQ halves are stick-only; the shared D-pad drives Grid.
+            let mut left_sample = left_sample;
+            let mut right_sample = right_sample;
             left_sample.dpad_up = false;
             left_sample.dpad_down = false;
             left_sample.dpad_left = false;
@@ -1895,8 +1906,14 @@ impl DualNav {
             right_sample.dpad_down = false;
             right_sample.dpad_left = false;
             right_sample.dpad_right = false;
+            // Every armed pad advances its steppers, even when another pad
+            // already owns the half this tick; otherwise a losing pad keeps a
+            // stale direction/next_fire and can fire an immediate repeat when
+            // it later wins.
+            let left_step = slot.left.step(&left_sample, now, true, true);
+            let right_step = slot.right.step(&right_sample, now, true, true);
             if !result.steps.iter().any(|step| step.half == NavHalf::Left)
-                && let Some(step) = slot.left.step(&left_sample, now, true, true)
+                && let Some(step) = left_step
             {
                 result.steps.push(DualStep {
                     pad: reading.id.clone(),
@@ -1905,7 +1922,7 @@ impl DualNav {
                 });
             }
             if !result.steps.iter().any(|step| step.half == NavHalf::Right)
-                && let Some(step) = slot.right.step(&right_sample, now, true, true)
+                && let Some(step) = right_step
             {
                 result.steps.push(DualStep {
                     pad: reading.id.clone(),

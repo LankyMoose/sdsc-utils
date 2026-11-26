@@ -457,6 +457,16 @@ pub fn slide_y(placement: ToastPlacement, progress: f32, dismissing: bool) -> f3
     placement.outside_y + (placement.target_y - placement.outside_y) * t
 }
 
+/// Fixed toast HWND geometry `(y, height)` covering both slide extremes.
+/// The window itself never moves per frame; the card is drawn translated
+/// inside this union box (which may extend off-screen).
+pub fn toast_window_geometry(placement: ToastPlacement) -> (f32, f32) {
+    (
+        placement.target_y.min(placement.outside_y),
+        toast_view::WINDOW_HEIGHT,
+    )
+}
+
 /// Toast top-left in cover-local coordinates (screen placement minus cover origin).
 pub fn toast_local_in_cover(
     placement: ToastPlacement,
@@ -661,6 +671,39 @@ mod tests {
         assert!((slide_y(placement, 1.0, true) - 200.0).abs() < f32::EPSILON);
         let mid = slide_y(placement, 0.5, false);
         assert!(mid > 100.0 && mid < 200.0);
+    }
+
+    #[test]
+    fn toast_window_geometry_contains_both_slide_extremes() {
+        let bottom = ToastPlacement {
+            x: 10.0,
+            target_y: 1080.0 - toast_view::HEIGHT - toast_view::MARGIN,
+            outside_y: 1080.0,
+        };
+        let (y, h) = toast_window_geometry(bottom);
+        assert_eq!(y, bottom.target_y);
+        assert!(y + h >= bottom.outside_y + toast_view::HEIGHT);
+        assert!(y <= bottom.target_y);
+        let top = ToastPlacement {
+            x: 10.0,
+            target_y: toast_view::MARGIN,
+            outside_y: -toast_view::HEIGHT,
+        };
+        let (y, h) = toast_window_geometry(top);
+        assert_eq!(y, top.outside_y);
+        assert!(y + h >= top.target_y + toast_view::HEIGHT);
+        for placement in [bottom, top] {
+            let (y, h) = toast_window_geometry(placement);
+            for step in 0..=10 {
+                let progress = step as f32 / 10.0;
+                let card_y = slide_y(placement, progress, false);
+                assert!(
+                    card_y >= y - 0.001 && card_y + toast_view::HEIGHT <= y + h + 0.001,
+                    "slide pose {card_y} clipped by window {y}..{}",
+                    y + h
+                );
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub mod mouse_shield;
 pub mod osk;
 pub mod percent_ring;
 pub mod popup;
+#[cfg(debug_assertions)]
+pub mod redraw_probe;
 pub mod reveal;
 pub mod scale;
 pub mod shader;

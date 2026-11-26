@@ -3,7 +3,9 @@
 
 #[cfg(debug_assertions)]
 use crate::domain::pad::PadSample;
-use crate::domain::pad::{NavAction, NavHalf, OskInputSlot, PadAction, PadButton, PadButtonAction};
+use crate::domain::pad::{
+    NavAction, NavHalf, NavProfile, OskInputSlot, PadAction, PadButton, PadButtonAction,
+};
 use crate::persist::prefs::OskMode;
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::osk::dual::Half;
@@ -22,6 +24,9 @@ pub struct SystemOsk {
     pub pending_show: bool,
     pub cover: Option<crate::ui::layout::MonitorCover>,
     pub slot: Arc<OskInputSlot>,
+    /// Incremented on open/close so the pull-model widget drops arming and
+    /// latch state even if its hidden window missed the transition redraw.
+    pub nav_epoch: u64,
 }
 
 impl SystemOsk {
@@ -32,6 +37,7 @@ impl SystemOsk {
             pending_show: false,
             cover: None,
             slot,
+            nav_epoch: 0,
         }
     }
 }
@@ -47,6 +53,7 @@ impl App {
             return self.show_osk_window();
         }
         self.osk.state.open(target);
+        self.osk.nav_epoch = self.osk.nav_epoch.wrapping_add(1);
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.open")
             .field("target", target.label())
             .field("mode", self.osk.state.mode.label())
@@ -115,6 +122,7 @@ impl App {
         }
         let target = self.osk.state.target;
         self.osk.state.close();
+        self.osk.nav_epoch = self.osk.nav_epoch.wrapping_add(1);
         // Hardware/IME handoff keeps the URL editor alive: the key that closed
         // the OSK is about to be handled as URL text. Every other close path
         // (mouse, pad, Home, Browser close) cancels the edit.
@@ -160,6 +168,7 @@ impl App {
             self.osk.window = None;
             self.osk.pending_show = false;
             self.osk.state.close();
+            self.osk.nav_epoch = self.osk.nav_epoch.wrapping_add(1);
         }
         Task::none()
     }
@@ -237,18 +246,28 @@ impl App {
 
     /// Discrete step/commit from the pull-model OSK surface.
     pub(crate) fn on_osk_message(&mut self, message: OskMessage) -> Task<Message> {
-        match message {
+        let previous_haptic = self.haptic_pad_serial.take();
+        let task = match message {
             OskMessage::Step {
                 pad,
                 half,
                 direction,
+                phase,
             } => {
                 let Some(direction) = nav_dir(direction) else {
+                    self.haptic_pad_serial = previous_haptic;
                     return Task::none();
                 };
                 self.set_haptic_pad_from_id(Some(&pad));
                 self.osk.state.dual_move(to_half(half), direction);
-                self.play_ui_cue(UiSoundKind::Nav);
+                let feedback = match phase {
+                    crate::domain::pad::NavPhase::First => NavProfile::MENU.step_feedback,
+                    crate::domain::pad::NavPhase::Repeat => NavProfile::MENU.repeat_feedback,
+                    crate::domain::pad::NavPhase::Release => false,
+                };
+                if feedback {
+                    self.play_ui_cue(UiSoundKind::Nav);
+                }
                 Task::none()
             }
             OskMessage::Commit { pad, half } => {
@@ -259,6 +278,7 @@ impl App {
             }
             OskMessage::GridStep { pad, direction } => {
                 let Some(direction) = nav_dir(direction) else {
+                    self.haptic_pad_serial = previous_haptic;
                     return Task::none();
                 };
                 self.set_haptic_pad_from_id(Some(&pad));
@@ -266,7 +286,9 @@ impl App {
                 self.play_ui_cue(UiSoundKind::Nav);
                 Task::none()
             }
-        }
+        };
+        self.haptic_pad_serial = previous_haptic;
+        task
     }
 
     /// Source-side taps while the OSK owns the pad. Analog movement is handled
@@ -278,6 +300,7 @@ impl App {
         else {
             return Task::none();
         };
+        let previous_haptic = self.haptic_pad_serial.take();
         self.set_haptic_pad_from_id(Some(&action.pad));
         self.play_ui_cue(UiSoundKind::Action);
         let mut outputs: Vec<Output> = Vec::new();
@@ -307,6 +330,7 @@ impl App {
         if close {
             task = task.chain(self.close_osk("pad"));
         }
+        self.haptic_pad_serial = previous_haptic;
         task
     }
 

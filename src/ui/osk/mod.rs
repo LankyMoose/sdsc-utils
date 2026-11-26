@@ -74,6 +74,7 @@ pub enum OskMessage {
         pad: PadId,
         half: NavHalf,
         direction: NavAction,
+        phase: crate::domain::pad::NavPhase,
     },
     Commit {
         pad: PadId,

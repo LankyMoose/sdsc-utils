@@ -1681,7 +1681,7 @@ impl App {
                 }
             }
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::LauncherFrame));
-        } else if self.launcher_visible && !self.home_visible {
+        } else if self.launcher_visible && !self.home_visible && !self.osk.state.open {
             // No animation needs frames: keep the wall-clock idle/sleep and
             // cursor-hide state moving at 2Hz instead of a 60Hz ambient tick.
             subscriptions.push(
@@ -1756,6 +1756,8 @@ impl App {
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         let content = self.view_inner(window);
+        #[cfg(debug_assertions)]
+        let content = crate::ui::redraw_probe::probe(window, content);
         // Automated/quiet sessions never accept real keyboard or mouse input;
         // replay injects synthetic events into the same handlers instead.
         if crate::platform::debug_quiet::input_dropped() {
@@ -1766,7 +1768,7 @@ impl App {
 
     fn view_inner(&self, window: window::Id) -> Element<'_, Message> {
         #[cfg(debug_assertions)]
-        crate::platform::redraw_stats::note_view(self.redraw_window_kind(window));
+        crate::platform::redraw_stats::note_view(window, self.redraw_window_kind(window));
         if Some(window) == self.popup_window {
             return popup_view::view(
                 &self.popup_state,
@@ -1803,8 +1805,12 @@ impl App {
         }
 
         if Some(window) == self.osk.window {
-            return crate::ui::osk::surface(&self.osk.state, Arc::clone(&self.osk.slot))
-                .map(Message::Osk);
+            return crate::ui::osk::surface(
+                &self.osk.state,
+                Arc::clone(&self.osk.slot),
+                self.osk.nav_epoch,
+            )
+            .map(Message::Osk);
         }
 
         if Some(window) == self.browser_window {
@@ -3448,6 +3454,30 @@ fn tray_events_mapped() -> impl Stream<Item = Message> {
 }
 
 /// Bind the hid-worker → iced pad-input edge channel while listening.
+/// OSK-open edge filter: returns `(forward_to_ui, next_active)`.
+/// Analog frames feed the slot only; the UI needs a wake on transitions,
+/// actions, non-sample snapshots, and while PS is held.
+fn osk_stream_wake(edge: &crate::domain::pad::InputEdge, active: bool) -> (bool, bool) {
+    let sample_reason = matches!(
+        edge.reason,
+        crate::domain::pad::SnapshotReason::Sample
+            | crate::domain::pad::SnapshotReason::SamplePartial
+    );
+    let resting = edge
+        .readings
+        .iter()
+        .all(|reading| crate::domain::pad::sample_nav_resting(&reading.sample));
+    let ps_held = edge.readings.iter().any(|reading| {
+        reading
+            .sample
+            .held
+            .contains(&crate::domain::gesture::GestureControl::Ps)
+    });
+    // Wake on start (both false) and release (both true), not while held.
+    let wake = !sample_reason || !edge.actions.is_empty() || ps_held || resting == active;
+    (wake, !resting)
+}
+
 fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + Send + use<> {
     // Deep enough to ride out Launcher-frame hitches without dropping taps:
     // the worker publishes at report rate while hot.
@@ -3456,6 +3486,7 @@ fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + S
         let (tx, mut rx) = iced::futures::channel::mpsc::channel(128);
         hub.bind(tx);
         let _guard = InputEdgeBindGuard { hub: hub.clone() };
+        let mut osk_active = false;
         while let Some(first) = rx.next().await {
             // Conflate to the latest buffered edge: readings are absolute
             // state, so intermediates are stale by definition. Without this,
@@ -3472,6 +3503,16 @@ fn pad_input_edge_stream(hub: &Arc<InputHub>) -> impl Stream<Item = Message> + S
                 actions.append(&mut edge.actions);
             }
             edge.actions = actions;
+            // OSK open: analog frames stay in the pull-model slot. Only
+            // forward a wake on rest<->active transitions and while PS is
+            // held (global Home chord); actions always pass immediately.
+            if hub.osk_listening() {
+                let (wake, next_active) = osk_stream_wake(&edge, osk_active);
+                osk_active = next_active;
+                if !wake {
+                    continue;
+                }
+            }
             if output.send(Message::PadInput(edge)).await.is_err() {
                 break;
             }
@@ -3859,6 +3900,65 @@ mod tests {
         assert!(!Message::Exit.is_user_input());
         assert!(!Message::Tick.is_user_input());
         assert!(!Message::RendererReloadDue.is_user_input());
+    }
+
+    #[test]
+    fn osk_stream_wakes_only_on_transitions_ps_and_actions() {
+        use crate::domain::gesture::GestureControl;
+        use crate::domain::pad::{InputEdge, PadId, PadSample, SnapshotMeta, SnapshotReason};
+        let meta = SnapshotMeta {
+            published_at: std::time::Instant::now(),
+            seq: 1,
+            reason: SnapshotReason::Sample,
+            pad_count: 1,
+        };
+        let edge = |sample: PadSample, actions: Vec<crate::domain::pad::PadAction>| {
+            InputEdge::from_snapshot(
+                vec![crate::domain::pad::NavReading {
+                    id: PadId("hid:a".into()),
+                    sample,
+                    source: "hid",
+                }],
+                actions,
+                &meta,
+            )
+        };
+        let mut active = false;
+        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), active);
+        assert!(!wake, "resting neutral stays in the slot");
+        assert!(!next);
+        let held = PadSample {
+            lstick_x: -0.95,
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), active);
+        assert!(wake, "rest->active wake");
+        active = next;
+        let (wake, next) = osk_stream_wake(&edge(held.clone(), Vec::new()), active);
+        assert!(!wake, "held analog frames do not cross");
+        assert!(next);
+        let (wake, next) = osk_stream_wake(&edge(PadSample::default(), Vec::new()), active);
+        assert!(wake, "release wake");
+        assert!(!next);
+        let ps = PadSample {
+            held: [GestureControl::Ps].into_iter().collect(),
+            ..Default::default()
+        };
+        let (wake, _) = osk_stream_wake(&edge(ps, Vec::new()), false);
+        assert!(wake, "PS stays global");
+        let (wake, _) = osk_stream_wake(
+            &edge(
+                PadSample::default(),
+                vec![crate::domain::pad::PadAction {
+                    pad: PadId("hid:a".into()),
+                    button: crate::domain::pad::PadButton::Cross,
+                    action: crate::domain::pad::PadButtonAction::Tap,
+                }],
+            ),
+            false,
+        );
+        assert!(wake, "taps always publish immediately");
     }
 
     /// The forget sequence end to end: prune drops the pad from the fleet, and

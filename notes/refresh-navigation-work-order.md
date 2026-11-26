@@ -302,10 +302,11 @@ In priority order:
 
 ### WO-8 — QA/docs
 
-- [x] Add idle-redraw instrumentation (debug counter of view/redraw per
-      window and message source).
+- [x] Add idle-redraw instrumentation (debug counters of view rebuilds,
+      actual per-window redraws, and message sources).
 - [x] Add an automated “OSK open + pad at rest produces no continuous global
-      traffic/redraws” check.
+      traffic/redraws” check (message counters + actual `redraw.osk`; synthetic
+      pad-at-rest covered by `InputHub`/`osk_stream_wake` unit tests).
 - [x] Add a “toast resting produces no frames” check.
 - [x] Add a “Launcher idle produces no LauncherFrame when ambient is pull”
       check.
