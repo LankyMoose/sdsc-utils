@@ -13,7 +13,7 @@ use crate::ui::browser::state::{
     BROWSER_URL_GAP, BROWSER_URL_ICON, BrowserPanel, browser_header_layout,
     browser_url_text_budget, display_url,
 };
-use crate::ui::face::{FaceButton, RingStyle, face_glyph, hint_text_capsule};
+use crate::ui::face::{FaceButton, RingStyle, face_glyph};
 use crate::ui::{svg_icon, text_fit, theme};
 use iced::widget::text::Wrapping;
 use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
@@ -190,35 +190,80 @@ fn header_icon(icon: &'static str, size: f32, color: Color) -> Element<'static, 
         .into()
 }
 
-/// Controller capsule + label using the shared action-hint furniture.
-fn bumper_hint(
-    capsule: &'static str,
+/// Compact history capsule: `‹ L1 · BACK` (left) or `FORWARD · R1 ›` (right).
+/// The whole cluster lives inside one pill; the label is the small dim text.
+fn history_hint(
     label: &'static str,
+    key: &'static str,
+    icon: &'static str,
+    key_first: bool,
+    icon_first: bool,
     pressed: bool,
     enabled: bool,
 ) -> Element<'static, BrowserMessage> {
+    const CAPSULE_H: f32 = 28.0;
+    const LABEL_SIZE: f32 = 10.0;
+    const KEY_SIZE: f32 = 11.0;
+    const ICON_SIZE: f32 = 14.0;
     let alpha = if enabled { 1.0 } else { 0.4 };
-    let glyph = hint_text_capsule(
-        text(capsule)
-            .size(12.0)
+    let mut parts: Vec<Element<'static, BrowserMessage>> = Vec::with_capacity(4);
+    let icon_color = theme::scale_alpha(theme::MUTED, alpha);
+    if icon_first {
+        parts.push(header_icon(icon, ICON_SIZE, icon_color));
+    }
+    let key_text = || {
+        text(key)
+            .size(KEY_SIZE)
             .font(Font::MONOSPACE)
-            .color(theme::scale_alpha(theme::ACCENT, alpha)),
-        10.0,
-        1.0,
-        pressed && enabled,
-        0.0,
-        true,
-        alpha,
-    );
-    row![
-        glyph,
+            .color(theme::scale_alpha(theme::ACCENT, alpha))
+            .into()
+    };
+    let dot_text = || {
+        text("·")
+            .size(12.0)
+            .color(theme::scale_alpha(theme::MUTED, alpha * 0.8))
+            .into()
+    };
+    let label_text = || {
         text(label)
-            .size(14.0)
-            .color(theme::scale_alpha(theme::MUTED, alpha)),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
+            .size(LABEL_SIZE)
+            .color(theme::scale_alpha(theme::DIM, alpha))
+            .into()
+    };
+    if key_first {
+        parts.extend([key_text(), dot_text(), label_text()]);
+    } else {
+        parts.extend([label_text(), dot_text(), key_text()]);
+    }
+    if !icon_first {
+        parts.push(header_icon(icon, ICON_SIZE, icon_color));
+    }
+    let border = if pressed {
+        theme::ACCENT
+    } else {
+        Color {
+            a: 0.25,
+            ..theme::MUTED
+        }
+    };
+    container(row(parts).spacing(5).align_y(Alignment::Center))
+        .height(Length::Fixed(CAPSULE_H))
+        .padding(Padding {
+            top: 0.0,
+            right: 10.0,
+            bottom: 0.0,
+            left: 10.0,
+        })
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            border: iced::Border {
+                color: theme::scale_alpha(border, alpha),
+                width: if pressed { 2.5 } else { 2.0 },
+                radius: (CAPSULE_H / 2.0).into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Shared Triangle face glyph; lives inside the URL well, anchored right.
@@ -280,34 +325,24 @@ fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessa
     let layout = browser_header_layout(content_w);
     let back_enabled = panel.can_go_back();
     let forward_enabled = panel.can_go_forward();
-    let back = row![
-        header_icon(
-            svg_icon::CHEVRON_LEFT_SVG,
-            18.0,
-            if back_enabled {
-                theme::MUTED
-            } else {
-                theme::DIM
-            },
-        ),
-        bumper_hint("L1", "Back", panel.l1_held, back_enabled),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    let forward = row![
-        bumper_hint("R1", "Forward", panel.r1_held, forward_enabled),
-        header_icon(
-            svg_icon::CHEVRON_RIGHT_SVG,
-            18.0,
-            if forward_enabled {
-                theme::MUTED
-            } else {
-                theme::DIM
-            },
-        ),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    let back = history_hint(
+        "BACK",
+        "L1",
+        svg_icon::CHEVRON_LEFT_SVG,
+        true,
+        true,
+        panel.l1_held,
+        back_enabled,
+    );
+    let forward = history_hint(
+        "FORWARD",
+        "R1",
+        svg_icon::CHEVRON_RIGHT_SVG,
+        false,
+        false,
+        panel.r1_held,
+        forward_enabled,
+    );
     let content = row![
         container(back)
             .width(Length::Fixed(layout.side_w))

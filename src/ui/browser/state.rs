@@ -224,21 +224,23 @@ impl Default for BrowserPanel {
 }
 
 impl BrowserPanel {
-    /// CEF's own back/forward capability wins over the projected stack:
-    /// redirects and same-document entries can move CEF without the UI's
-    /// local snapshot settling first.
+    /// Back is available when either source agrees.
+    ///
+    /// CEF's capability catches redirects and same-document entries that the
+    /// canonical stack has not absorbed yet; the session stack catches the
+    /// brief window after a commit where CEF still reports the pre-navigation
+    /// capability (observed as a falsely disabled Back hint after a search).
     pub fn can_go_back(&self) -> bool {
-        self.page
-            .last_engine_can
-            .map(|(back, _)| back)
-            .unwrap_or_else(|| self.page.session.can_go_back())
+        self.page.last_engine_can.is_some_and(|(back, _)| back) || self.page.session.can_go_back()
     }
 
+    /// Forward is available when either source agrees (same reasoning as
+    /// [`Self::can_go_back`]).
     pub fn can_go_forward(&self) -> bool {
         self.page
             .last_engine_can
-            .map(|(_, forward)| forward)
-            .unwrap_or_else(|| self.page.session.can_go_forward())
+            .is_some_and(|(_, forward)| forward)
+            || self.page.session.can_go_forward()
     }
 
     /// Match the surface to the live card page size. Returns true when the
@@ -598,6 +600,44 @@ mod tests {
 
     fn step(panel: &mut BrowserPanel, rx: f32, ry: f32, r2: bool, at: Instant) -> (f32, f32) {
         panel.advance_stick(0.0, 0.0, rx, ry, r2, at)
+    }
+
+    fn engine_entry(url: &str) -> crate::browser::engine::EngineHistoryEntry {
+        crate::browser::engine::EngineHistoryEntry {
+            url: url.to_string(),
+            display_url: url.to_string(),
+            original_url: url.to_string(),
+            title: None,
+            has_post_data: false,
+        }
+    }
+
+    #[test]
+    fn history_hint_uses_either_the_stack_or_engine_capability() {
+        let mut panel = panel();
+        // CEF briefly reports no capability after a commit while the canonical
+        // stack already has the new entry: the hint must stay enabled.
+        panel.page.last_engine_can = Some((false, false));
+        panel.session.apply_engine_history(
+            &[
+                engine_entry("https://a.test/"),
+                engine_entry("https://b.test/"),
+            ],
+            1,
+        );
+        assert!(panel.can_go_back());
+        assert!(!panel.can_go_forward());
+
+        // Engine capability can also lead the stack (redirects/same-document).
+        panel.session = crate::browser::BrowserSession::default();
+        panel.page.last_engine_can = Some((false, true));
+        assert!(!panel.can_go_back());
+        assert!(panel.can_go_forward());
+
+        // Both sources agree there is nowhere to go.
+        panel.page.last_engine_can = Some((false, false));
+        assert!(!panel.can_go_back());
+        assert!(!panel.can_go_forward());
     }
 
     #[test]
