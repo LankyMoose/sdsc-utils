@@ -108,6 +108,17 @@ impl<Message> canvas::Program<Message> for CursorSurface {
         }
 
         let snapshot = self.handle.snapshot();
+        let moving = snapshot.vx.abs() > 0.0
+            || snapshot.vy.abs() > 0.0
+            || snapshot.fly_to.is_some()
+            || (snapshot.dock_blend
+                - if snapshot.attached.is_some() {
+                    1.0
+                } else {
+                    0.0
+                })
+            .abs()
+                > 0.0;
         let stick = sample.lstick_x != 0.0
             || sample.lstick_y != 0.0
             || sample.rstick_x != 0.0
@@ -117,7 +128,7 @@ impl<Message> canvas::Program<Message> for CursorSurface {
         let dock_grace = snapshot.attached.is_some()
             && stick
             && snapshot.docked_for < crate::browser::cursor::BREAK_LATCH_GRACE_SECS;
-        if frame.pose_changed || dock_grace {
+        if frame.pose_changed || moving || dock_grace {
             // The ring actually moved (or may break free shortly): present at
             // vsync. Otherwise the canvas sleeps and a meaningful stick change
             // wakes it through the pad edge stream.

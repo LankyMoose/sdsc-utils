@@ -436,9 +436,30 @@ impl Cursor {
             self.vy = 0.0;
         }
         if self.vx != 0.0 || self.vy != 0.0 {
-            self.x = (self.x + self.vx * dt_secs).clamp(0.0, self.view_w);
-            // Analog movement stays inside the page surface.
-            self.y = (self.y + self.vy * dt_secs).clamp(0.0, self.view_h);
+            if self.vx != 0.0 {
+                let next = self.x + self.vx * dt_secs;
+                if next <= 0.0 {
+                    self.x = 0.0;
+                    self.vx = 0.0;
+                } else if next >= self.view_w {
+                    self.x = self.view_w;
+                    self.vx = 0.0;
+                } else {
+                    self.x = next;
+                }
+            }
+            if self.vy != 0.0 {
+                let next = self.y + self.vy * dt_secs;
+                if next <= 0.0 {
+                    self.y = 0.0;
+                    self.vy = 0.0;
+                } else if next >= self.view_h {
+                    self.y = self.view_h;
+                    self.vy = 0.0;
+                } else {
+                    self.y = next;
+                }
+            }
         }
         // Docking is arrival-based (see `snap`): the outline only engages
         // once the gliding point actually reaches an element. The morph
