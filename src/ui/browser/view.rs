@@ -190,32 +190,29 @@ fn header_icon(icon: &'static str, size: f32, color: Color) -> Element<'static, 
         .into()
 }
 
-/// Compact history capsule: `‹ L1 · BACK` (left) or `FORWARD · R1 ›` (right).
-/// The whole cluster lives inside one pill; the label is the small dim text.
+/// Compact history capsule: `‹ L1` (left) or `R1 ›` (right). The bumper key
+/// is the only text; the chevron uses the dim label color and follows the
+/// capsule's enabled alpha.
 fn history_hint(
-    label: &'static str,
     key: &'static str,
     icon: &'static str,
-    key_first: bool,
     icon_first: bool,
     pressed: bool,
     enabled: bool,
 ) -> Element<'static, BrowserMessage> {
     const CAPSULE_H: f32 = 28.0;
-    const LABEL_SIZE: f32 = 10.0;
     const KEY_SIZE: f32 = 11.0;
     const ICON_SIZE: f32 = 14.0;
     let alpha = if enabled { 1.0 } else { 0.4 };
-    let mut parts: Vec<Element<'static, BrowserMessage>> = Vec::with_capacity(4);
-    let icon_color = theme::scale_alpha(theme::MUTED, alpha);
+    let mut parts: Vec<Element<'static, BrowserMessage>> = Vec::with_capacity(2);
+    let icon_color = theme::scale_alpha(theme::DIM, alpha);
     if icon_first {
         parts.push(header_icon(icon, ICON_SIZE, icon_color));
     }
     let key_text = || {
-        // The monospace key's cap is one pixel taller than the label's. Row
-        // centre aligns line boxes, which leaves the taller cap optically
-        // high; two pixels of top padding shifts the ink down one pixel
-        // without moving any other part of the cluster.
+        // The monospace key's cap reads one pixel high when only its line box
+        // is centred; two pixels of top padding shifts the ink down one pixel
+        // without moving the chevron.
         container(
             text(key)
                 .size(KEY_SIZE)
@@ -230,37 +227,7 @@ fn history_hint(
         })
         .into()
     };
-    let dot = || {
-        // A real circle, not a font glyph: `·` rides the baseline and reads
-        // low inside a centre-aligned row. The 3px box centres exactly with
-        // the key/label/icon line.
-        container(space())
-            .width(Length::Fixed(3.0))
-            .height(Length::Fixed(3.0))
-            .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(theme::scale_alpha(
-                    theme::MUTED,
-                    alpha * 0.8,
-                ))),
-                border: iced::Border {
-                    radius: 1.5.into(),
-                    ..iced::Border::default()
-                },
-                ..container::Style::default()
-            })
-            .into()
-    };
-    let label_text = || {
-        text(label)
-            .size(LABEL_SIZE)
-            .color(theme::scale_alpha(theme::DIM, alpha))
-            .into()
-    };
-    if key_first {
-        parts.extend([key_text(), dot(), label_text()]);
-    } else {
-        parts.extend([label_text(), dot(), key_text()]);
-    }
+    parts.push(key_text());
     if !icon_first {
         parts.push(header_icon(icon, ICON_SIZE, icon_color));
     }
@@ -345,26 +312,22 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
         .into()
 }
 
-/// One-row Browser header: Back (L1) · URL well · Forward (R1).
+/// One-row Browser header: `‹ L1` · URL well · `R1 ›`.
 fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessage> {
     let content_w = (page_w - 2.0 * BROWSER_HEADER_PAD).max(1.0);
     let layout = browser_header_layout(content_w);
     let back_enabled = panel.can_go_back();
     let forward_enabled = panel.can_go_forward();
     let back = history_hint(
-        "BACK",
         "L1",
         svg_icon::CHEVRON_LEFT_SVG,
-        true,
         true,
         panel.l1_held,
         back_enabled,
     );
     let forward = history_hint(
-        "FORWARD",
         "R1",
         svg_icon::CHEVRON_RIGHT_SVG,
-        false,
         false,
         panel.r1_held,
         forward_enabled,

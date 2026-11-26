@@ -11,9 +11,8 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 > **Ownership update:** the Browser is an in-process managed app (the
 > `sdsc-browser` process split was reverted; see
 > [single-process-browser.md](single-process-browser.md)), with a system OSK
-> and hosted UI/action contract. v0.1 has one header row — `‹ L1 · BACK` ·
-> URL well (Triangle edits) · `FORWARD · R1 ›` — above the page. The CEF
-> engine, page input, cursor, DOM, and frame-slot contracts here still apply.
+> and hosted UI/action contract. v0.1 has one header row — `‹ L1` · URL well
+> (Triangle edits) · `R1 ›` — above the page. The CEF engine, page input, cursor, DOM, and frame-slot contracts here still apply.
 
 ## Decision
 
@@ -70,10 +69,9 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 - `src/browser/keys.rs` — iced → engine keyboard mapping.
 - `src/ui/browser/state.rs` / `view.rs` — panel state + standalone-window
   rendering and `BrowserMessage`. The header is one centred row inside the
-  16:9 card: `‹ L1 · BACK` · URL well · `FORWARD · R1 ›`. Each history cluster
-  is one capsule; labels are 10px dim, keys monospace accent, and the
-  separator is a 3px filled circle centred on the key/label line (not a font
-  glyph, which would ride the baseline).
+  16:9 card: `‹ L1` · URL well · `R1 ›`. Each history cluster is one capsule
+  holding just the bumper key and its chevron; the chevron uses the dim label
+  color and both dim together when the action is unavailable.
   The URL well is 420–680px wide; equal side slots keep it centred with an 8px
   gap to each capsule. `BrowserPanel` owns the URL draft/edit state; the page
   starts below a 44px row + 1px rule.
@@ -181,8 +179,8 @@ meters still use the legacy per-surface bank.
   `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.stick`
   steps and closes the Browser window at `replay.done`; never use OS input
   injection for QA and do not leave test windows on screen.
-- v0 is single-tab with one header row (`‹ L1 · BACK` · URL well ·
-  `FORWARD · R1 ›`). History hints enable on either source: CEF capability
+- v0 is single-tab with one header row (`‹ L1` · URL well · `R1 ›`). History
+  hints enable on either source: CEF capability
   or the canonical session stack, so a post-commit capability lag cannot dim
   Back while it still works.
   The URL well ellipsizes long URLs at the end; while editing it shows the
