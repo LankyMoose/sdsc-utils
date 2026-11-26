@@ -855,19 +855,20 @@ impl App {
         &mut self,
         readings: &[launcher_input::NavReading],
         now: Instant,
-    ) -> Option<JumpDir> {
+    ) -> Option<(JumpDir, PadId)> {
         let reading = launcher_input::preferred_reading(readings)?;
         let masked = launcher_input::dpad_only(&reading.sample);
         // No D-pad held: feed neutral so a release resets repeat gating at
         // once (D-pad contacts never flicker — same discipline as the bank).
         let action = self.browser.dpad_stepper.update(&masked, now, true, true);
-        match action {
-            Some(NavAction::Up) => Some(JumpDir::Up),
-            Some(NavAction::Down) => Some(JumpDir::Down),
-            Some(NavAction::Left) => Some(JumpDir::Left),
-            Some(NavAction::Right) => Some(JumpDir::Right),
-            _ => None,
-        }
+        let jump = match action {
+            Some(NavAction::Up) => JumpDir::Up,
+            Some(NavAction::Down) => JumpDir::Down,
+            Some(NavAction::Left) => JumpDir::Left,
+            Some(NavAction::Right) => JumpDir::Right,
+            _ => return None,
+        };
+        Some((jump, reading.id.clone()))
     }
 
     /// Stream the pad cursor as the one true mouse (see `EngineCommand::MouseMove`):

@@ -223,14 +223,14 @@ In priority order:
 
 ### WO-1 — Shared navigation service
 
-- [ ] Introduce `NavInput`/`NavProfile`/`NavStep`/`NavBank`/`DualNav` in the
+- [x] Introduce `NavInput`/`NavProfile`/`NavStep`/`NavBank`/`DualNav` in the
       pad domain layer.
-- [ ] Preserve current menu values; express DQ per-stick use of the `Menu`
+- [x] Preserve current menu values; express DQ per-stick use of the `Menu`
       profile.
-- [ ] Migrate Launcher (`PadNavBank`), Home (single stepper), Browser D-pad,
+- [x] Migrate Launcher (`PadNavBank`), Home (single stepper), Browser D-pad,
       OSK Grid, and OSK DQ to the shared path.
-- [ ] Centralize step/commit feedback and per-pad haptic targeting.
-- [ ] Unit tests: deadzone/engage/release, diagonal dominance, repeat cadence,
+- [x] Centralize step/commit feedback and per-pad haptic targeting.
+- [x] Unit tests: deadzone/engage/release, diagonal dominance, repeat cadence,
       arming, multi-pad arbitration, trigger edges.
 
 ### WO-2 — Pad transport split

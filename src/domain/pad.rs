@@ -720,9 +720,176 @@ impl NavLogSnapshot {
     }
 }
 
+/// Shared navigation profile. One place for the menu deadzone/repeat feel and
+/// the surface-specific variants; call sites must not fork thresholds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NavProfile {
+    /// Per-axis deadzone applied before combining / using a stick axis.
+    pub axis_deadzone: f32,
+    /// Residual deadzone on the combined stick vector magnitude.
+    pub combined_deadzone: f32,
+    pub repeat_delay: Duration,
+    pub repeat_interval: Duration,
+    pub neutral_grace: Duration,
+    /// Keep the currently active axis on an equal-magnitude diagonal (menu).
+    /// When false, the vertical axis wins ties.
+    pub axis_lock: bool,
+    /// Emit a step cue for first steps (surface maps it to `UiSoundKind::Nav`).
+    pub step_feedback: bool,
+    /// Emit a cue for repeat steps.
+    pub repeat_feedback: bool,
+}
+
+impl Default for NavProfile {
+    fn default() -> Self {
+        Self::MENU
+    }
+}
+
+impl NavProfile {
+    /// Launcher / Home / OSK DQ. Values are the shipped menu feel; tune here.
+    pub const MENU: Self = Self {
+        axis_deadzone: STICK_AXIS_DEADZONE,
+        combined_deadzone: STICK_COMBINED_DEADZONE,
+        repeat_delay: NAV_INITIAL_DELAY,
+        repeat_interval: NAV_REPEAT,
+        neutral_grace: NAV_NEUTRAL_GRACE,
+        axis_lock: true,
+        step_feedback: true,
+        repeat_feedback: true,
+    };
+
+    /// Digital D-pad surface (OSK Grid, Browser cursor jumps). Same repeat
+    /// schedule as the menu; sticks are ignored by the caller's mask.
+    pub const DPAD: Self = Self {
+        axis_deadzone: 0.0,
+        combined_deadzone: 0.0,
+        ..Self::MENU
+    };
+
+    /// Browser virtual cursor: soft proportional stick, no per-step cue.
+    pub const CURSOR: Self = Self {
+        axis_deadzone: 0.12,
+        combined_deadzone: 0.0,
+        step_feedback: false,
+        repeat_feedback: false,
+        ..Self::MENU
+    };
+
+    /// Browser scroll: soft proportional stick + axis lock, no step cue.
+    pub const SCROLL: Self = Self {
+        axis_deadzone: 0.12,
+        combined_deadzone: 0.0,
+        step_feedback: false,
+        repeat_feedback: false,
+        ..Self::MENU
+    };
+
+    /// Shape one stick through the profile: per-axis deadzone, then the
+    /// residual combined-vector deadzone for the menu profile.
+    pub fn shape_stick(&self, x: f32, y: f32) -> (f32, f32) {
+        let x = if x.abs() < self.axis_deadzone { 0.0 } else { x };
+        let y = if y.abs() < self.axis_deadzone { 0.0 } else { y };
+        let mag = (x * x + y * y).sqrt();
+        if mag < self.combined_deadzone {
+            (0.0, 0.0)
+        } else {
+            (x, y)
+        }
+    }
+}
+
+/// Which stick a [`NavInput`] came from (or the legacy combined vector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavStick {
+    Left,
+    Right,
+    Combined,
+}
+
+/// One raw navigation sample before profile shaping. Carries pad identity so
+/// every step can target the pad that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavInput {
+    pub pad: PadId,
+    pub stick: NavStick,
+    pub x: f32,
+    pub y: f32,
+    pub dpad_up: bool,
+    pub dpad_down: bool,
+    pub dpad_left: bool,
+    pub dpad_right: bool,
+}
+
+impl NavInput {
+    pub fn from_sample(pad: PadId, sample: &PadSample, stick: NavStick) -> Self {
+        let (x, y) = match stick {
+            NavStick::Left => (sample.lstick_x, sample.lstick_y),
+            NavStick::Right => (sample.rstick_x, sample.rstick_y),
+            NavStick::Combined => (sample.stick_x, sample.stick_y),
+        };
+        Self {
+            pad,
+            stick,
+            x,
+            y,
+            dpad_up: sample.dpad_up,
+            dpad_down: sample.dpad_down,
+            dpad_left: sample.dpad_left,
+            dpad_right: sample.dpad_right,
+        }
+    }
+
+    /// Build a raw input, then shape the stick with `profile`. Use for OSK DQ
+    /// and any other raw-stick host; prepared combined vectors pass
+    /// [`NavProfile::MENU`] already shaped (x/y effectively unchanged because
+    /// the residual/deadzone are already applied upstream).
+    pub fn shaped_from_sample(
+        pad: PadId,
+        sample: &PadSample,
+        stick: NavStick,
+        profile: NavProfile,
+    ) -> Self {
+        let mut input = Self::from_sample(pad, sample, stick);
+        let (x, y) = profile.shape_stick(input.x, input.y);
+        input.x = x;
+        input.y = y;
+        input
+    }
+
+    /// Mask to the fields a [`NavStepper`] consumes.
+    pub fn to_sample(&self) -> PadSample {
+        PadSample {
+            stick_x: self.x,
+            stick_y: self.y,
+            dpad_up: self.dpad_up,
+            dpad_down: self.dpad_down,
+            dpad_left: self.dpad_left,
+            dpad_right: self.dpad_right,
+            ..PadSample::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavPhase {
+    First,
+    Repeat,
+    Release,
+}
+
+/// One shared navigation step. Feedback policy is on the profile; the app
+/// maps it to sound/haptic on `pad`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavStep {
+    pub direction: NavAction,
+    pub phase: NavPhase,
+}
+
 /// Shared 2D nav stepper for D-pad + sticks (dominant axis; prevents double-fire).
 #[derive(Debug, Clone, Default)]
 pub struct NavStepper {
+    profile: NavProfile,
     /// Encoded direction: -2 Left, -1 Up, 1 Down, 2 Right, 0 idle.
     direction: i8,
     next_fire: Option<Instant>,
@@ -735,8 +902,8 @@ pub struct NavStepper {
     /// When the sample drops to neutral while a direction is active, the moment
     /// of the first neutral tick. Transient dropouts (analog threshold hover,
     /// e.g. a worn stick wavering across the stick deadzone) must not reset
-    /// repeat gating — only a neutral held past [`NAV_NEUTRAL_GRACE`] is a
-    /// deliberate release.
+    /// repeat gating — only a neutral held past [`NavProfile::neutral_grace`]
+    /// is a deliberate release.
     neutral_since: Option<Instant>,
 }
 
@@ -751,6 +918,19 @@ impl NavStepper {
         }
     }
 
+    pub fn with_profile(profile: NavProfile) -> Self {
+        Self {
+            profile,
+            ..Self::default()
+        }
+    }
+
+    pub fn profile(&self) -> NavProfile {
+        self.profile
+    }
+
+    /// Shared step entry point: returns First/Repeat/Release.
+    ///
     /// `horizontal`: left/right move. Vertical-only keeps Up/Down.
     /// `allow_vertical`: false on the horizontal Games strip where Up/Down are
     /// suppressed — vertical stick wobble must not enter direction state, or a
@@ -759,25 +939,26 @@ impl NavStepper {
     /// repeat timer). Forcing want_up/want_down false here keeps direction
     /// pinned so initial-delay + repeat gating holds.
     ///
-    /// A neutral sample only resets direction state after [`NAV_NEUTRAL_GRACE`]:
-    /// analog sticks hovering at the deadzone edge flicker between deflected
-    /// and neutral (0↔dir), and an instant reset would fire immediately on
-    /// every return, bypassing repeat gating. Bridging brief dropouts keeps a
-    /// steady hold gated; a deliberate release still resets, and any
-    /// direction change (including the opposite direction) still fires at once.
+    /// A neutral sample only resets direction state after
+    /// [`NavProfile::neutral_grace`]: analog sticks hovering at the deadzone
+    /// edge flicker between deflected and neutral (0↔dir), and an instant
+    /// reset would fire immediately on every return, bypassing repeat gating.
+    /// Bridging brief dropouts keeps a steady hold gated; a deliberate release
+    /// still resets, and any direction change (including the opposite
+    /// direction) still fires at once.
     ///
     /// Digital D-pad input is exempt from the grace: D-pad contacts don't
     /// flicker, so a neutral sample after a D-pad-driven direction is a
     /// deliberate release and resets at once. Without this, fast same-direction
     /// re-taps (release shorter than the grace) stay on the repeat schedule
     /// and the re-press is swallowed instead of firing.
-    pub fn update(
+    pub fn step(
         &mut self,
         sample: &PadSample,
         now: Instant,
         horizontal: bool,
         allow_vertical: bool,
-    ) -> Option<NavAction> {
+    ) -> Option<NavStep> {
         let want_left = horizontal && (sample.dpad_left || sample.stick_x < 0.0);
         let want_right = horizontal && (sample.dpad_right || sample.stick_x > 0.0);
         let want_up = allow_vertical && (sample.dpad_up || sample.stick_y < 0.0);
@@ -807,7 +988,7 @@ impl NavStepper {
                 } else if ay > ax {
                     // Vertical wins on stronger Y (or equal when both sticks zero → dpad tie).
                     vert.unwrap_or(0)
-                } else if self.direction.abs() == 2 {
+                } else if self.profile.axis_lock && self.direction.abs() == 2 {
                     // Stick-magnitude tie: keep the active axis so diagonals don't flicker.
                     h * 2
                 } else {
@@ -827,24 +1008,16 @@ impl NavStepper {
             // Digital D-pad release: deliberate by construction, reset at once
             // so a fast re-tap fires as a new press (no repeat-gating swallow).
             if self.direction_from_dpad {
-                self.direction = 0;
-                self.direction_from_dpad = false;
-                self.next_fire = None;
-                self.neutral_since = None;
-                return None;
+                return Some(self.release_step(NavPhase::Release));
             }
             // Active hold dropped to neutral: bridge transient dropouts so a
             // flickering stick cannot reset repeat gating; only a deliberate
             // (grace-held) release resets.
             let since = *self.neutral_since.get_or_insert(now);
-            if now.saturating_duration_since(since) < NAV_NEUTRAL_GRACE {
+            if now.saturating_duration_since(since) < self.profile.neutral_grace {
                 return None;
             }
-            self.direction = 0;
-            self.direction_from_dpad = false;
-            self.next_fire = None;
-            self.neutral_since = None;
-            return None;
+            return Some(self.release_step(NavPhase::Release));
         }
         self.neutral_since = None;
         // Whether the D-pad (not just the stick) drives this direction now.
@@ -861,16 +1034,58 @@ impl NavStepper {
         if self.direction != direction {
             self.direction = direction;
             self.direction_from_dpad = from_dpad;
-            self.next_fire = Some(now + NAV_INITIAL_DELAY);
-            return Self::action_for(direction);
+            self.next_fire = Some(now + self.profile.repeat_delay);
+            return Self::action_for(direction).map(|direction| NavStep {
+                direction,
+                phase: NavPhase::First,
+            });
         }
 
         self.direction_from_dpad = from_dpad;
         if self.next_fire.is_some_and(|t| now >= t) {
-            self.next_fire = Some(now + NAV_REPEAT);
-            return Self::action_for(direction);
+            self.next_fire = Some(now + self.profile.repeat_interval);
+            return Self::action_for(direction).map(|direction| NavStep {
+                direction,
+                phase: NavPhase::Repeat,
+            });
         }
         None
+    }
+
+    /// Shared step from a pad-identified input.
+    pub fn step_input(
+        &mut self,
+        input: &NavInput,
+        now: Instant,
+        horizontal: bool,
+        allow_vertical: bool,
+    ) -> Option<NavStep> {
+        let sample = input.to_sample();
+        self.step(&sample, now, horizontal, allow_vertical)
+    }
+
+    fn release_step(&mut self, phase: NavPhase) -> NavStep {
+        let direction = Self::action_for(self.direction).unwrap_or(NavAction::Up);
+        self.direction = 0;
+        self.direction_from_dpad = false;
+        self.next_fire = None;
+        self.neutral_since = None;
+        NavStep { direction, phase }
+    }
+
+    /// Behavior-preserving wrapper: First/Repeat map to the legacy action,
+    /// Release stays invisible to existing call sites.
+    pub fn update(
+        &mut self,
+        sample: &PadSample,
+        now: Instant,
+        horizontal: bool,
+        allow_vertical: bool,
+    ) -> Option<NavAction> {
+        match self.step(sample, now, horizontal, allow_vertical) {
+            Some(step) if step.phase != NavPhase::Release => Some(step.direction),
+            _ => None,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -1356,10 +1571,200 @@ struct PadSlot {
 
 /// Bank of per-pad nav machines. Never merges samples across pads.
 #[derive(Debug, Clone, Default)]
-pub struct PadNavBank {
+pub struct NavBank {
     slots: HashMap<PadId, PadSlot>,
     /// When true, newly seen pads start armed (e.g. after launcher opens cleanly).
     arm_new_pads: bool,
+}
+
+/// Transitional alias while call sites move to [`NavBank`].
+pub type PadNavBank = NavBank;
+
+/// Which DQ half / stick a step belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavHalf {
+    Left,
+    Right,
+}
+
+/// One step from one pad's half. Feedback target is `pad`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DualStep {
+    pub pad: PadId,
+    pub half: NavHalf,
+    pub step: NavStep,
+}
+
+/// A trigger press edge for one pad's half (L2 = left, R2 = right).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerEdge {
+    pub pad: PadId,
+    pub half: NavHalf,
+}
+
+/// Result of one all-live-pad DQ tick. At most one step per half; trigger
+/// edges are consumed per pad so a held trigger on one pad cannot mask another.
+#[derive(Debug, Clone, Default)]
+pub struct DualNavTick {
+    pub steps: Vec<DualStep>,
+    pub triggers: Vec<TriggerEdge>,
+    pub armed_pads: usize,
+    pub unarmed_pads: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DualSlot {
+    left: NavStepper,
+    right: NavStepper,
+    triggers: TriggerLatch,
+    armed: bool,
+}
+
+/// All-live-pad Dual QWERTY navigation: two independent menu-profile cursors
+/// plus trigger edges, with per-pad arming and first-step arbitration per half.
+#[derive(Debug, Clone, Default)]
+pub struct DualNav {
+    slots: HashMap<PadId, DualSlot>,
+    arm_new_pads: bool,
+    profile: NavProfile,
+}
+
+impl DualNav {
+    pub fn new(profile: NavProfile) -> Self {
+        Self {
+            profile,
+            ..Self::default()
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.slots.clear();
+        self.arm_new_pads = false;
+    }
+
+    /// Clear machines; new pads arm immediately when `arm_immediately`.
+    pub fn prepare_on_open(&mut self, arm_immediately: bool) {
+        self.slots.clear();
+        self.arm_new_pads = arm_immediately;
+    }
+
+    /// Feed every live pad. DQ keeps the halves independent: each half reads
+    /// only its own stick (D-pad and the other stick zeroed).
+    pub fn tick(&mut self, readings: &[NavReading], now: Instant) -> DualNavTick {
+        self.sync_presence(readings);
+        let mut result = DualNavTick::default();
+        for reading in readings {
+            let Some(slot) = self.slots.get_mut(&reading.id) else {
+                continue;
+            };
+            if !slot.armed {
+                slot.left.reset();
+                slot.right.reset();
+                slot.triggers.reset();
+                if sample_nav_resting(&reading.sample) {
+                    slot.armed = true;
+                    result.armed_pads += 1;
+                } else {
+                    result.unarmed_pads += 1;
+                }
+                continue;
+            }
+            result.armed_pads += 1;
+
+            let left = NavInput::shaped_from_sample(
+                reading.id.clone(),
+                &reading.sample,
+                NavStick::Left,
+                self.profile,
+            );
+            let right = NavInput::shaped_from_sample(
+                reading.id.clone(),
+                &reading.sample,
+                NavStick::Right,
+                self.profile,
+            );
+            let mut left_sample = left.to_sample();
+            let mut right_sample = right.to_sample();
+            // DQ halves are stick-only; the shared D-pad drives Grid.
+            left_sample.dpad_up = false;
+            left_sample.dpad_down = false;
+            left_sample.dpad_left = false;
+            left_sample.dpad_right = false;
+            right_sample.dpad_up = false;
+            right_sample.dpad_down = false;
+            right_sample.dpad_left = false;
+            right_sample.dpad_right = false;
+            if !result.steps.iter().any(|step| step.half == NavHalf::Left)
+                && let Some(step) = slot.left.step(&left_sample, now, true, true)
+            {
+                result.steps.push(DualStep {
+                    pad: reading.id.clone(),
+                    half: NavHalf::Left,
+                    step,
+                });
+            }
+            if !result.steps.iter().any(|step| step.half == NavHalf::Right)
+                && let Some(step) = slot.right.step(&right_sample, now, true, true)
+            {
+                result.steps.push(DualStep {
+                    pad: reading.id.clone(),
+                    half: NavHalf::Right,
+                    step,
+                });
+            }
+            for half in slot.triggers.update(reading.sample.l2, reading.sample.r2) {
+                result.triggers.push(TriggerEdge {
+                    pad: reading.id.clone(),
+                    half,
+                });
+            }
+        }
+        result
+    }
+
+    fn sync_presence(&mut self, readings: &[NavReading]) {
+        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
+        self.slots.retain(|id, _| live.contains(id));
+        for reading in readings {
+            if self.slots.contains_key(&reading.id) {
+                continue;
+            }
+            let mut slot = DualSlot {
+                left: NavStepper::with_profile(self.profile),
+                right: NavStepper::with_profile(self.profile),
+                ..DualSlot::default()
+            };
+            slot.armed = self.arm_new_pads;
+            self.slots.insert(reading.id.clone(), slot);
+        }
+    }
+}
+
+/// Rising-edge latch for L2/R2 on one pad. Holding a trigger fires once.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TriggerLatch {
+    l2: bool,
+    r2: bool,
+}
+
+impl TriggerLatch {
+    /// Returns the halves whose trigger went down this sample (left first).
+    pub fn update(&mut self, l2: bool, r2: bool) -> Vec<NavHalf> {
+        let mut out = Vec::new();
+        if l2 && !self.l2 {
+            out.push(NavHalf::Left);
+        }
+        if r2 && !self.r2 {
+            out.push(NavHalf::Right);
+        }
+        self.l2 = l2;
+        self.r2 = r2;
+        out
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Which face / Options / Create buttons are currently held (OR across armed pads).
@@ -1421,7 +1826,7 @@ pub struct PadTickResult {
     pub diag: Option<NavReading>,
 }
 
-impl PadNavBank {
+impl NavBank {
     pub fn reset(&mut self) {
         self.slots.clear();
         self.arm_new_pads = false;
@@ -3564,5 +3969,241 @@ mod tests {
             stepper.update(&left, t0 + Duration::from_millis(460), true, false),
             Some(NavAction::Left)
         );
+    }
+
+    #[test]
+    fn menu_profile_shapes_raw_dq_stick_and_ignores_light_touch() {
+        let profile = NavProfile::MENU;
+        assert_eq!(profile.shape_stick(0.65, 0.0), (0.0, 0.0));
+        let (x, y) = profile.shape_stick(-0.95, 0.0);
+        assert!(x < 0.0 && y == 0.0);
+        // Residual combined deadzone still kills tiny vector sums.
+        assert_eq!(profile.shape_stick(0.1, 0.1), (0.0, 0.0));
+        // D-pad profile is digital: no stick shaping.
+        assert_eq!(NavProfile::DPAD.shape_stick(0.65, 0.0), (0.65, 0.0));
+    }
+
+    #[test]
+    fn nav_step_reports_first_repeat_and_release() {
+        let mut stepper = NavStepper::with_profile(NavProfile::MENU);
+        let t0 = Instant::now();
+        let left = PadSample {
+            stick_x: -0.95,
+            ..Default::default()
+        };
+        assert_eq!(
+            stepper.step(&left, t0, true, true),
+            Some(NavStep {
+                direction: NavAction::Left,
+                phase: NavPhase::First
+            })
+        );
+        assert!(
+            stepper
+                .step(&left, t0 + Duration::from_millis(100), true, true)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.step(&left, t0 + Duration::from_millis(280), true, true),
+            Some(NavStep {
+                direction: NavAction::Left,
+                phase: NavPhase::Repeat
+            })
+        );
+        // Wrapper still hides the release step from legacy call sites.
+        assert!(
+            stepper
+                .update(
+                    &PadSample::default(),
+                    t0 + Duration::from_millis(400),
+                    true,
+                    true
+                )
+                .is_none()
+        );
+        assert_eq!(
+            stepper.step(
+                &PadSample::default(),
+                t0 + Duration::from_millis(520),
+                true,
+                true
+            ),
+            Some(NavStep {
+                direction: NavAction::Left,
+                phase: NavPhase::Release
+            })
+        );
+    }
+
+    #[test]
+    fn nav_profile_axis_lock_keeps_active_horizontal_on_tie() {
+        let mut stepper = NavStepper::with_profile(NavProfile::MENU);
+        let t0 = Instant::now();
+        let left = PadSample {
+            stick_x: -0.5,
+            ..Default::default()
+        };
+        assert_eq!(stepper.update(&left, t0, true, true), Some(NavAction::Left));
+        // Equal-magnitude diagonal keeps the horizontal axis while locked:
+        // no direction change, and the repeat is still gated until +280ms.
+        let tie = PadSample {
+            stick_x: -0.5,
+            stick_y: 0.5,
+            ..Default::default()
+        };
+        assert!(
+            stepper
+                .update(&tie, t0 + Duration::from_millis(100), true, true)
+                .is_none()
+        );
+        assert_eq!(
+            stepper.step(&tie, t0 + Duration::from_millis(280), true, true),
+            Some(NavStep {
+                direction: NavAction::Left,
+                phase: NavPhase::Repeat
+            })
+        );
+        let mut unlocked = NavStepper::with_profile(NavProfile {
+            axis_lock: false,
+            ..NavProfile::MENU
+        });
+        assert_eq!(
+            unlocked.update(&tie, t0, true, true),
+            Some(NavAction::Down),
+            "vertical wins ties without the lock"
+        );
+        assert_eq!(
+            unlocked.update(&tie, t0 + Duration::from_millis(100), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn dual_nav_requires_rest_before_arming_and_moves_independent_halves() {
+        let mut nav = DualNav::new(NavProfile::MENU);
+        nav.prepare_on_open(false);
+        let t0 = Instant::now();
+        let mut held = PadSample {
+            lstick_x: -0.95,
+            ..Default::default()
+        };
+        held.stick_x = held.lstick_x;
+        let tick = nav.tick(&[reading("a", held.clone())], t0);
+        assert!(tick.steps.is_empty(), "held pad must not move before rest");
+        assert_eq!(tick.unarmed_pads, 1);
+        let tick = nav.tick(&[reading("a", PadSample::default())], t0);
+        assert_eq!(tick.armed_pads, 1);
+        let tick = nav.tick(&[reading("a", held)], t0 + Duration::from_millis(10));
+        assert_eq!(tick.steps.len(), 1);
+        assert_eq!(tick.steps[0].half, NavHalf::Left);
+        assert_eq!(tick.steps[0].step.direction, NavAction::Left);
+
+        let mut right = PadSample {
+            rstick_y: 0.95,
+            ..Default::default()
+        };
+        right.stick_y = right.rstick_y;
+        let tick = nav.tick(&[reading("a", right)], t0 + Duration::from_millis(20));
+        assert_eq!(tick.steps.len(), 1);
+        assert_eq!(tick.steps[0].half, NavHalf::Right);
+    }
+
+    #[test]
+    fn dual_nav_first_step_wins_per_half_per_tick() {
+        let mut nav = DualNav::new(NavProfile::MENU);
+        nav.prepare_on_open(true);
+        let t0 = Instant::now();
+        let mut first = PadSample {
+            lstick_x: -0.95,
+            ..Default::default()
+        };
+        first.stick_x = first.lstick_x;
+        let mut second = PadSample {
+            rstick_y: 0.95,
+            ..Default::default()
+        };
+        second.stick_y = second.rstick_y;
+        let tick = nav.tick(&[reading("a", first), reading("b", second)], t0);
+        assert_eq!(tick.steps.len(), 2);
+        assert_eq!(tick.steps[0].pad.as_str(), "a");
+        assert_eq!(tick.steps[0].half, NavHalf::Left);
+        assert_eq!(tick.steps[1].pad.as_str(), "b");
+        assert_eq!(tick.steps[1].half, NavHalf::Right);
+        // The first pad keeps owning repeat steps for its half.
+        let tick = nav.tick(
+            &[
+                reading(
+                    "a",
+                    PadSample {
+                        lstick_x: -0.95,
+                        stick_x: -0.95,
+                        ..Default::default()
+                    },
+                ),
+                reading(
+                    "b",
+                    PadSample {
+                        lstick_y: 0.95,
+                        stick_y: 0.95,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            t0 + Duration::from_millis(280),
+        );
+        assert_eq!(tick.steps.len(), 1);
+        assert_eq!(tick.steps[0].pad.as_str(), "a");
+    }
+
+    #[test]
+    fn dual_nav_triggers_are_latched_per_pad() {
+        let mut nav = DualNav::new(NavProfile::MENU);
+        nav.prepare_on_open(true);
+        let t0 = Instant::now();
+        let a_held = PadSample {
+            l2: true,
+            ..Default::default()
+        };
+        let tick = nav.tick(&[reading("a", a_held.clone())], t0);
+        assert_eq!(tick.triggers.len(), 1);
+        assert_eq!(tick.triggers[0].half, NavHalf::Left);
+        // Holding A's L2 must not mask a fresh B press.
+        let tick = nav.tick(
+            &[
+                reading("a", a_held),
+                reading(
+                    "b",
+                    PadSample {
+                        l2: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            t0 + Duration::from_millis(10),
+        );
+        assert_eq!(tick.triggers.len(), 1);
+        assert_eq!(tick.triggers[0].pad.as_str(), "b");
+        // Holding both still fires once per pad.
+        let tick = nav.tick(
+            &[
+                reading(
+                    "a",
+                    PadSample {
+                        l2: true,
+                        ..Default::default()
+                    },
+                ),
+                reading(
+                    "b",
+                    PadSample {
+                        r2: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            t0 + Duration::from_millis(20),
+        );
+        assert_eq!(tick.triggers.len(), 1);
+        assert_eq!(tick.triggers[0].half, NavHalf::Right);
     }
 }

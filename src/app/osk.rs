@@ -1,10 +1,13 @@
 //! System OSK session: input routing, text-action dispatch, and the topmost
 //! no-activate overlay window. The Browser never owns OSK state or layout.
 
-use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadSample};
+use crate::domain::pad::{
+    DualNav, NavAction, NavHalf, NavPhase, NavProfile, NavStepper, PadAction, PadButton,
+    PadButtonAction, PadSample,
+};
 use crate::persist::prefs::OskMode;
 use crate::platform::ui_sound::UiSoundKind;
-use crate::ui::osk::dual::{Half, TriggerLatch};
+use crate::ui::osk::dual::Half;
 use crate::ui::osk::grid::GridKey;
 use crate::ui::osk::{Dir, OskState, OskTarget, Output};
 use iced::{Point, Size, Task, window};
@@ -13,15 +16,13 @@ use std::time::Instant;
 use super::{App, Message};
 
 /// System-owned OSK session. `state` is pure UI state; this struct owns the
-/// overlay window and pad edge latches.
+/// overlay window and the all-live-pad nav bank.
 pub struct SystemOsk {
     pub window: Option<window::Id>,
     pub state: OskState,
     pub pending_show: bool,
     pub cover: Option<crate::ui::layout::MonitorCover>,
-    pub left_stick: NavStepper,
-    pub right_stick: NavStepper,
-    pub triggers: TriggerLatch,
+    pub dual_nav: DualNav,
     pub grid_stepper: NavStepper,
 }
 
@@ -32,10 +33,8 @@ impl SystemOsk {
             state: OskState::new(mode),
             pending_show: false,
             cover: None,
-            left_stick: NavStepper::default(),
-            right_stick: NavStepper::default(),
-            triggers: TriggerLatch::default(),
-            grid_stepper: NavStepper::default(),
+            dual_nav: DualNav::new(NavProfile::MENU),
+            grid_stepper: NavStepper::with_profile(NavProfile::DPAD),
         }
     }
 }
@@ -51,6 +50,8 @@ impl App {
             return self.show_osk_window();
         }
         self.osk.state.open(target);
+        self.osk.dual_nav.prepare_on_open(false);
+        self.osk.grid_stepper.reset();
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.open")
             .field("target", target.label())
             .field("mode", self.osk.state.mode.label())
@@ -125,9 +126,7 @@ impl App {
         if target == Some(OskTarget::BrowserUrl) && !matches!(reason, "keyboard" | "ime") {
             self.browser.panel.cancel_url_edit();
         }
-        self.osk.left_stick.reset();
-        self.osk.right_stick.reset();
-        self.osk.triggers.reset();
+        self.osk.dual_nav.reset();
         self.osk.grid_stepper.reset();
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.close")
             .field("reason", reason)
@@ -157,9 +156,7 @@ impl App {
             return Task::none();
         }
         self.osk.state.set_mode(mode);
-        self.osk.left_stick.reset();
-        self.osk.right_stick.reset();
-        self.osk.triggers.reset();
+        self.osk.dual_nav.reset();
         self.osk.grid_stepper.reset();
         if let Some(id) = self.osk.window {
             return crate::ui::layout::invalidate_window(id);
@@ -172,9 +169,7 @@ impl App {
             self.osk.window = None;
             self.osk.pending_show = false;
             self.osk.state.close();
-            self.osk.left_stick.reset();
-            self.osk.right_stick.reset();
-            self.osk.triggers.reset();
+            self.osk.dual_nav.reset();
             self.osk.grid_stepper.reset();
         }
         Task::none()
@@ -265,40 +260,49 @@ impl App {
             crate::controller::hid::diag::diag_info("ui-diag: PS opens home over OSK");
             return self.close_osk("home").chain(self.toggle_home());
         }
-        let Some(reading) = crate::ui::launcher::input::preferred_reading(readings) else {
-            return Task::none();
-        };
         let now = Instant::now();
-        let sample = &reading.sample;
+        let previous_haptic = self.haptic_pad_serial.take();
         let mut outputs: Vec<Output> = Vec::new();
+        let mut task = Task::none();
 
         match self.osk.state.mode {
             OskMode::Dual => {
-                let left = side_stick(sample, true);
-                if let Some(action) = self.osk.left_stick.update(&left, now, true, true)
-                    && let Some(direction) = nav_dir(action)
-                {
-                    self.osk.state.dual_move(Half::Left, direction);
+                let tick = self.osk.dual_nav.tick(readings, now);
+                for step in tick.steps {
+                    if step.step.phase == NavPhase::Release {
+                        continue;
+                    }
+                    let Some(direction) = nav_dir(step.step.direction) else {
+                        continue;
+                    };
+                    self.set_haptic_pad_from_id(Some(&step.pad));
+                    self.osk.state.dual_move(half(step.half), direction);
+                    self.play_ui_cue(UiSoundKind::Nav);
                 }
-                let right = side_stick(sample, false);
-                if let Some(action) = self.osk.right_stick.update(&right, now, true, true)
-                    && let Some(direction) = nav_dir(action)
-                {
-                    self.osk.state.dual_move(Half::Right, direction);
-                }
-                // Each trigger commits the cursor on its own half. L2/R2 are
-                // edges: holding one types once.
-                for half in self.osk.triggers.update(sample.l2, sample.r2) {
-                    outputs.push(Output::Text(self.osk.state.dual_key(half)));
+                for edge in tick.triggers {
+                    self.set_haptic_pad_from_id(Some(&edge.pad));
+                    self.play_ui_cue(UiSoundKind::Action);
+                    outputs.push(Output::Text(self.osk.state.dual_key(half(edge.half))));
                 }
             }
             OskMode::Grid => {
-                let masked = crate::ui::launcher::input::dpad_only(sample);
-                if let Some(action) = self.osk.grid_stepper.update(&masked, now, true, true)
-                    && let Some(direction) = nav_dir(action)
-                {
+                // First pad that produces a step owns this tick; the D-pad is
+                // digital, so a held pad repeats on its own schedule.
+                for reading in readings {
+                    let masked = crate::ui::launcher::input::dpad_only(&reading.sample);
+                    let Some(step) = self.osk.grid_stepper.step(&masked, now, true, true) else {
+                        continue;
+                    };
+                    if step.phase == NavPhase::Release {
+                        continue;
+                    }
+                    let Some(direction) = nav_dir(step.direction) else {
+                        continue;
+                    };
+                    self.set_haptic_pad_from_id(Some(&reading.id));
                     self.osk.state.grid_move(direction);
                     self.play_ui_cue(UiSoundKind::Nav);
+                    break;
                 }
             }
         }
@@ -308,6 +312,8 @@ impl App {
             .iter()
             .find(|action| action.action == PadButtonAction::Tap)
         {
+            self.set_haptic_pad_from_id(Some(&action.pad));
+            self.play_ui_cue(UiSoundKind::Action);
             match action.button {
                 PadButton::Cross => match self.osk.state.mode {
                     OskMode::Dual => outputs.push(Output::Space),
@@ -328,16 +334,13 @@ impl App {
             }
         }
 
-        let mut task = Task::none();
         for output in outputs {
             task = task.chain(self.apply_osk_output(output));
         }
         if close {
             task = task.chain(self.close_osk("pad"));
         }
-        if let Some(id) = self.osk.window {
-            task = task.chain(crate::ui::layout::invalidate_window(id));
-        }
+        self.haptic_pad_serial = previous_haptic;
         task
     }
 
@@ -452,12 +455,18 @@ impl App {
         sample.stick_x = sample.lstick_x;
         sample.stick_y = sample.lstick_y;
         let pad = crate::domain::pad::PadId("replay".into());
+        let neutral = crate::ui::launcher::input::NavReading {
+            id: pad.clone(),
+            sample: PadSample::default(),
+            source: "replay",
+        };
         let reading = crate::ui::launcher::input::NavReading {
             id: pad,
             sample,
             source: "replay",
         };
-        self.on_osk_pad(&[reading], &[])
+        self.on_osk_pad(&[neutral], &[])
+            .chain(self.on_osk_pad(&[reading], &[]))
     }
 
     /// Debug replay: press/release one trigger (or both) so DQ commits through
@@ -475,6 +484,11 @@ impl App {
             _ => return Task::none(),
         };
         let pad = crate::domain::pad::PadId("replay".into());
+        let neutral = crate::ui::launcher::input::NavReading {
+            id: pad.clone(),
+            sample: PadSample::default(),
+            source: "replay",
+        };
         let press = crate::ui::launcher::input::NavReading {
             id: pad.clone(),
             sample: PadSample {
@@ -489,7 +503,8 @@ impl App {
             sample: PadSample::default(),
             source: "replay",
         };
-        self.on_osk_pad(&[press], &[])
+        self.on_osk_pad(&[neutral], &[])
+            .chain(self.on_osk_pad(&[press], &[]))
             .chain(self.on_osk_pad(&[release], &[]))
     }
 
@@ -542,18 +557,11 @@ impl App {
     }
 }
 
-/// One stick as a nav sample. DQ keeps the halves independent, so the D-pad
-/// and the other stick are deliberately zeroed.
-fn side_stick(sample: &PadSample, left: bool) -> PadSample {
-    let (x, y) = if left {
-        (sample.lstick_x, sample.lstick_y)
-    } else {
-        (sample.rstick_x, sample.rstick_y)
-    };
-    PadSample {
-        stick_x: x,
-        stick_y: y,
-        ..PadSample::default()
+/// Map a shared nav half to the DQ layout half.
+fn half(nav: NavHalf) -> Half {
+    match nav {
+        NavHalf::Left => Half::Left,
+        NavHalf::Right => Half::Right,
     }
 }
 

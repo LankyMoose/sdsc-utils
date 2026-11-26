@@ -66,9 +66,9 @@ def main() -> int:
         {"app": "launcher", "action": "pad.dir", "params": {"dir": "down"}},
         {"app": "launcher", "action": "pad.tap", "params": {"button": "cross"}},
         # X: left cursor D -> C (down) -> X (left).
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.65}},
+        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.95}},
         {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": -0.65, "y": 0.0}},
+        {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": -0.95, "y": 0.0}},
         {"app": "launcher", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
         {"app": "launcher", "action": "osk.trigger", "params": {"side": "left"}},
         # Options is Enter: commit the OSK text into the form, then save.

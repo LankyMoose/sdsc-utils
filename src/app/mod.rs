@@ -56,8 +56,8 @@ use crate::ui::launcher::art_worker::ArtOwner;
 use crate::ui::launcher::cursor_hide;
 use crate::ui::launcher::gesture::{self, ChordReleaseGate};
 use crate::ui::launcher::input::{
-    self as launcher_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavLogSnapshot,
-    PadNavBank,
+    self as launcher_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavBank,
+    NavLogSnapshot, NavProfile, NavStepper,
 };
 use crate::ui::launcher::view::{self as launcher_view, LauncherMessage};
 use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
@@ -799,7 +799,7 @@ pub struct App {
     /// When Launcher was last revealed (unfocus grace).
     launcher_revealed_at: Option<Instant>,
     gesture_detectors: GestureDetectorBank,
-    pad_nav: PadNavBank,
+    pad_nav: NavBank,
     /// Source-action delivery gate (sequence dedupe + owner arming).
     pad_actions: PadActionGate,
     /// Source taps waiting for a pad frame to run through the surface handler.
@@ -1192,9 +1192,13 @@ impl App {
             last_start_paint_active: std::cell::Cell::new(false),
             launcher_nav_ready: false,
             launcher_state: launcher_view::State::default(),
-            browser: browser::BrowserAppState {
-                engine: browser_engine,
-                ..Default::default()
+            browser: {
+                let mut browser = browser::BrowserAppState {
+                    engine: browser_engine,
+                    ..Default::default()
+                };
+                browser.dpad_stepper = NavStepper::with_profile(NavProfile::DPAD);
+                browser
             },
             osk: osk::SystemOsk::new(osk_mode),
             install_policy: installs::AppInstallPolicy::new(install_limit),
@@ -1210,7 +1214,7 @@ impl App {
             home_face_latch_until: None,
             launcher_revealed_at: None,
             gesture_detectors: GestureDetectorBank::default(),
-            pad_nav: PadNavBank::default(),
+            pad_nav: NavBank::default(),
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
             pending_browser_trace: None,

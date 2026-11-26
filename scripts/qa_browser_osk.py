@@ -97,11 +97,11 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
             {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
             {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
             # Move the left cursor D -> F and type F.
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.65, "y": 0.0}},
+            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.95, "y": 0.0}},
             {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
             {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
             # Move the right cursor K -> J and type J. Both halves stay independent.
-            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": -0.65, "y": 0.0}},
+            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": -0.95, "y": 0.0}},
             {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": 0.0, "y": 0.0}},
             {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
             # Cross Space, Triangle Backspace.

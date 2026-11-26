@@ -535,7 +535,7 @@ impl Default for State {
             focus: HomeFocus::Apps,
             launcher_enabled: true,
             engine_ready: false,
-            nav: crate::domain::pad::NavStepper::default(),
+            nav: crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU),
             cross_held: false,
             square_held: false,
             triangle_held: false,
@@ -896,7 +896,8 @@ impl State {
     pub fn on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
         self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
-        self.nav = crate::domain::pad::NavStepper::default();
+        self.nav =
+            crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU);
         self.cross_held = false;
         self.square_held = false;
         self.triangle_held = false;

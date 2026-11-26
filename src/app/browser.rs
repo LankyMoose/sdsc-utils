@@ -6,7 +6,9 @@
 //! `notes/browser-embedding.md` for the engine/cursor contract.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
-use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadId};
+use crate::domain::pad::{
+    NavAction, NavBank, NavStepper, PadAction, PadButton, PadButtonAction, PadId,
+};
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
@@ -133,7 +135,7 @@ pub struct BrowserAppState {
     pub dpad_stepper: NavStepper,
     /// Browser-window pad bank: face/bumper edges + reader nav. The engine
     /// cursor uses `dpad_stepper` and raw stick samples instead.
-    pub nav: crate::domain::pad::PadNavBank,
+    pub nav: NavBank,
     /// First fresh Browser surface attempted the persisted-strip restore.
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
@@ -1671,7 +1673,8 @@ impl super::App {
         );
         if engine_mode {
             self.tick_browser_cursor(readings, now);
-            if let Some(jump) = self.poll_browser_dpad_jump(readings, now) {
+            if let Some((jump, pad)) = self.poll_browser_dpad_jump(readings, now) {
+                self.set_haptic_pad_from_id(Some(&pad));
                 self.play_ui_cue(UiSoundKind::Nav);
                 self.browser.panel.jump_cursor(jump);
             }
