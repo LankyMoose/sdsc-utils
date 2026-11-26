@@ -127,6 +127,15 @@ struct Offset<'a, Message> {
     offset_y: f32,
 }
 
+impl Offset<'_, ()> {
+    fn child_cursor(offset_y: f32, cursor: mouse::Cursor) -> mouse::Cursor {
+        cursor
+            .position()
+            .map(|point| mouse::Cursor::Available(iced::Point::new(point.x, point.y - offset_y)))
+            .unwrap_or(cursor)
+    }
+}
+
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Offset<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::stateless()
@@ -174,7 +183,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Offset<'_, Messag
             &mut tree.children[0],
             event,
             layout,
-            cursor,
+            Offset::child_cursor(self.offset_y, cursor),
             renderer,
             clipboard,
             shell,
@@ -199,7 +208,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Offset<'_, Messag
                 theme,
                 style,
                 layout,
-                cursor,
+                Offset::child_cursor(self.offset_y, cursor),
                 viewport,
             );
         });

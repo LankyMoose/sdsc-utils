@@ -43,6 +43,9 @@ pub struct SurfaceState {
     mode: Option<OskMode>,
     dual: DualNav,
     grid: NavBank,
+    /// Last poll saw a non-neutral pad; keep polling even if the slot seq
+    /// stalls so repeat cadence still fires from the widget clock.
+    last_active: bool,
 }
 
 impl SurfaceState {
@@ -50,6 +53,7 @@ impl SurfaceState {
         self.dual.prepare_on_open(false);
         self.grid.prepare_on_open(false);
         self.last_seq = 0;
+        self.last_active = false;
         self.mode = Some(mode);
     }
 }
@@ -104,14 +108,21 @@ impl Widget<OskMessage, iced::Theme, iced::Renderer> for OskSurface<'_> {
             }
             state.was_open = true;
             let (seq, readings) = self.slot.read();
-            if seq != state.last_seq {
+            let changed = seq != state.last_seq;
+            if changed {
                 state.last_seq = seq;
+            }
+            if changed || state.last_active {
+                state.last_active = readings
+                    .iter()
+                    .any(|reading| !crate::domain::pad::sample_nav_resting(&reading.sample));
                 self.poll(state, &readings, shell);
             }
         } else if state.was_open {
             state.was_open = false;
             state.mode = None;
             state.last_seq = 0;
+            state.last_active = false;
             state.dual.reset();
             state.grid.reset();
         }
