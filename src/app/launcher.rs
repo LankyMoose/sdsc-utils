@@ -3514,28 +3514,18 @@ impl App {
     }
 
     /// Pad navigation while a dropdown selector menu is expanded.
-    /// Directionals move the highlight (wrapping), Cross selects and closes,
-    /// Circle/Options close without changing anything. The open menu's row
-    /// parameterizes the option list; committing routes through the row's
+    /// Up/Down move the highlight clamped at both ends (no wrap: an edge move
+    /// is rejected silently, with no Nav cue and no scroll), Cross selects and
+    /// closes, Circle/Options close without changing anything. The open menu's
+    /// row parameterizes the option list; committing routes through the row's
     /// select message so apply + close run even when re-picking the value.
     pub(crate) fn on_selector_menu_nav(&mut self, action: NavAction) -> Task<Message> {
         let Some((row, highlight)) = self.launcher_state.settings.menu else {
             return Task::none();
         };
-        let count = row.selector_count() as isize;
         match action {
-            NavAction::Up => {
-                let next = (highlight as isize - 1).rem_euclid(count) as usize;
-                self.launcher_state.settings.set_menu_highlight(next);
-                self.play_ui_cue(UiSoundKind::Nav);
-                self.scroll_settings_focus_into_view(launcher_view::ScrollReveal::Either)
-            }
-            NavAction::Down => {
-                let next = (highlight as isize + 1).rem_euclid(count) as usize;
-                self.launcher_state.settings.set_menu_highlight(next);
-                self.play_ui_cue(UiSoundKind::Nav);
-                self.scroll_settings_focus_into_view(launcher_view::ScrollReveal::Either)
-            }
+            NavAction::Up => self.step_selector_menu(-1),
+            NavAction::Down => self.step_selector_menu(1),
             NavAction::Confirm => {
                 let select = row.selector_select(highlight);
                 self.play_ui_cue(UiSoundKind::Action);
@@ -3549,6 +3539,33 @@ impl App {
             _ => Task::none(),
         }
     }
+
+    /// Move the open dropdown highlight one step. The step is clamped
+    /// ([`selector_menu_step`]): a rejected edge returns `Task::none()` before
+    /// any cue or scroll, so only a real highlight change feels the Nav cue.
+    fn step_selector_menu(&mut self, delta: isize) -> Task<Message> {
+        let Some((row, highlight)) = self.launcher_state.settings.menu else {
+            return Task::none();
+        };
+        let Some(next) = selector_menu_step(highlight, row.selector_count(), delta) else {
+            return Task::none();
+        };
+        self.launcher_state.settings.set_menu_highlight(next);
+        self.play_ui_cue(UiSoundKind::Nav);
+        self.scroll_settings_focus_into_view(launcher_view::ScrollReveal::Either)
+    }
+}
+
+/// Clamped selector-menu highlight step: `Some(next)` only when the move stays
+/// inside the option list. Edges return `None` (no wrap) so callers reject them
+/// silently — matching the linear Games strip (`view::move_selection`), which
+/// keeps its own clamp and skip logic.
+pub(crate) fn selector_menu_step(highlight: usize, count: usize, delta: isize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let next = highlight.checked_add_signed(delta)?;
+    (next < count).then_some(next)
 }
 
 impl App {
@@ -4750,9 +4767,12 @@ pub(crate) fn launcher_focus_move_frozen(message: &LauncherMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action};
+    use super::{
+        launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action, selector_menu_step,
+    };
     use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
     use crate::ui::launcher::input::NavAction;
+    use crate::ui::launcher::settings::{SettingsPanel, SettingsRow};
     use crate::ui::launcher::view::LauncherMessage;
 
     #[test]
@@ -4826,6 +4846,68 @@ mod tests {
         state.replace_confirm = None;
         state.edit_confirm = Some(EditConfirm);
         assert!(!launcher_nav_move_allowed(&state));
+    }
+
+    #[test]
+    fn selector_menu_steps_clamp_at_both_ends() {
+        // Every selector dropdown rejects the edge move instead of wrapping,
+        // so the app applies no Nav cue and no scroll there.
+        for row in [
+            SettingsRow::SelectionMode,
+            SettingsRow::ImmersiveLayout,
+            SettingsRow::Navbar,
+            SettingsRow::ReducedMotion,
+        ] {
+            let count = row.selector_count();
+            assert!(count >= 2, "{row:?} needs at least two options");
+            assert_eq!(selector_menu_step(0, count, -1), None, "{row:?} Up edge");
+            assert_eq!(
+                selector_menu_step(count - 1, count, 1),
+                None,
+                "{row:?} Down edge"
+            );
+            // Interior moves always land, so only those change the highlight.
+            for i in 0..count - 1 {
+                assert_eq!(selector_menu_step(i, count, 1), Some(i + 1), "{row:?}");
+                assert_eq!(selector_menu_step(i + 1, count, -1), Some(i), "{row:?}");
+            }
+        }
+        // Defensive: empty lists and out-of-range highlights never step.
+        assert_eq!(selector_menu_step(0, 0, 1), None);
+        assert_eq!(selector_menu_step(0, 0, -1), None);
+        assert_eq!(selector_menu_step(5, 3, 1), None);
+        assert_eq!(selector_menu_step(0, 3, -1), None);
+    }
+
+    #[test]
+    fn selector_menu_edge_rejection_keeps_highlight() {
+        // Mirror the caller: only a clamped `Some` reaches set_menu_highlight,
+        // so a rejected edge leaves the open highlight exactly where it was.
+        fn apply_step(panel: &mut SettingsPanel, delta: isize) {
+            let Some((row, highlight)) = panel.menu else {
+                return;
+            };
+            if let Some(next) = selector_menu_step(highlight, row.selector_count(), delta) {
+                panel.set_menu_highlight(next);
+            }
+        }
+
+        let mut panel = SettingsPanel {
+            menu: Some((SettingsRow::SelectionMode, 0)),
+            ..Default::default()
+        };
+        apply_step(&mut panel, -1);
+        assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, 0)));
+
+        let last = SettingsRow::SelectionMode.selector_count() - 1;
+        panel.menu = Some((SettingsRow::SelectionMode, last));
+        apply_step(&mut panel, 1);
+        assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, last)));
+
+        // Interior moves do land via the same path.
+        panel.menu = Some((SettingsRow::SelectionMode, 0));
+        apply_step(&mut panel, 1);
+        assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, 1)));
     }
 
     #[test]
