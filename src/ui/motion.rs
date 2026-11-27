@@ -142,10 +142,9 @@ pub fn shell_backdrop_done(started: std::time::Instant, now: std::time::Instant)
 
 /// One shared full-screen dim behind Home/Browser/Launcher.
 ///
-/// The screens own separate windows, but they must never expose an undimmed
-/// desktop between them. This is the single alpha timeline; whichever visible
-/// screen owns it draws the same value, so handing ownership between windows
-/// is pixel-identical and swap transitions never flash.
+/// All three modes draw inside one shell HWND, so this is simply the single
+/// alpha timeline for that window. It stays full across mode swaps and fades
+/// only when the shell hides for the desktop; no ownership handoff is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ShellBackdrop {
     #[default]

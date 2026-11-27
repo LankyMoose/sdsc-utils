@@ -116,12 +116,12 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   `window::size()` query, which can return the pre-fullscreen default.
 
 PS is a screen hide/resume toggle: while Browser owns the pad a PS press
-dismisses the window to the desktop (engine suspended, cached page and grid
-state preserved) and the next PS restores the same Browser. Circle from the
-page (no active URL edit) suspends the Browser and returns to the Home screen;
-Home is a peer full-screen surface, never an overlay on a running managed app.
-Circle cancels an active URL edit instead of leaving; Escape cancels the edit
-but never leaves.
+dismisses the shared shell window to the desktop (engine suspended, cached page
+and grid state preserved) and the next PS shows the same warm HWND again.
+Circle from the page (no active URL edit) suspends the Browser and switches the
+same shell window to the Home screen; Home is a peer full-screen mode, never an
+overlay on a running managed app. Circle cancels an active URL edit instead of
+leaving; Escape cancels the edit but never leaves.
 
 Input priority is **Home → Browser → Launcher**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
@@ -220,12 +220,12 @@ meters still use the legacy per-surface bank.
   the restore read it; `BrowserAppState::tabs_restored` gates that.
 - On alpha-capable backends the Browser root dims the whole screen with a
   55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
-  backends keep the flat backdrop. The scrim is the shared `ShellBackdrop`
-  timeline, painted only by the screen that currently owns it, so Home↔Browser
-  swaps hand the same dim between windows without a desktop flash. Browser now
-  uses the same `ShellAnim` entrance/exit as Home (card scale/opacity/y, CEF
-  texture + header + tabs fading). The cursor is recentered in the live page
-  area every time the window opens.
+  backends keep the flat backdrop. Browser, Home, and Launcher share **one
+  physical shell window**; the scrim is the one `ShellBackdrop` timeline, so a
+  mode swap never has to hand a dim between HWNDs. Browser uses the same
+  `ShellAnim` entrance/exit as Home (card scale/opacity/y, CEF texture + header
+  + tabs fading). The cursor is recentered in the live page area every time the
+  Browser mode opens.
 - The Home window always covers the monitor and draws the same shared scrim;
   the card is centered and scales with the stage (icon tiles, no subtitles). On
   an opaque backend the scrim blends over the opaque clear color.

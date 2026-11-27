@@ -139,6 +139,66 @@ pub fn focus_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     window::gain_focus(id)
 }
 
+/// Show or hide the one shell HWND through the same raw Win32 path.
+///
+/// iced's [`window::set_mode`] effect and the raw quiet-mode show path can
+/// complete out of order across a rapid PS hide/resume. Every request carries
+/// a monotonic token; a task that is no longer the latest visibility request
+/// does nothing, so the last call always wins.
+pub fn set_shell_visible<Message: Send + 'static>(
+    id: window::Id,
+    visible: bool,
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    token: u64,
+) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        let quiet = crate::platform::debug_quiet::enabled();
+        let offscreen = crate::platform::debug_quiet::offscreen();
+        window::run(id, move |window| {
+            use std::sync::atomic::Ordering;
+            use window::raw_window_handle::RawWindowHandle;
+
+            if epoch.load(Ordering::SeqCst) != token {
+                return;
+            }
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            if visible {
+                if quiet {
+                    if offscreen {
+                        host::move_offscreen(hwnd);
+                    } else {
+                        host::move_to_secondary_monitor(hwnd);
+                    }
+                    host::set_no_activate(hwnd, true);
+                }
+                host::show_window(hwnd);
+            } else {
+                host::hide(hwnd);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        use std::sync::atomic::Ordering;
+        if epoch.load(Ordering::SeqCst) != token {
+            return Task::none();
+        }
+        if visible {
+            window::set_mode(id, window::Mode::Windowed)
+        } else {
+            window::set_mode(id, window::Mode::Hidden)
+        }
+    }
+}
+
 /// Show a hidden UI window (`Mode::Windowed`). Quiet mode: no activation,
 /// secondary monitor.
 pub fn show_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {

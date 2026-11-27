@@ -32,8 +32,7 @@ use crate::ui::launcher::input::{self as launcher_input, FaceHeld, NavAction, Na
 use crate::ui::launcher::mode::{self as launcher_mode};
 use crate::ui::launcher::view::{self as launcher_view, LauncherMessage, ReplaceConfirm};
 use crate::ui::layout::{
-    MonitorCover, cursor_on_primary_monitor, focus_window, open_visible, overlay_platform_specific,
-    primary_monitor_cover, window_hwnd,
+    MonitorCover, cursor_on_primary_monitor, focus_window, primary_monitor_cover, window_hwnd,
 };
 use iced::widget::operation;
 use iced::{Task, window};
@@ -4220,7 +4219,6 @@ impl App {
         }
         self.clear_ps_resume();
         // An explicit open wins over a pending deferred destroy.
-        self.launcher_close_armed = false;
         // Edit state (editing mode, drafts, confirms) survives closes like
         // everything else: PS toggles never wipe in-progress work.
         self.refresh_launcher_rows();
@@ -4263,18 +4261,13 @@ impl App {
         // lands) must re-arm the release latch so the opening press cannot
         // re-fire.
         if self.launcher_visible
-            && let Some(id) = self.launcher_window
+            && let Some(id) = self.shell_window
         {
             self.session.auto_open_pending = false;
             self.last_running_check = None;
             self.arm_chord_release_latch();
             let badge = self.refresh_running_badge();
-            let close_browser = if self.browser_visible {
-                self.close_browser_window()
-            } else {
-                Task::none()
-            };
-            return close_browser.chain(Task::batch([badge, focus_window(id)]));
+            return badge.chain(Task::batch([focus_window(id)]));
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
@@ -4286,25 +4279,6 @@ impl App {
         // refresh_launcher_rows already ran a throttled check; force one restore on open.
         self.last_running_check = None;
         let badge = self.refresh_running_badge();
-
-        // Cold open — OS window entrance. Do not chain sync_toast_zorder here;
-        // LauncherOpened raises after the window/renderer exists.
-        if self.launcher_window.is_some() {
-            // Stale id without visibility (close in flight) — wait for WindowClosed.
-            // Leave auto_open_pending set so WindowClosed can retry.
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: launcher open skipped (window still closing)",
-            );
-            return Task::none();
-        }
-        // The outgoing screen keeps the native cursor hidden across the swap.
-        self.shell_opening = true;
-        // Launcher and Browser are mutually exclusive.
-        let close_browser = if self.browser_visible {
-            self.close_browser_window()
-        } else {
-            Task::none()
-        };
 
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
             x: 0.0,
@@ -4320,30 +4294,12 @@ impl App {
             Instant::now(),
         );
         crate::controller::hid::diag::diag_info("ui-diag: launcher immersive enter");
-        let size = cover.size();
-        let position = window::Position::Specific(cover.origin());
 
         self.launcher_nav_ready = false;
         crate::controller::hid::diag::diag_info("ui-diag: launcher cold open");
         if self.launcher_cold_load_remaining {
             self.launcher_state.begin_cold_load(Instant::now());
         }
-        let (id, open) = window::open(window::Settings {
-            size,
-            position,
-            visible: open_visible(),
-            transparent: crate::ui::chrome::transparent_windows(),
-            resizable: false,
-            decorations: false,
-            // Launcher is a normal-level window now: the PS Home is the only
-            // always-on-top shell surface. Bring-to-front happens on open.
-            level: window::Level::Normal,
-            exit_on_close_request: true,
-            platform_specific: overlay_platform_specific(),
-            ..window::Settings::default()
-        });
-        self.launcher_window = Some(id);
-        self.launcher_visible = true;
         self.session.auto_open_pending = false;
         crate::platform::wgpu_diag::note_start_open();
         // Launcher composites the toast card; hide the HWND so it cannot float
@@ -4355,11 +4311,9 @@ impl App {
         } else {
             Task::none()
         };
-        close_browser.chain(hide_toast.chain(Task::batch([
-            badge,
-            restored_art,
-            open.map(Message::LauncherOpened),
-        ])))
+        self.activate_shell_mode(crate::app::home::ShellScreen::Launcher, cover)
+            .chain(hide_toast)
+            .chain(Task::batch([badge, restored_art]))
     }
 
     /// Advance the enter ceremony: once the veil clock finishes, clear the
@@ -4563,31 +4517,11 @@ impl App {
         clear_gate
     }
 
-    pub(crate) fn close_launcher(&mut self) -> Task<Message> {
-        // A close arriving while a deferred destroy is armed is already
-        // handled: the armed phase owns the teardown.
-        if self.launcher_close_armed {
-            return Task::none();
-        }
-        // Destroying a hidden-cursor window skips the restore present (winit
-        // only pushes on change) and leaks a global ShowCursor(FALSE). Only
-        // arm the deferred destroy when this close leaves no shell screen:
-        // a swap keeps the pointer hidden and the replacement window owns it.
-        let last_shell = !self.home_visible && !self.browser_visible && !self.shell_opening;
-        let restore_cursor = self.shell_cursor_hidden && last_shell;
-        // Clear visibility before any hide task so Resting toast RaiseInteractive
-        // cannot resurface Launcher while the hide is in flight.
+    /// Clear Launcher-owned state without touching the shared shell window.
+    fn retire_launcher(&mut self) -> Task<Message> {
+        crate::controller::hid::diag::diag_info("ui-diag: launcher close");
         self.launcher_visible = false;
-        if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Launcher)
-            && !self.home_visible
-            && !self.browser_visible
-        {
-            self.shell_backdrop_owner = None;
-            self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
-        }
-        if restore_cursor {
-            self.set_shell_cursor_hidden(false);
-        }
+        self.launcher_window = None;
         let rehost_toast = self.rehost_toast_after_composite();
         self.launcher_nav_ready = false;
         self.launcher_revealed_at = None;
@@ -4609,48 +4543,24 @@ impl App {
         self.confirm_key_held = false;
         self.cancel_key_held = false;
         self.pad_held = FaceHeld::default();
-        // Visual state (selection, dock, drawer, scrolls, edit draft) is
-        // never reset on close anymore: every close preserves state and the
-        // next open resumes where it left off (see `toggle_start_on_reopen_chord`).
-        // No window (never opened / already destroyed): nothing to do —
-        // there is no teardown pending and no reset to run.
         self.clear_start_nav_diag();
-        // Focus-close often leaves the reopen chord held (e.g. PS); latch until
-        // a debounced full release so the next PadPoll cannot immediately reopen.
         self.arm_chord_release_latch();
-        if restore_cursor && self.launcher_window.is_some() {
-            // Deferred destroy: the flag already cleared above, so the next
-            // loop pass rebuilds with a visible interaction and pushes the
-            // restore to the OS before FinishStartClose tears down the HWND.
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: launcher close armed (cursor restore)",
-            );
-            self.launcher_close_armed = true;
-            return rehost_toast.chain(Task::done(Message::FinishStartClose));
-        }
-        rehost_toast.chain(self.hide_and_close_start_window())
+        rehost_toast
     }
 
-    /// Second close phase: destroy the Launcher HWND after the cursor-restore
-    /// present has landed (see `launcher_close_armed`).
-    pub(crate) fn finish_start_close(&mut self) -> Task<Message> {
-        if !self.launcher_close_armed {
-            return Task::none();
+    pub(crate) fn close_launcher(&mut self) -> Task<Message> {
+        let last_shell = !self.home_visible && !self.browser_visible && !self.shell_opening;
+        if self.shell_cursor_hidden && last_shell {
+            self.set_shell_cursor_hidden(false);
         }
-        self.launcher_close_armed = false;
-        self.hide_and_close_start_window()
+        let retire = self.retire_launcher();
+        retire.chain(self.hide_shell_window())
     }
 
-    /// Hide-then-close the Launcher HWND (avoids a DWM default-brush flash
-    /// while the wgpu surface tears down). No-op without a window.
-    fn hide_and_close_start_window(&mut self) -> Task<Message> {
-        match self.launcher_window {
-            Some(id) => {
-                crate::controller::hid::diag::diag_info("ui-diag: launcher close");
-                window::set_mode(id, window::Mode::Hidden).chain(window::close(id))
-            }
-            None => Task::none(),
-        }
+    /// Launcher -> Home mode switch: retire Launcher state but keep the shell
+    /// visible for Home's entrance.
+    pub(crate) fn retire_launcher_for_home(&mut self) -> Task<Message> {
+        self.retire_launcher()
     }
 
     pub(crate) fn clear_start_nav_diag(&mut self) {

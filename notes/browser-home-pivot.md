@@ -25,6 +25,11 @@ overlay, app selection, the engine backend, or MSIX packaging.
 > Forward/R1 — above the page cursor/text surface. The OSK is system owned;
 > L1/R1/Options map to semantic back/forward/reload; popups are denied. The app
 > split below (Phase D) was reverted; keep the Browser in-process.
+>
+> **Single-window update:** Home, Launcher, and Browser now share one physical
+> fullscreen shell HWND (`src/app/shell.rs`). The per-screen window ownership
+> described below is historical; modes switch inside that window and PS hides
+> the same warm HWND.
 
 Current browser internals: [browser-embedding.md](browser-embedding.md).
 
@@ -34,9 +39,9 @@ Split the controller browser out of the Launcher and make it a standalone
 managed app **inside the shell process**. PS opens a small overlay **Home**
 listing installed apps (Launcher first, Browser second when its engine is
 installed, ＋ tile for adding optional packages). Future controller-first apps
-register the same way. Browser runs its own fullscreen window with its own
-chrome. Home, Launcher, and Browser are all managed by sdsc-utils (tray + HID +
-iced daemon, one process).
+register the same way. Home, Launcher, and Browser all render as modes of the
+one shell window with their own chrome. Home, Launcher, and Browser are all
+managed by sdsc-utils (tray + HID + iced daemon, one process).
 
 Engine target: **CEF OSR** as a Store/standalone DLC. Servo is deleted with no
 reader fallback (viability already proven; no `A11yTree`-dependent

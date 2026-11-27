@@ -185,10 +185,8 @@ use crate::browser::keys::RawKey;
 use crate::ui::home as home_view;
 use crate::ui::launcher::gesture::ChordReleaseTick;
 use crate::ui::launcher::input as launcher_input;
-use crate::ui::layout::{
-    MonitorCover, focus_window, overlay_platform_specific, primary_monitor_cover,
-};
-use iced::{Point, Size, Task, window};
+use crate::ui::layout::{MonitorCover, focus_window, primary_monitor_cover};
+use iced::{Task, window};
 use std::time::Instant;
 
 /// Map source-side tap actions to the Home shell's gated messages.
@@ -393,16 +391,13 @@ impl App {
         // Tell the outgoing screen's close path that another shell screen is
         // taking over, so the native cursor stays hidden across the swap.
         self.shell_opening = true;
-        // Launcher is opaque and hides instantly; show Home first and tear it
-        // down only after Home has presented, so no undimmed desktop gap can
-        // appear between the two.
         let close = if self.browser_visible {
             let close_osk = self.close_osk("circle_home");
             self.browser.panel.cancel_url_edit();
             close_osk.chain(self.close_browser_window())
         } else if self.launcher_visible {
-            self.deferred_launcher_close = true;
-            self.close_osk("circle_home")
+            let close_osk = self.close_osk("circle_home");
+            close_osk.chain(self.retire_launcher_for_home())
         } else {
             Task::none()
         };
@@ -410,7 +405,9 @@ impl App {
             .field("source", "circle")
             .emit();
         crate::controller::hid::diag::diag_info("ui-diag: circle returns to Home");
-        close.chain(self.open_home())
+        // State switch is immediate; cleanup runs in parallel. Chaining made
+        // the incoming show wait on toast/window effects that can settle late.
+        Task::batch([close, self.open_home()])
     }
 
     pub(crate) fn clear_ps_resume(&mut self) {
@@ -423,20 +420,15 @@ impl App {
         self.shell_backdrop.alpha(now)
     }
 
-    /// The window that should draw the shared backdrop, if any.
+    /// The shared backdrop is drawn by the one shell window.
     pub(crate) fn shell_backdrop_window(&self) -> Option<window::Id> {
-        match self.shell_backdrop_owner? {
-            ShellScreen::Home => self.home_window,
-            ShellScreen::Browser => self.browser_window,
-            ShellScreen::Launcher => self.launcher_window,
-        }
+        self.shell_window
     }
 
     /// A screen is now visible. If the backdrop is already up (a swap, or an
     /// exit still in flight) hold it at full so the dim never dips; otherwise
     /// start the delayed entrance fade.
-    pub(crate) fn claim_shell_backdrop(&mut self, screen: ShellScreen, now: Instant) {
-        self.shell_backdrop_owner = Some(screen);
+    pub(crate) fn claim_shell_backdrop(&mut self, now: Instant) {
         if self.shell_backdrop.alpha(now) > 0.01 {
             self.shell_backdrop.hold_full();
         } else {
@@ -444,56 +436,9 @@ impl App {
         }
     }
 
-    /// Begin fading the shared backdrop only when no other shell screen is
-    /// visible or opening underneath. Returns true when the fade started.
-    pub(crate) fn begin_shell_backdrop_exit(&mut self, screen: ShellScreen, now: Instant) -> bool {
-        let other = match screen {
-            ShellScreen::Home => {
-                self.browser_visible
-                    || self.launcher_visible
-                    || self.browser_window.is_some()
-                    || self.launcher_window.is_some()
-            }
-            ShellScreen::Browser => {
-                self.home_visible
-                    || self.launcher_visible
-                    || self.home_window.is_some()
-                    || self.launcher_window.is_some()
-            }
-            ShellScreen::Launcher => {
-                self.home_visible
-                    || self.browser_visible
-                    || self.home_window.is_some()
-                    || self.browser_window.is_some()
-            }
-        };
-        if other || self.shell_opening {
-            self.shell_backdrop.hold_full();
-            false
-        } else {
-            self.shell_backdrop.exit(now);
-            true
-        }
-    }
-
-    /// Hand the shared backdrop to the next visible screen when its owner
-    /// closes, or hide it when the last window is gone.
-    pub(crate) fn release_shell_backdrop(&mut self, screen: ShellScreen) {
-        if self.shell_backdrop_owner != Some(screen) {
-            return;
-        }
-        self.shell_backdrop_owner = if self.home_visible {
-            Some(ShellScreen::Home)
-        } else if self.browser_visible {
-            Some(ShellScreen::Browser)
-        } else if self.launcher_visible {
-            Some(ShellScreen::Launcher)
-        } else {
-            None
-        };
-        if self.shell_backdrop_owner.is_none() {
-            self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
-        }
+    /// Begin fading the shared backdrop for a hide-to-desktop transition.
+    pub(crate) fn begin_shell_backdrop_exit(&mut self, now: Instant) {
+        self.shell_backdrop.exit(now);
     }
 
     pub(crate) fn open_home(&mut self) -> Task<Message> {
@@ -511,14 +456,9 @@ impl App {
             return Task::none();
         }
         if self.home_visible
-            && let Some(id) = self.home_window
+            && let Some(id) = self.shell_window
         {
             return focus_window(id).chain(self.sync_toast_zorder());
-        }
-        if self.home_window.is_some() {
-            // Close in flight; the next attempt can open once WindowClosed lands.
-            crate::controller::hid::diag::diag_info("ui-diag: home open skipped (window closing)");
-            return Task::none();
         }
         self.shell_opening = true;
         self.reset_shell_cursor_clock();
@@ -536,12 +476,9 @@ impl App {
         // clear color instead of the desktop.
         self.home_stage = (cover.width, cover.height);
         self.home_monitor_cover = Some(cover);
-        self.home_pending_show = true;
         if self.launcher_visible {
             self.launcher_home_pause.get_or_insert_with(Instant::now);
         }
-        let window_size = Size::new(cover.width, cover.height);
-        let window_position = window::Position::Specific(Point::new(cover.x, cover.y));
         self.refresh_engine_status();
         self.sync_home_engine_info();
         self.sync_home_settings();
@@ -565,70 +502,41 @@ impl App {
         self.sync_home_controllers();
         // The opening PS press must not toggle Home straight back closed.
         self.arm_chord_release_latch();
-        let (id, open) = window::open(window::Settings {
-            size: window_size,
-            position: window_position,
-            // Hidden until the final cover size is configured and DWM
-            // transitions are disabled; showing earlier lets Windows animate
-            // the create-time default size into the full-screen rect.
-            visible: false,
-            transparent: crate::ui::chrome::transparent_windows(),
-            resizable: false,
-            decorations: false,
-            // Above Settings/popup; the toast is raised/composited above.
-            level: window::Level::AlwaysOnTop,
-            exit_on_close_request: true,
-            platform_specific: overlay_platform_specific(),
-            ..window::Settings::default()
-        });
-        self.home_window = Some(id);
-        self.home_visible = true;
         self.session.auto_open_pending = false;
         crate::controller::hid::diag::diag_info("ui-diag: home open");
-        open.map(Message::HomeOpened)
-            .chain(crate::ui::layout::disable_window_transitions(id))
-            .chain(Task::done(Message::WindowShowNow(id)))
+        self.activate_shell_mode(ShellScreen::Home, cover)
             .chain(self.check_engine_manifest())
             .chain(close_osk)
     }
 
-    /// Begin hiding Home. The window stays alive (and modal) through the
-    /// exit fade; [`Self::finish_home_close`] tears it down when the shell
-    /// animation settles. Returns focus to Launcher when it is the app underneath.
+    /// Begin hiding/switching Home. The shared shell window stays alive through
+    /// the exit fade; [`Self::finish_home_close`] switches mode or hides it.
     pub(crate) fn close_home(&mut self) -> Task<Message> {
         // Circle/auto-close semantics: a later PS starts at Home, not the
         // screen that was dismissed before this close.
         self.clear_ps_resume();
-        // Dismissing the last shell screen restores the pointer during the
-        // exit fade (the Home window still presents frames). A swap to another
-        // shell screen keeps it hidden.
         let last_shell = !self.browser_visible && !self.launcher_visible && !self.shell_opening;
         if self.shell_cursor_hidden && last_shell {
-            // Keep the 2 Hz cursor clock from re-hiding during the exit fade.
             self.reset_shell_cursor_clock();
             self.set_shell_cursor_hidden(false);
         }
-        if self
-            .home_shell_anim
-            .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
-        {
+        if self.home_closing() {
             return Task::none();
         }
         let now = Instant::now();
         let Some(id) = self.home_window else {
             self.home_visible = false;
-            self.home_pending_show = false;
             self.home_shell_anim = None;
-            self.release_shell_backdrop(ShellScreen::Home);
             self.resume_launcher_after_home(now);
-            return self.rehost_toast_after_composite();
+            return self.hide_shell_window();
         };
-        if self.home_pending_show {
-            // Dismissed before the window was shown: nothing to animate.
-            return self.finish_home_close(now);
-        }
         crate::controller::hid::diag::diag_info("ui-diag: home close");
-        self.begin_shell_backdrop_exit(ShellScreen::Home, now);
+        self.home_visible = false;
+        if !self.shell_opening && self.pending_shell_mode.is_none() {
+            self.begin_shell_backdrop_exit(now);
+        } else {
+            self.shell_backdrop.hold_full();
+        }
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
         let from = self
@@ -639,30 +547,23 @@ impl App {
         crate::ui::layout::invalidate_window(id)
     }
 
-    /// Complete a Home close after the exit fade. Owns window teardown, focus
-    /// return, toast rehost, and thawing the Launcher animation clock.
+    /// Complete a Home close. A waiting screen switches in place; otherwise
+    /// the warm shell hides and the pointer returns to the desktop.
     pub(crate) fn finish_home_close(&mut self, now: Instant) -> Task<Message> {
         self.home_shell_anim = None;
-        self.home_pending_show = false;
         self.home_visible = false;
+        self.home_window = None;
         self.resume_launcher_after_home(now);
-        let Some(id) = self.home_window.take() else {
-            self.release_shell_backdrop(ShellScreen::Home);
-            return self.rehost_toast_after_composite();
-        };
-        self.release_shell_backdrop(ShellScreen::Home);
-        let task = window::close(id).chain(self.rehost_toast_after_composite());
-        if self.browser_visible
-            && let Some(browser) = self.browser_window
-        {
-            return task.chain(focus_window(browser));
+        // A second PS while the outgoing card was fading out wins over a
+        // queued Home->app swap; hide_shell_window resumes the PS target.
+        if self.ps_resume_pending {
+            self.pending_shell_mode = None;
+            return self.hide_shell_window();
         }
-        if self.launcher_visible
-            && let Some(start) = self.launcher_window
-        {
-            return task.chain(focus_window(start));
+        if let Some(mode) = self.take_pending_shell_mode() {
+            return self.switch_shell_mode(mode);
         }
-        task
+        self.hide_shell_window()
     }
 
     pub(crate) fn home_closing(&self) -> bool {
@@ -689,18 +590,6 @@ impl App {
         }
     }
 
-    pub(crate) fn on_home_opened(&mut self, id: window::Id) -> Task<Message> {
-        // Home may have been dismissed before the renderer came up; accept
-        // the open only while it is still the tracked window.
-        if self.home_window != Some(id) {
-            return Task::none();
-        }
-        self.home_visible = true;
-        self.shell_opening = false;
-        crate::controller::hid::diag::diag_info(format!("ui-diag: home opened id={id:?}"));
-        Task::none()
-    }
-
     pub(crate) fn on_home_window_sized(&mut self, size: iced::Size) -> Task<Message> {
         let Some(cover) = self.home_monitor_cover else {
             return Task::none();
@@ -710,43 +599,6 @@ impl App {
         }
         self.home_stage = (size.width, size.height);
         Task::none()
-    }
-
-    pub(crate) fn on_home_show_now(&mut self) -> Task<Message> {
-        self.show_home_now()
-    }
-
-    fn show_home_now(&mut self) -> Task<Message> {
-        if !self.home_pending_show {
-            return Task::none();
-        }
-        let Some(id) = self.home_window else {
-            return Task::none();
-        };
-        self.home_pending_show = false;
-        self.home_shell_anim = Some(crate::ui::home::ShellAnim::enter(Instant::now()));
-        let now = Instant::now();
-        self.claim_shell_backdrop(ShellScreen::Home, now);
-        let close_launcher = if self.deferred_launcher_close {
-            self.deferred_launcher_close = false;
-            self.close_launcher()
-        } else {
-            Task::none()
-        };
-        // Home composites the toast card; keep the HWND hidden so it
-        // cannot sit above the scrim as a blank transparent window.
-        let hide_toast = if self.toast_message.is_some() {
-            self.toast_window
-                .map(crate::ui::layout::hide_toast)
-                .unwrap_or_else(Task::none)
-        } else {
-            Task::none()
-        };
-        hide_toast
-            .chain(crate::ui::layout::show_window(id))
-            .chain(focus_window(id))
-            .chain(self.sync_toast_zorder())
-            .chain(close_launcher)
     }
 
     pub(crate) fn on_home_message(&mut self, message: home_view::HomeMessage) -> Task<Message> {
@@ -1139,7 +991,7 @@ impl App {
                 // the Browser before showing the Launcher. Keep the pointer
                 // hidden across the Home->Launcher swap.
                 self.shell_opening = true;
-                self.close_home().chain(self.open_launcher())
+                Task::batch([self.close_home(), self.open_launcher()])
             }
             home_view::HomeTile::Browser => {
                 if self.browser.engine.is_none() {
@@ -1151,7 +1003,7 @@ impl App {
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Browser");
                 self.shell_opening = true;
-                self.close_home().chain(self.open_browser_window())
+                Task::batch([self.close_home(), self.open_browser_window()])
             }
         }
     }

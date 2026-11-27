@@ -131,6 +131,8 @@ pub(crate) struct ReplayWait {
     pub needs_cursor_idle: bool,
     /// Wait for a browser grid FLIP transition to settle.
     pub needs_grid_idle: bool,
+    /// Wait for a shell mode switch / PS hide-or-resume to settle.
+    pub needs_shell_idle: bool,
     pub redraw_seen: bool,
     /// Capture count at wait creation; ready once the pending count drops.
     pub captures_to_finish: u32,
@@ -476,6 +478,9 @@ impl super::App {
                     wait.needs_engine = true;
                     wait.needs_redraw = true;
                 }
+                // Rapid replay steps must not stack PS/mode transitions on
+                // top of each other; a real user sees the card settle first.
+                wait.needs_shell_idle = true;
             }
             // Screenshots complete when their capture message lands.
             "screenshot" | "osk.screenshot" => {
@@ -653,6 +658,9 @@ impl super::App {
             return false;
         }
         if wait.needs_grid_idle && self.browser.panel.grid.animating() {
+            return false;
+        }
+        if wait.needs_shell_idle && !self.shell_idle() {
             return false;
         }
         if wait.needs_redraw && !wait.redraw_seen {
@@ -2613,15 +2621,9 @@ impl super::App {
     pub(crate) fn open_browser_window(&mut self) -> Task<Message> {
         self.clear_ps_resume();
         if self.browser_visible
-            && let Some(id) = self.browser_window
+            && let Some(id) = self.shell_window
         {
             return crate::ui::layout::focus_window(id);
-        }
-        if self.browser_window.is_some() {
-            crate::controller::hid::diag::diag_info(
-                "ui-diag: browser open skipped (window still closing)",
-            );
-            return Task::none();
         }
         if self.browser.engine.is_none() {
             crate::controller::hid::diag::diag_info(
@@ -2632,13 +2634,6 @@ impl super::App {
         // The outgoing screen keeps the native cursor hidden across the swap.
         self.shell_opening = true;
         self.reset_shell_cursor_clock();
-        // Launcher and Browser are mutually exclusive: opening one dismisses
-        // the other rather than stacking two fullscreen apps.
-        let close_start = if self.launcher_visible {
-            self.close_launcher()
-        } else {
-            Task::none()
-        };
         let cover =
             crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
                 x: 0.0,
@@ -2647,8 +2642,7 @@ impl super::App {
                 height: 1080.0,
             });
         self.browser_monitor_cover = Some(cover);
-        // A new window can land on a different monitor; the cover drives the
-        // first layout until its own resize event arrives.
+        // The cover drives the first layout until a resize event arrives.
         self.browser_window_size = None;
         self.browser.panel.l1_held = false;
         self.browser.panel.r1_held = false;
@@ -2657,84 +2651,55 @@ impl super::App {
         // Center before the first frame, not after the window has painted the
         // previous open's cursor position.
         self.browser.panel.cursor.reset_for_page();
-        self.browser_visible = true;
-        self.browser_pending_show = true;
-        self.browser_shell_anim = None;
-        self.browser_close_issued = false;
         let was_open = self.browser.panel.session.is_open();
-        let (id, open) = iced::window::open(iced::window::Settings {
-            size: cover.size(),
-            position: iced::window::Position::Specific(cover.origin()),
-            // Hidden until the final cover size is configured and DWM
-            // transitions are disabled; showing earlier lets Windows animate
-            // the create-time default size into the full-screen rect.
-            visible: false,
-            // The 16:9 card sits over a dimmed desktop; the root view draws
-            // the scrim on backends that can composite alpha.
-            transparent: crate::ui::chrome::transparent_windows(),
-            resizable: false,
-            decorations: false,
-            level: iced::window::Level::Normal,
-            exit_on_close_request: true,
-            platform_specific: crate::ui::layout::window_platform_specific(),
-            ..iced::window::Settings::default()
-        });
-        self.browser_window = Some(id);
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
-        let opened = open.map(Message::BrowserOpened);
-        let opened = if was_open {
+        let activation = self.activate_shell_mode(crate::app::home::ShellScreen::Browser, cover);
+        if was_open {
             // Reopen after close: cached page, suspended engine.
             self.browser.panel.session.open_surface();
             self.resume_browser_engine();
-            opened
+            activation
         } else {
             // Fresh surface: restore the saved page or open the default page.
-            opened.chain(self.open_browser_session())
-        };
-        close_start
-            .chain(crate::ui::layout::disable_window_transitions(id))
-            .chain(opened)
-            .chain(Task::done(Message::WindowShowNow(id)))
+            activation.chain(self.open_browser_session())
+        }
     }
 
-    /// Close the standalone Browser window and suspend its engine (cached
-    /// page survives for the next open). The card/scrim run the same
-    /// entrance/exit language as Home; the HWND is torn down when the fade
-    /// settles.
+    /// True while the Browser card is animating out.
+    pub(crate) fn browser_closing(&self) -> bool {
+        self.browser_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
+    }
+
+    /// Close the Browser screen. The shared shell window stays alive: a swap
+    /// switches mode after the card fades; PS dismiss hides the warm window.
     pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
-        if self.browser_close_issued
-            || self
-                .browser_shell_anim
-                .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
-        {
+        if self.browser_closing() {
+            return Task::none();
+        }
+        if self.browser_window.is_none() {
             return Task::none();
         }
         self.browser_visible = false;
-        // Destroying the last shell window while the pointer is hidden would
-        // leak winit's global ShowCursor(FALSE). Restore now; the exit frames
-        // below present the restored pointer before the HWND goes away.
+        // Hiding the warm shell restores the pointer during the exit fade.
         let last_shell = !self.home_visible && !self.launcher_visible && !self.shell_opening;
         if self.shell_cursor_hidden && last_shell {
             self.set_shell_cursor_hidden(false);
         }
         self.browser_monitor_cover = None;
         self.browser_window_size = None;
-        if self.browser_pending_show {
-            self.browser_pending_show = false;
-            return self
-                .close_browser_surface()
-                .chain(self.finish_browser_window_close());
-        }
-        self.browser_pending_show = false;
         self.reset_shell_cursor_clock();
         let now = Instant::now();
-        self.begin_shell_backdrop_exit(crate::app::home::ShellScreen::Browser, now);
+        if !self.shell_opening && self.pending_shell_mode.is_none() {
+            self.begin_shell_backdrop_exit(now);
+        } else {
+            self.shell_backdrop.hold_full();
+        }
         let close_osk = self.close_osk("browser_close");
-        let Some(id) = self.browser_window else {
+        let Some(id) = self.shell_window else {
             self.browser_shell_anim = None;
-            self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
-            return close_osk.chain(self.close_browser_surface());
+            return close_osk;
         };
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
@@ -2746,67 +2711,24 @@ impl super::App {
         close_osk.chain(crate::ui::layout::invalidate_window(id))
     }
 
-    /// Second Browser close phase: the exit fade has settled. Hide + destroy
-    /// the HWND (and suspend the engine) only now, so the final frame matches.
-    /// The id stays tracked until `WindowClosed` so the deferred PS resume and
-    /// cursor cleanup still run.
+    /// Second Browser close phase: the card finished fading. Switch to the
+    /// screen that was waiting, or hide the warm shell for the desktop.
     pub(crate) fn finish_browser_window_close(&mut self) -> Task<Message> {
         self.browser_shell_anim = None;
-        if self.browser_close_issued {
-            return Task::none();
-        }
-        let Some(id) = self.browser_window else {
-            self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
-            return Task::none();
-        };
-        self.browser_close_issued = true;
-        self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
-        let surface = self.close_browser_surface();
+        self.browser_window = None;
         crate::controller::hid::diag::diag_info("ui-diag: browser window close");
-        let task = surface
-            .chain(iced::window::set_mode(id, iced::window::Mode::Hidden))
-            .chain(iced::window::close(id));
-        if self.launcher_visible
-            && let Some(start) = self.launcher_window
-        {
-            return task.chain(crate::ui::layout::focus_window(start));
+        let surface = self.close_browser_surface();
+        if self.ps_resume_pending {
+            self.pending_shell_mode = None;
+            return surface.chain(self.hide_shell_window());
         }
-        task
-    }
-
-    pub(crate) fn on_browser_opened(&mut self, id: iced::window::Id) -> Task<Message> {
-        if self.browser_window != Some(id) {
-            return Task::none();
+        if let Some(mode) = self.take_pending_shell_mode() {
+            return surface.chain(self.switch_shell_mode(mode));
         }
-        self.browser_visible = true;
-        self.shell_opening = false;
-        crate::controller::hid::diag::diag_info(format!("ui-diag: browser opened id={id:?}"));
-        // The cover is logical pixels and already drives this first layout.
-        // The real size arrives through `window::resize_events()` once the
-        // fullscreen surface is configured; a one-shot `window::size()` here
-        // can race creation and report the pre-fullscreen default, which
-        // would briefly shrink the cursor space (the quarter-screen bug).
-        self.sync_browser_viewport();
-        self.replay_kick()
-    }
-
-    /// Show the hidden Browser window after the DWM transition task has run
-    /// and the surface has had a moment to settle at the cover size. Showing
-    /// immediately lets Windows animate the create-time default size into the
-    /// fullscreen rect (the visible "scale" on open).
-    pub(crate) fn on_browser_show_now(&mut self) -> Task<Message> {
-        if !self.browser_pending_show {
-            return Task::none();
+        if self.home_visible || self.launcher_visible {
+            return surface;
         }
-        self.browser_pending_show = false;
-        let Some(id) = self.browser_window else {
-            return Task::none();
-        };
-        let now = Instant::now();
-        self.browser_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
-        self.claim_shell_backdrop(crate::app::home::ShellScreen::Browser, now);
-        self.sync_browser_viewport();
-        crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
+        surface.chain(self.hide_shell_window())
     }
 
     pub(crate) fn on_browser_window_sized(&mut self, size: iced::Size) -> Task<Message> {

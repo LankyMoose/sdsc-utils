@@ -15,6 +15,7 @@ pub(crate) mod installs;
 mod launcher;
 mod osk;
 mod popup;
+mod shell;
 mod toast;
 mod update;
 
@@ -172,8 +173,6 @@ pub enum Message {
 
     ConfigureOpened(window::Id),
     Configure(ConfigureMessage),
-    /// Standalone Browser window opened (focus + size the engine viewport).
-    BrowserOpened(window::Id),
     /// Browser-window chrome / page / cursor message.
     Browser(crate::ui::browser::BrowserMessage),
     /// Poll a pending history jump that never reported landing/error.
@@ -233,10 +232,11 @@ pub enum Message {
     /// Hidden shell setup is done: show the window and begin the backdrop
     /// fade (the card is visible immediately; the scrim fades in after).
     WindowShowNow(window::Id),
+    /// The shared shell HWND finished creating (renderer is up).
+    ShellOpened(window::Id),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
     ShellFadeTick,
     /// PS Home window opened (focus it once the renderer exists).
-    HomeOpened(window::Id),
     /// Home selection / activation from pad, keyboard, or mouse.
     Home(crate::ui::home::HomeMessage),
     /// Raw keyboard event for the Browser app (controller-first: no mouse).
@@ -265,9 +265,6 @@ pub enum Message {
     PreviewClose,
 
     LauncherOpened(window::Id),
-    /// Deferred Launcher HWND destruction (second close phase; see
-    /// `launcher_close_armed`). Lets the cursor-restore present land first.
-    FinishStartClose,
     /// Drive launcher animation frames.
     LauncherFrame,
     /// Low-rate idle timer (sleep/dim) while no animation needs frames.
@@ -396,7 +393,6 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
-            | Message::BrowserOpened(_)
             | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
             | Message::Osk(_)
@@ -407,10 +403,9 @@ impl Message {
             | Message::HomeFrame
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
+            | Message::ShellOpened(_)
             | Message::ShellFadeTick
-            | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
-            | Message::FinishStartClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
             | Message::ShellCursorTick
@@ -542,10 +537,7 @@ impl Message {
             | Message::PopupOpened(_)
             | Message::PlacePopup { .. }
             | Message::ConfigureOpened(_)
-            | Message::BrowserOpened(_)
-            | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
-            | Message::FinishStartClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
             | Message::ShellCursorTick
@@ -555,6 +547,7 @@ impl Message {
             | Message::EngineInfoSize { .. }
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
+            | Message::ShellOpened(_)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
@@ -745,6 +738,23 @@ pub struct App {
     launcher_window: Option<window::Id>,
     /// True only while Launcher is revealed (warm HWND may exist while false).
     launcher_visible: bool,
+    /// One physical fullscreen shell window shared by Home/Browser/Launcher.
+    /// The three `*_window` fields above are aliases for the active mode (or
+    /// None while the shell is hidden for PS); this id stays warm so PS
+    /// hide/resume never destroys/recreates the surface.
+    shell_window: Option<window::Id>,
+    shell_mode: home::ShellScreen,
+    /// The shell window exists but is hidden (PS dismiss). The next open shows
+    /// it again instead of creating a new HWND.
+    shell_hidden: bool,
+    /// Created hidden; `WindowShowNow` configures size/level and presents it.
+    shell_pending_show: bool,
+    /// A mode switch requested while the outgoing card is still animating out;
+    /// `finish_*_close` consumes it and switches in place.
+    pending_shell_mode: Option<home::ShellScreen>,
+    /// Monotonic token for the last shell show/hide request. Raw Win32
+    /// visibility effects can run out of order; stale tokens no-op.
+    shell_visibility_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Standalone fullscreen Browser app window.
     browser_window: Option<window::Id>,
     browser_visible: bool,
@@ -752,19 +762,11 @@ pub struct App {
     browser_monitor_cover: Option<MonitorCover>,
     /// Actual logical window size reported by iced after creation/resize.
     browser_window_size: Option<(f32, f32)>,
-    /// Browser HWND is created hidden until its final size + DWM transition
-    /// setup; then it is shown so no create-time scale animation is visible.
-    browser_pending_show: bool,
     /// Browser window entrance/exit (card scale/opacity/y), same language as
     /// Home.
     browser_shell_anim: Option<crate::ui::home::ShellAnim>,
-    /// One dim backdrop shared by Home/Browser/Launcher. Whichever visible
-    /// screen owns it paints the same alpha, so swaps never expose the desktop.
+    /// One dim backdrop for the one shell window.
     shell_backdrop: crate::ui::motion::ShellBackdrop,
-    shell_backdrop_owner: Option<home::ShellScreen>,
-    /// Home was opened while Launcher is still up; tear Launcher down only
-    /// after Home has actually presented (avoids a desktop gap on Circle).
-    deferred_launcher_close: bool,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
     home_window: Option<window::Id>,
@@ -778,23 +780,11 @@ pub struct App {
     ps_resume_pending: bool,
     /// Actual logical size of Home window (always the monitor cover).
     home_stage: (f32, f32),
-    /// Home HWND is created hidden until its final size + DWM transition
-    /// setup; then it is shown.
-    home_pending_show: bool,
     /// Home window entrance/exit (card scale/opacity/y + scrim fade).
     home_shell_anim: Option<crate::ui::home::ShellAnim>,
     /// Monitor covered by Home window (toast composite pose).
     home_monitor_cover: Option<MonitorCover>,
     home_state: crate::ui::home::State,
-    /// Close is two-phase when the cursor was hidden: the flag clears
-    /// immediately, but HWND destruction waits one loop pass
-    /// (`FinishStartClose`) so a rebuild pushes the restored cursor to the
-    /// OS first. Destroying a hidden-cursor window skips that push and
-    /// leaks a global `ShowCursor(FALSE)` (winit only pushes on change).
-    launcher_close_armed: bool,
-    /// The Browser exit fade settled and hide/close was issued; the id is kept
-    /// until `WindowClosed` so the PS-resume retry and cleanup still run.
-    browser_close_issued: bool,
     /// Last Launcher-window paint (for the transition paint-gap witness;
     /// `Cell` because `view()` only gets `&self`).
     last_start_paint_at: std::cell::Cell<Option<Instant>>,
@@ -1220,26 +1210,26 @@ impl App {
             pad_input_panel: PadInputPanel::default(),
             launcher_window: None,
             launcher_visible: false,
+            shell_window: None,
+            shell_mode: home::ShellScreen::Home,
+            shell_hidden: true,
+            shell_pending_show: false,
+            pending_shell_mode: None,
+            shell_visibility_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             browser_window: None,
             browser_visible: false,
             browser_monitor_cover: None,
             browser_window_size: None,
-            browser_pending_show: false,
             browser_shell_anim: None,
             shell_backdrop: crate::ui::motion::ShellBackdrop::Hidden,
-            shell_backdrop_owner: None,
-            deferred_launcher_close: false,
             home_window: None,
             home_visible: false,
             ps_resume: None,
             ps_resume_pending: false,
             home_stage: (crate::ui::home::HOME_WIDTH, crate::ui::home::HOME_HEIGHT),
-            home_pending_show: false,
             home_shell_anim: None,
             home_monitor_cover: None,
             home_state: crate::ui::home::State::default(),
-            launcher_close_armed: false,
-            browser_close_issued: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
             launcher_nav_ready: false,
@@ -1911,12 +1901,7 @@ impl App {
                 .browser_shell_anim
                 .map(|anim| anim.frame(now, reduced).panel)
                 .unwrap_or_else(crate::ui::home::PanelVisual::full);
-            let backdrop_alpha =
-                if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Browser) {
-                    self.shell_backdrop_alpha(now)
-                } else {
-                    0.0
-                };
+            let backdrop_alpha = self.shell_backdrop_alpha(now);
             let shell = crate::ui::home::ShellFrame {
                 panel,
                 backdrop_alpha,
@@ -1954,12 +1939,7 @@ impl App {
                 .home_shell_anim
                 .map(|anim| anim.frame(now, reduced))
                 .unwrap_or_else(crate::ui::home::ShellFrame::full);
-            let backdrop_alpha =
-                if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Home) {
-                    self.shell_backdrop_alpha(now)
-                } else {
-                    0.0
-                };
+            let backdrop_alpha = self.shell_backdrop_alpha(now);
             let home_panel = crate::ui::home::view(
                 &self.home_state,
                 &self.session.prefs.spectrum,
@@ -2211,7 +2191,6 @@ impl App {
                 task.chain(self.raise_toast_above_all())
             }
             Message::Configure(message) => self.on_configure_message(message),
-            Message::BrowserOpened(id) => self.on_browser_opened(id),
             Message::Browser(message) => self.on_browser_message(message),
             Message::BrowserHistoryTimeout => {
                 self.check_history_travel_timeout();
@@ -2270,15 +2249,8 @@ impl App {
                     Task::none()
                 }
             }
-            Message::WindowShowNow(id) => {
-                if self.browser_window == Some(id) {
-                    self.on_browser_show_now()
-                } else if self.home_window == Some(id) {
-                    self.on_home_show_now()
-                } else {
-                    Task::none()
-                }
-            }
+            Message::WindowShowNow(id) => self.on_shell_show_now(id),
+            Message::ShellOpened(id) => self.on_shell_opened(id),
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();
@@ -2318,9 +2290,7 @@ impl App {
                             crate::ui::motion::ShellBackdrop::Entering { .. } => {
                                 crate::ui::motion::ShellBackdrop::Full
                             }
-                            crate::ui::motion::ShellBackdrop::Exiting { .. }
-                                if self.shell_backdrop_owner.is_none() =>
-                            {
+                            crate::ui::motion::ShellBackdrop::Exiting { .. } => {
                                 crate::ui::motion::ShellBackdrop::Hidden
                             }
                             other => other,
@@ -2332,7 +2302,6 @@ impl App {
                 }
                 redraw
             }
-            Message::HomeOpened(id) => self.on_home_opened(id),
             Message::Home(message) => self.on_home_message(message),
 
             #[cfg(debug_assertions)]
@@ -2358,7 +2327,6 @@ impl App {
             },
 
             Message::LauncherOpened(id) => self.on_start_opened(id),
-            Message::FinishStartClose => self.finish_start_close(),
             Message::LauncherArtEvent(ev) => self.on_start_art_event(ev),
             Message::LauncherFrame => self.on_start_frame(),
             Message::LauncherIdleTick => {
@@ -2523,63 +2491,37 @@ impl App {
         } else if Some(id) == self.configure_window {
             self.configure_window = None;
             self.sync_toast_zorder()
-        } else if Some(id) == self.browser_window {
-            self.browser_window = None;
-            self.browser_visible = false;
-            self.browser_close_issued = false;
+        } else if Some(id) == self.shell_window {
+            let was_browser = self.browser_visible || self.browser_window.is_some();
+            let was_launcher = self.launcher_visible;
+            let resume_ps = self.ps_resume_pending;
+            self.shell_window = None;
+            self.shell_hidden = true;
+            self.shell_pending_show = false;
+            self.pending_shell_mode = None;
+            self.clear_shell_aliases();
+            self.home_shell_anim = None;
             self.browser_shell_anim = None;
             self.browser_monitor_cover = None;
-            if self.browser.panel.session.is_open() {
+            self.home_monitor_cover = None;
+            self.launcher_monitor_cover = None;
+            self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
+            if was_browser && self.browser.panel.session.is_open() {
                 let _ = self.close_browser_surface();
             }
-            self.release_shell_backdrop(home::ShellScreen::Browser);
-            self.restore_cursor_if_desktop();
-            self.maybe_resume_ps_after_close()
-        } else if Some(id) == self.osk.window {
-            self.on_osk_window_closed(id)
-        } else if Some(id) == self.home_window {
-            self.home_window = None;
-            self.home_visible = false;
-            self.home_shell_anim = None;
-            self.release_shell_backdrop(home::ShellScreen::Home);
-            self.resume_launcher_after_home(Instant::now());
-            self.restore_cursor_if_desktop();
-            // Return focus to Launcher when it is the app underneath. The toast
-            // is AlwaysOnTop, so it stays above a normal-level Launcher without
-            // re-raising anything.
-            if self.browser_visible
-                && let Some(browser) = self.browser_window
-            {
-                return focus_window(browser);
-            }
-            if self.launcher_visible
-                && let Some(start) = self.launcher_window
-            {
-                return focus_window(start);
-            }
-            self.maybe_resume_ps_after_close()
-        } else if Some(id) == self.launcher_window {
-            self.launcher_window = None;
-            self.launcher_visible = false;
-            self.launcher_close_armed = false;
-            self.launcher_nav_ready = false;
-            self.release_shell_backdrop(home::ShellScreen::Launcher);
             let rehost_toast = self.rehost_toast_after_composite();
-            let resume_ps = self.ps_resume_pending;
-            // Close preserves all visual state (selection, dock, drawer,
-            // scrolls, drafts, browser panel): the next open resumes where
-            // it left off. Only the cursor-restore backstop and input
-            // re-arming run here. Also covers the OS-close path, which
-            // bypasses `close_launcher` entirely.
+            if was_launcher {
+                self.pad_nav.reset();
+                self.browser.dpad_stepper.reset();
+                self.clear_start_nav_diag();
+                self.consume_reopen_gesture_chord();
+            }
             self.restore_cursor_if_desktop();
-            self.pad_nav.reset();
-            self.browser.dpad_stepper.reset();
-            self.clear_start_nav_diag();
-            self.consume_reopen_gesture_chord();
             let sync = rehost_toast.chain(self.sync_toast_zorder());
             if resume_ps {
-                sync.chain(self.maybe_resume_ps_after_close())
-            } else if self.session.auto_open_pending
+                return sync.chain(self.maybe_resume_ps_after_close());
+            }
+            if self.session.auto_open_pending
                 && self.session.prefs.home_enabled
                 && self.session.prefs.home_auto_open.auto_opens()
                 && !self.browser_visible
@@ -2593,6 +2535,8 @@ impl App {
             } else {
                 sync
             }
+        } else if Some(id) == self.osk.window {
+            self.on_osk_window_closed(id)
         } else if Some(id) == self.toast_window {
             self.toast_window = None;
             // Recreate so iced keeps a warm compositor for popup/Settings.
