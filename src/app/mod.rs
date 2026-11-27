@@ -235,14 +235,14 @@ pub enum Message {
     ShellOpened(window::Id),
     /// Shell is shown offscreen with the entrance pose; present it on the
     /// monitor after one paint.
-    ShellPresent(window::Id),
+    ShellPresent(window::Id, u64),
     /// Offscreen prime ran; arm the first-redraw reveal gate.
-    ShellRevealArmed(window::Id),
+    ShellRevealArmed(window::Id, u64),
     /// First shell redraw after the offscreen prime (`listen_raw`; the
     /// filtered window-event listener intentionally drops RedrawRequested).
     ShellRedraw(window::Id),
     /// Safety net: re-present/re-focus the shell if the first present was lost.
-    ShellFocusFallback(window::Id),
+    ShellFocusFallback(window::Id, u64),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
     ShellFadeTick,
     /// PS Home window opened (focus it once the renderer exists).
@@ -413,10 +413,10 @@ impl Message {
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
-            | Message::ShellPresent(_)
-            | Message::ShellRevealArmed(_)
+            | Message::ShellPresent(_, _)
+            | Message::ShellRevealArmed(_, _)
             | Message::ShellRedraw(_)
-            | Message::ShellFocusFallback(_)
+            | Message::ShellFocusFallback(_, _)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
             | Message::LauncherFrame
@@ -561,10 +561,10 @@ impl Message {
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
-            | Message::ShellPresent(_)
-            | Message::ShellRevealArmed(_)
+            | Message::ShellPresent(_, _)
+            | Message::ShellRevealArmed(_, _)
             | Message::ShellRedraw(_)
-            | Message::ShellFocusFallback(_)
+            | Message::ShellFocusFallback(_, _)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
@@ -848,6 +848,9 @@ pub struct App {
     /// Offscreen prime finished; wait for the shell's first redraw event
     /// before moving the warm HWND onscreen (REV-1).
     shell_reveal_armed: bool,
+    /// Generation guard for delayed reveal timers: a fallback from an older
+    /// show must never present the next one before its prime paints.
+    shell_reveal_generation: u64,
     /// Entrance clock for the first-present diagnostic.
     shell_reveal_started: Option<Instant>,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
@@ -1281,6 +1284,7 @@ impl App {
             shell_opening: false,
             shell_presented: false,
             shell_reveal_armed: false,
+            shell_reveal_generation: 0,
             shell_reveal_started: None,
             launcher_file_dialog_open: false,
             ps_release: ChordReleaseDetector::default(),
@@ -1368,7 +1372,7 @@ impl App {
         // frame so it never appears near the top-left corner.
         app.browser.panel.cursor.reset_for_page();
 
-        // Disk-persisted bookmarks feed the Share grid star and bookmark row.
+        // Disk-persisted bookmarks feed the tabs grid star and bookmark row.
         app.browser.panel.bookmarks = crate::browser::bookmarks::load();
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
@@ -2316,10 +2320,28 @@ impl App {
             }
             Message::WindowShowNow(id) => self.on_shell_show_now(id),
             Message::ShellOpened(id) => self.on_shell_opened(id),
-            Message::ShellPresent(id) => self.on_shell_present(id, "fallback"),
-            Message::ShellRevealArmed(id) => self.on_shell_reveal_armed(id),
+            Message::ShellPresent(id, generation) => {
+                if generation == self.shell_reveal_generation {
+                    self.on_shell_present(id, "fallback")
+                } else {
+                    Task::none()
+                }
+            }
+            Message::ShellRevealArmed(id, generation) => {
+                if generation == self.shell_reveal_generation {
+                    self.on_shell_reveal_armed(id)
+                } else {
+                    Task::none()
+                }
+            }
             Message::ShellRedraw(id) => self.on_shell_redraw(id),
-            Message::ShellFocusFallback(id) => self.on_shell_focus_fallback(id),
+            Message::ShellFocusFallback(id, generation) => {
+                if generation == self.shell_reveal_generation {
+                    self.on_shell_focus_fallback(id)
+                } else {
+                    Task::none()
+                }
+            }
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();
@@ -2681,7 +2703,10 @@ impl App {
             let now = Instant::now();
             self.launcher_revealed_at = Some(now);
             self.launcher_state.steam_scan_pending = self.steam_scan_pending;
-            crate::controller::hid::diag::diag_info(format!("ui-diag: launcher opened id={id:?}"));
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: launcher opened id={id:?} nav_ready={}",
+                self.launcher_nav_ready
+            ));
             // Raise/focus after create_renderer has a chance to finish —
             // chaining sync on the same turn as window::open correlated
             // with atlas create_renderer panics.

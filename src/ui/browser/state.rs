@@ -1,7 +1,7 @@
 //! Browser app state: page state, cursor, text keyboard, tab strip, grid, and
 //! bookmarks.
 //!
-//! Page mode has one header row (Back / URL / Forward). Share/Create swaps the
+//! Page mode has one header row (Back / URL / Forward). Circle swaps the
 //! page area for the tab grid (`grid.rs`); the header stays.
 
 use std::collections::HashMap;
@@ -181,7 +181,7 @@ pub struct BrowserPanel {
     pub url_draft: String,
     /// First typed character replaces the prefilled URL (select-all semantics).
     pub url_replace_on_type: bool,
-    /// Share/Create tab-grid mode and FLIP transition.
+    /// Tabs-view mode and FLIP transition.
     pub grid: crate::ui::browser::grid::GridState,
 }
 

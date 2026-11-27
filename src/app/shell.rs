@@ -48,7 +48,9 @@ impl App {
         self.shell_opening = false;
         self.shell_presented = false;
         self.shell_reveal_armed = false;
+        self.shell_reveal_generation = self.shell_reveal_generation.wrapping_add(1);
         self.shell_reveal_started = Some(std::time::Instant::now());
+        let generation = self.shell_reveal_generation;
         // Invalidate any hide task still queued from the previous dismiss:
         // the raw offscreen show below bypasses `shell_visibility_task`, so
         // this show needs its own epoch to win the ordering race.
@@ -68,14 +70,17 @@ impl App {
         // gate (its present step stays offscreen), so automation exercises
         // the real PS reveal path.
         enter
-            .chain(layout::show_shell_offscreen(id).map(move |_| Message::ShellRevealArmed(id)))
+            .chain(
+                layout::show_shell_offscreen(id)
+                    .map(move |_| Message::ShellRevealArmed(id, generation)),
+            )
             .chain(Task::perform(
                 super::delay(std::time::Duration::from_millis(250)),
-                move |_| Message::ShellPresent(id),
+                move |_| Message::ShellPresent(id, generation),
             ))
             .chain(Task::perform(
                 super::delay(std::time::Duration::from_millis(300)),
-                move |_| Message::ShellFocusFallback(id),
+                move |_| Message::ShellFocusFallback(id, generation),
             ))
     }
 
@@ -317,7 +322,24 @@ impl App {
             _ => Task::none(),
         };
         let toast = self.shell_toast_task(mode);
-        level.chain(enter).chain(show).chain(toast).chain(ensure)
+        // A warm, still-visible resume (rapid PS) does not go through
+        // `on_shell_show_now`, so it must arm Launcher pad nav explicitly.
+        // Without this the Launcher stays `launcher_nav_ready = false` and
+        // ignores the controller until a hide/show cycle.
+        let opened = if mode == ShellScreen::Launcher && !was_hidden {
+            match self.shell_window {
+                Some(id) => Task::done(Message::LauncherOpened(id)),
+                None => Task::none(),
+            }
+        } else {
+            Task::none()
+        };
+        level
+            .chain(enter)
+            .chain(show)
+            .chain(toast)
+            .chain(opened)
+            .chain(ensure)
     }
 
     /// Switch to a mode in an already-visible shell window.

@@ -235,6 +235,10 @@ def main() -> int:
     actions = [
         {"app": "browser", "action": "navigate", "params": {"url": page_a.as_uri()}},
         {"app": "browser", "action": "screenshot", "params": {}},
+        # Share/Create must stay inert on the page; if it opens the grid the
+        # trace count below is 5 instead of 4.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "create"}},
+        {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.bookmark", "params": {"index": 0}},
@@ -271,12 +275,32 @@ def main() -> int:
         {"app": "browser", "action": "screen.ps", "params": {}},
         {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
+        # REV-1 stress: repeated dismiss/resume cycles. Every first present
+        # must be the entrance pose, never the warmed resting frame.
+        *[
+            step
+            for _ in range(5)
+            for step in (
+                {"app": "browser", "action": "screen.ps", "params": {}},
+                {"app": "browser", "action": "wait", "params": {}},
+                {"app": "browser", "action": "screen.ps", "params": {}},
+                {"app": "browser", "action": "wait", "params": {}},
+            )
+        ],
         {"app": "browser", "action": "screen.home", "params": {}},
         {"app": "browser", "action": "screen.ps", "params": {}},
         {"app": "launcher", "action": "open", "params": {}},
-        {"app": "launcher", "action": "screen.ps", "params": {}},
-        {"app": "launcher", "action": "screen.ps", "params": {}},
         {"app": "launcher", "action": "wait", "params": {}},
+        # Rapid PS stress: the second release lands during the exit tween.
+        # Each resume must re-arm Launcher pad nav (no controller lockout).
+        *[
+            step
+            for _ in range(5)
+            for step in (
+                {"app": "launcher", "action": "screen.ps_burst", "params": {}},
+                {"app": "launcher", "action": "wait", "params": {}},
+            )
+        ],
         {"app": "launcher", "action": "screen.home", "params": {}},
     ]
     with (session / "actions.jsonl").open("w", encoding="utf-8") as out:
@@ -461,11 +485,52 @@ def main() -> int:
             for line in presents
             if (match := re.search(r"alpha=([0-9.]+)", line))
         ]
-        pose_ok = bool(alphas) and all(alpha < 0.9 for alpha in alphas)
+        sources = [
+            match.group(1)
+            for line in presents
+            if (match := re.search(r"source=([a-z-]+)", line))
+        ]
+        pose_ok = (
+            bool(alphas)
+            and all(alpha < 0.9 for alpha in alphas)
+            and all(source == "redraw" for source in sources)
+        )
         print(f"check first shell present is entrance pose: {'ok' if pose_ok else 'FAIL'}")
+        print(f"presents={len(presents)} sources={sources}")
         if not pose_ok:
             print(
                 f"error: shell presented a resting pose first: {presents}",
+                file=sys.stderr,
+            )
+            return 1
+        opened = [
+            line
+            for line in log_text.splitlines()
+            if "ui-diag: launcher opened" in line
+        ]
+        nav_ok = len(opened) >= 5 and all("nav_ready=true" in line for line in opened)
+        print(f"check rapid PS re-arms Launcher nav: {'ok' if nav_ok else 'FAIL'}")
+        if not nav_ok:
+            print(
+                f"error: rapid PS left Launcher nav unarmed: {opened}",
+                file=sys.stderr,
+            )
+            return 1
+        browser_trace = next(sandbox.glob("trace/session-*/browser.jsonl"), None)
+        grid_opens = 0
+        if browser_trace:
+            grid_opens = sum(
+                1
+                for line in browser_trace.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if '"browser.grid.open"' in line
+            )
+        share_ok = grid_opens == 4
+        print(f"check Share/Create does not open tabs: {'ok' if share_ok else 'FAIL'}")
+        if not share_ok:
+            print(
+                f"error: expected 4 explicit grid opens, found {grid_opens}",
                 file=sys.stderr,
             )
             return 1

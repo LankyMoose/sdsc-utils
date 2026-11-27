@@ -311,7 +311,7 @@ fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
             (PadButton::Circle, PadButtonAction::Tap) => NavAction::Cancel,
             (PadButton::Square, PadButtonAction::Tap) => NavAction::CycleSort,
             (PadButton::Triangle, PadButtonAction::Tap) => NavAction::Triangle,
-            (PadButton::Create, PadButtonAction::Tap) => NavAction::ToggleControllers,
+            // Share/Create is unbound; tabs open from Home, not the page.
             // L1/R1/Options semantic actions are resolved by the OS binding
             // table, not this generic nav map.
             (PadButton::L3, PadButtonAction::Tap) => NavAction::ToggleMagnetism,
@@ -672,7 +672,7 @@ impl super::App {
                 wait.needs_grid_idle = true;
                 wait.needs_shell_idle = true;
             }
-            "screen.ps" | "screen.home" => {
+            "screen.ps" | "screen.ps_burst" | "screen.home" => {
                 // Resume opens the Browser asynchronously; dismiss has no
                 // window to wait for.
                 if self.browser_visible {
@@ -3134,12 +3134,8 @@ impl super::App {
         if self.browser.panel.grid.is_grid() {
             return self.on_browser_grid_pad(readings, tap_actions);
         }
-        if tap_actions.iter().any(|action| {
-            action.button == PadButton::Create && action.action == PadButtonAction::Tap
-        }) {
-            crate::controller::hid::diag::diag_info("ui-diag: Share opens browser grid");
-            return self.open_browser_grid();
-        }
+        // Share/Create is intentionally unbound: it must not open the tabs
+        // view from the page.
         let now = std::time::Instant::now();
         let engine_mode = self.browser.panel.session.has_frame();
         // Reader fallback uses the D-pad nav bank; engine mode parks it
@@ -3298,7 +3294,7 @@ impl super::App {
         if let Some(action) = button {
             self.set_haptic_pad_from_id(Some(&action.pad));
             let action = match action.button {
-                // Share/Create is page-only; in tabs view it is unbound.
+                // Share/Create is unbound on the page and in the tabs view.
                 PadButton::Create => Task::none(),
                 PadButton::Circle => self.return_to_home_screen(),
                 PadButton::Cross => self.browser_grid_activate_focus(),
@@ -4557,7 +4553,6 @@ mod tests {
             (PadButton::Circle, NavAction::Cancel),
             (PadButton::Triangle, NavAction::Triangle),
             (PadButton::L3, NavAction::ToggleMagnetism),
-            (PadButton::Create, NavAction::ToggleControllers),
         ] {
             assert_eq!(
                 browser_tap_action(&[tap(button)]).map(|(_, action)| action),
@@ -4565,8 +4560,13 @@ mod tests {
             );
         }
         // Semantic bindings (L1/R1/Options) are resolved by the OS action
-        // table, not this generic map.
-        for button in [PadButton::L1, PadButton::R1, PadButton::Options] {
+        // table, not this generic map. Share/Create is deliberately unbound.
+        for button in [
+            PadButton::L1,
+            PadButton::R1,
+            PadButton::Options,
+            PadButton::Create,
+        ] {
             assert!(browser_tap_action(&[tap(button)]).is_none());
         }
         // Tap only: holds never invoke actions.

@@ -76,7 +76,7 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   The URL well is 420–680px wide; equal side slots keep it centred with an 8px
   gap to each capsule. `BrowserPanel` owns the URL draft/edit state; the page
   starts below a 44px row + 1px rule.
-- `src/ui/browser/grid.rs` — Share/Create tab grid: pure card/bookmark layout,
+- `src/ui/browser/grid.rs` — tabs view: pure card/bookmark layout,
   frozen visual order, star overlay, and the FLIP transition over the existing
   per-tab `FrameSlot` texture. The engine viewport is never resized; the card
   aspect is the live page aspect, so content does not reflow or stretch.
@@ -161,7 +161,8 @@ meters still use the legacy per-surface bank.
   L3 toggles magnet; R3 dumps an issue bundle. Circle from the page opens the
   tabs view (if editing, it cancels the edit first); Escape cancels the edit
   only. PS dismisses to desktop; Circle again from the tabs view returns Home.
-- **Share/Create toggles the tabs view.** It has no Browser header. The tabs
+- **Circle toggles the tabs view.** Share/Create is unbound. The tabs view has
+  no Browser header. The tabs
   card is ~30% narrower than the page card and its height is driven by the
   content: one horizontally scrollable, newest-first row of page-aspect cards (plus
   first), a bookmark strip, and the footer island. A reserved scrollbar lane
@@ -174,8 +175,8 @@ meters still use the legacy per-surface bank.
   focused card (or the plus card/new tab/bookmark), Square closes the focused
   tab (the last tab resets to the default page instead of leaving zero tabs),
   Triangle toggles its bookmark, Down enters the bookmark strip (Up returns to
-  the row), Share/Create leaves back to the active page, and Circle returns
-  Home while persisting the focused card. There is no L1/R1 paging. Right
+  the row), and Circle returns Home while persisting the focused card. There is
+  no L1/R1 paging. Right
   stick scrolls the row (or the bookmark strip while it owns focus).
   Mouse click/wheel work. L1/R1/Options page-history actions are disabled while
   tabs view owns the surface. Slot 0 is always the plus card; card and plus
@@ -221,8 +222,8 @@ meters still use the legacy per-surface bank.
   draft tail (leading ellipsis) so the caret stays visible. The full strip
   restores from `tabs.json` (active page live, background tabs dormant until
   first activation) and every tab operation rewrites it. Popups remain denied.
-  Share/Create opens the animated tab grid; Cross on a card expands it back to
-  the page, Square closes it, Triangle toggles its bookmark, and the bookmark
+  Circle opens the animated tab grid from the page; Cross on a card expands it
+  back to the page, Square closes it, Triangle toggles its bookmark, and the bookmark
   strip below the grid scrolls horizontally. The URL editor remains Triangle;
   no tab strip/bookmark/history/status chrome is rendered in page mode.
 - The saved strip is not written until the first Browser open has restored

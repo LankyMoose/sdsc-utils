@@ -1,4 +1,4 @@
-//! Tabs view: Share/Create opens a 4x3 card grid over the Browser card, with a
+//! Tabs view: Circle opens a 4x3 card grid over the Browser card, with a
 //! leading plus card, a bookmark strip, and a footer hint island.
 //!
 //! The transition is a FLIP over the existing per-tab `FrameSlot` texture: the

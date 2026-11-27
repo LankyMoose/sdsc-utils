@@ -237,11 +237,26 @@ reveal first frame.
   `iced::event::listen_raw` and restarts the entrance clock at arm; post-fix
   traces read `source=redraw elapsed_ms=6–16 alpha=0.06–0.16`, and the
   Launcher reports `scale=1.000` (fade only).
+  A second failure showed up under repeated PS: a 250 ms fallback from the
+  previous show could land during the next one (`source=fallback elapsed_ms=0`).
+  `shell_reveal_generation` now guards the prime-arm, present, and focus
+  fallback timers. Stress QA runs 5 cycles × 5 runs (65 reveals) with no
+  fallback; `qa_browser_grid.py` asserts every present is `source=redraw` and
+  the entrance pose.
 
 - **Feedback:** Home → Browser played two sounds because
   `open_browser_session` cued `Action` and the strip restore/default page
   cued `Nav`. The session/restore path is now silent; one `Action` belongs to
   the Home tile. Debug Action cues log `ui-diag: ui cue kind=Action total=N`.
+  Share/Create is unbound on the Browser page; `qa_browser_grid.py` asserts the
+  trace has only the explicit grid opens.
+
+- **Rapid PS / Launcher lockout:** a warm resume during the exit tween
+  (`ps_resume_pending` -> `hide_shell_window` early resume) went through
+  `activate_shell_mode`, which did not send `LauncherOpened`, leaving
+  `launcher_nav_ready = false`. `activate_shell_mode` now emits
+  `LauncherOpened` for a still-visible Launcher resume; the rapid-PS stress in
+  `qa_browser_grid.py` asserts every resume logs `nav_ready=true`.
 
 ## 5. Acceptance
 

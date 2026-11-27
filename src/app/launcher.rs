@@ -1422,7 +1422,7 @@ impl App {
     /// continuously while visible and must not defeat idle-dim.
     ///
     /// Background-tab events route to the stored page; foreground events feed
-    /// the live page. The Share grid reads both through `grid_tabs`.
+    /// the live page. The tabs grid reads both through `grid_tabs`.
     pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
         match event {
             EngineEvent::FrameSlot { tab, slot } => return self.on_frame_slot(tab, slot),
@@ -1886,6 +1886,9 @@ impl App {
                 }
             }
             "screen.ps" => self.ps_screen_toggle(),
+            // Two PS releases in the same reducer turn: the second lands
+            // while the exit tween owns the shell (rapid-toggle stress).
+            "screen.ps_burst" => Task::batch([self.ps_screen_toggle(), self.ps_screen_toggle()]),
             "screen.home" => self.return_to_home_screen(),
             "home.move_x" => {
                 let delta = step

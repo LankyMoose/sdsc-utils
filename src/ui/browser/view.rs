@@ -46,7 +46,7 @@ pub enum BrowserMessage {
         dy: i32,
     },
     Scrolled(f32),
-    /// Share/Create toggles the tab grid.
+    /// Circle-style toggle for the tab grid.
     ToggleGrid,
     /// Click outside the active card: same as PS (dismiss to desktop).
     Backdrop,

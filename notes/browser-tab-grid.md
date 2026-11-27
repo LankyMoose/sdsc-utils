@@ -1,7 +1,7 @@
-# Browser tab grid (Share/Create)
+# Browser tab grid
 
 **Status:** landed on `browser/main`.
-**When to read:** changing Browser tab state, the Share grid, card FLIP,
+**When to read:** changing Browser tab state, the tabs grid, card FLIP,
 bookmark UI, or Browser screen/back behavior.
 
 ## Shape
@@ -20,10 +20,11 @@ bookmark UI, or Browser screen/back behavior.
 
 ## Contract
 
-- Home -> Browser opens the **tabs view** (not the page). **Share/Create**
-  toggles page<->tabs; **Circle** from the page returns to the tabs view, and
-  Circle from the tabs view returns Home **and persists the focused card as
-  the active tab**. Share/Create is page-only and is unbound in the tabs view.
+- Home -> Browser opens the **tabs view** (not the page). **Circle** toggles
+  page<->tabs: from the page it opens the tabs view, and from the tabs view it
+  returns Home **and persists the focused card as the active tab**.
+  Share/Create is unbound on the page and in the tabs view; it must not open
+  the grid.
 - The tabs view is headerless and uses a **compact card** sized to its
   content: `tabs_card_geometry` takes the page card width × 0.70 and derives
   the height from the single card row + bookmark strip + footer island. The

@@ -131,12 +131,12 @@ synthetic input steps for automation:
   page focusable under a point (QA setup for the Cross-opens-OSK path).
 - `pad.tap` — `{"button": "cross"}` injects one source-side pad tap through
   the live owner (OSK first, then Browser/Launcher manual form). `create` /
-  `share` toggles the Browser tab grid from page mode.
+  `share` is unbound on the Browser page (it must not open the tab grid).
 - `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap), or
   fires one complete Browser D-pad cursor nudge (press + release) when the
   Browser owns the pad. While the system OSK is open it queues a synthetic
   D-pad press/release for the pull-model keyboard.
-- `grid.open` / `grid.close` — debug-only direct Share grid enter/exit.
+- `grid.open` / `grid.close` — debug-only direct tabs-grid enter/exit.
   `grid.activate {"index": 0}` selects a frozen visual card, `grid.new_tab
   {"url": ...}` opens a tab and closes the grid (replay-only URL override;
   production plus uses the default page), `tab.new {"url": ...}` adds a tab
