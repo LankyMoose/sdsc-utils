@@ -422,13 +422,16 @@ impl App {
     /// Browser default page. Hardcoded until the settings screen lands, then a
     /// pref; navigation is via page links/search plus back/forward/reload.
     pub(crate) fn on_browser_go_default(&mut self) -> Task<Message> {
-        self.navigate_browser_to_with_cue(crate::browser::BROWSER_DEFAULT_URL.to_string(), true)
+        self.navigate_browser_to_with_cue(
+            crate::browser::BROWSER_DEFAULT_URL.to_string(),
+            Some(crate::domain::navigation::NavCue::Nav),
+        )
     }
 
     /// Default-page reset for the final-tab close: the caller owns the one
     /// `Nav` cue, so the navigation itself must stay silent.
     fn on_browser_go_default_silent(&mut self) -> Task<Message> {
-        self.navigate_browser_to_with_cue(crate::browser::BROWSER_DEFAULT_URL.to_string(), false)
+        self.navigate_browser_to_with_cue(crate::browser::BROWSER_DEFAULT_URL.to_string(), None)
     }
 
     /// Active tab id for engine commands. The backend gates input to the
@@ -696,10 +699,14 @@ impl App {
     }
 
     pub(crate) fn navigate_browser_to(&mut self, url: String) -> Task<Message> {
-        self.navigate_browser_to_with_cue(url, true)
+        self.navigate_browser_to_with_cue(url, Some(crate::domain::navigation::NavCue::Nav))
     }
 
-    fn navigate_browser_to_with_cue(&mut self, url: String, cue: bool) -> Task<Message> {
+    fn navigate_browser_to_with_cue(
+        &mut self,
+        url: String,
+        cue: Option<crate::domain::navigation::NavCue>,
+    ) -> Task<Message> {
         self.cancel_history_travel("navigate");
         let current = self.browser.panel.session.url().to_string();
         let raw = if url.trim().is_empty() { current } else { url };
@@ -731,8 +738,8 @@ impl App {
             pending.generation = Some(generation);
         }
         self.note_launcher_activity();
-        if cue {
-            self.play_ui_cue(UiSoundKind::Nav);
+        if let Some(cue) = cue {
+            self.apply_nav_cue(cue);
         }
         if self.browser.engine.is_none() {
             // The engine is mandatory; Home tile handles the missing-engine
@@ -3524,8 +3531,8 @@ impl App {
             return Task::none();
         };
         match action {
-            NavAction::Up => self.step_selector_menu(-1),
-            NavAction::Down => self.step_selector_menu(1),
+            NavAction::Up => self.step_selector_menu(crate::domain::navigation::NavDir::Up),
+            NavAction::Down => self.step_selector_menu(crate::domain::navigation::NavDir::Down),
             NavAction::Confirm => {
                 let select = row.selector_select(highlight);
                 self.play_ui_cue(UiSoundKind::Action);
@@ -3540,32 +3547,23 @@ impl App {
         }
     }
 
-    /// Move the open dropdown highlight one step. The step is clamped
-    /// ([`selector_menu_step`]): a rejected edge returns `Task::none()` before
+    /// Move the open dropdown highlight one step through the shared
+    /// clamp-only list policy: a rejected edge returns `Task::none()` before
     /// any cue or scroll, so only a real highlight change feels the Nav cue.
-    fn step_selector_menu(&mut self, delta: isize) -> Task<Message> {
+    fn step_selector_menu(&mut self, dir: crate::domain::navigation::NavDir) -> Task<Message> {
+        use crate::domain::navigation::{NavAxis, NavList};
         let Some((row, highlight)) = self.launcher_state.settings.menu else {
             return Task::none();
         };
-        let Some(next) = selector_menu_step(highlight, row.selector_count(), delta) else {
+        let mut list = NavList::new(row.selector_count(), NavAxis::Vertical).with_focus(highlight);
+        let outcome = list.try_move(dir);
+        if !outcome.moved() {
             return Task::none();
-        };
-        self.launcher_state.settings.set_menu_highlight(next);
-        self.play_ui_cue(UiSoundKind::Nav);
+        }
+        self.launcher_state.settings.set_menu_highlight(list.focus);
+        self.apply_move_outcome(outcome);
         self.scroll_settings_focus_into_view(launcher_view::ScrollReveal::Either)
     }
-}
-
-/// Clamped selector-menu highlight step: `Some(next)` only when the move stays
-/// inside the option list. Edges return `None` (no wrap) so callers reject them
-/// silently — matching the linear Games strip (`view::move_selection`), which
-/// keeps its own clamp and skip logic.
-pub(crate) fn selector_menu_step(highlight: usize, count: usize, delta: isize) -> Option<usize> {
-    if count == 0 {
-        return None;
-    }
-    let next = highlight.checked_add_signed(delta)?;
-    (next < count).then_some(next)
 }
 
 impl App {
@@ -4767,9 +4765,7 @@ pub(crate) fn launcher_focus_move_frozen(message: &LauncherMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action, selector_menu_step,
-    };
+    use super::{launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action};
     use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
     use crate::ui::launcher::input::NavAction;
     use crate::ui::launcher::settings::{SettingsPanel, SettingsRow};
@@ -4850,8 +4846,14 @@ mod tests {
 
     #[test]
     fn selector_menu_steps_clamp_at_both_ends() {
+        use crate::domain::navigation::{MoveOutcome, NavAxis, NavDir, NavList};
         // Every selector dropdown rejects the edge move instead of wrapping,
         // so the app applies no Nav cue and no scroll there.
+        let step = |highlight: usize, count: usize, dir: NavDir| {
+            let mut list = NavList::new(count, NavAxis::Vertical).with_focus(highlight);
+            let outcome = list.try_move(dir);
+            (outcome, list.focus)
+        };
         for row in [
             SettingsRow::SelectionMode,
             SettingsRow::ImmersiveLayout,
@@ -4860,35 +4862,58 @@ mod tests {
         ] {
             let count = row.selector_count();
             assert!(count >= 2, "{row:?} needs at least two options");
-            assert_eq!(selector_menu_step(0, count, -1), None, "{row:?} Up edge");
             assert_eq!(
-                selector_menu_step(count - 1, count, 1),
-                None,
+                step(0, count, NavDir::Up).0,
+                MoveOutcome::Rejected,
+                "{row:?} Up edge"
+            );
+            assert_eq!(
+                step(count - 1, count, NavDir::Down).0,
+                MoveOutcome::Rejected,
                 "{row:?} Down edge"
             );
             // Interior moves always land, so only those change the highlight.
             for i in 0..count - 1 {
-                assert_eq!(selector_menu_step(i, count, 1), Some(i + 1), "{row:?}");
-                assert_eq!(selector_menu_step(i + 1, count, -1), Some(i), "{row:?}");
+                assert_eq!(
+                    step(i, count, NavDir::Down),
+                    (
+                        MoveOutcome::Moved {
+                            cue: crate::domain::navigation::NavCue::Nav
+                        },
+                        i + 1
+                    ),
+                    "{row:?}"
+                );
+                assert_eq!(
+                    step(i + 1, count, NavDir::Up),
+                    (
+                        MoveOutcome::Moved {
+                            cue: crate::domain::navigation::NavCue::Nav
+                        },
+                        i
+                    ),
+                    "{row:?}"
+                );
             }
         }
-        // Defensive: empty lists and out-of-range highlights never step.
-        assert_eq!(selector_menu_step(0, 0, 1), None);
-        assert_eq!(selector_menu_step(0, 0, -1), None);
-        assert_eq!(selector_menu_step(5, 3, 1), None);
-        assert_eq!(selector_menu_step(0, 3, -1), None);
+        // Defensive: an empty list never steps.
+        assert_eq!(step(0, 0, NavDir::Down).0, MoveOutcome::Rejected);
+        assert_eq!(step(0, 0, NavDir::Up).0, MoveOutcome::Rejected);
     }
 
     #[test]
     fn selector_menu_edge_rejection_keeps_highlight() {
-        // Mirror the caller: only a clamped `Some` reaches set_menu_highlight,
+        use crate::domain::navigation::{NavAxis, NavDir, NavList};
+        // Mirror the caller: only a moved outcome reaches set_menu_highlight,
         // so a rejected edge leaves the open highlight exactly where it was.
-        fn apply_step(panel: &mut SettingsPanel, delta: isize) {
+        fn apply_step(panel: &mut SettingsPanel, dir: NavDir) {
             let Some((row, highlight)) = panel.menu else {
                 return;
             };
-            if let Some(next) = selector_menu_step(highlight, row.selector_count(), delta) {
-                panel.set_menu_highlight(next);
+            let mut list =
+                NavList::new(row.selector_count(), NavAxis::Vertical).with_focus(highlight);
+            if list.try_move(dir).moved() {
+                panel.set_menu_highlight(list.focus);
             }
         }
 
@@ -4896,17 +4921,17 @@ mod tests {
             menu: Some((SettingsRow::SelectionMode, 0)),
             ..Default::default()
         };
-        apply_step(&mut panel, -1);
+        apply_step(&mut panel, NavDir::Up);
         assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, 0)));
 
         let last = SettingsRow::SelectionMode.selector_count() - 1;
         panel.menu = Some((SettingsRow::SelectionMode, last));
-        apply_step(&mut panel, 1);
+        apply_step(&mut panel, NavDir::Down);
         assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, last)));
 
         // Interior moves do land via the same path.
         panel.menu = Some((SettingsRow::SelectionMode, 0));
-        apply_step(&mut panel, 1);
+        apply_step(&mut panel, NavDir::Down);
         assert_eq!(panel.menu, Some((SettingsRow::SelectionMode, 1)));
     }
 

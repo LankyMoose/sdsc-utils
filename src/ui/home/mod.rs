@@ -13,6 +13,7 @@
 use crate::app::installs::{DOWNLOAD_LIMIT_OPTIONS_KBPS, download_limit_label};
 use crate::controller::dualsense::lightbar;
 use crate::controller::model::Serial;
+use crate::domain::navigation::{MoveOutcome, NavAxis, NavDir, NavDispatcher, NavList};
 use crate::persist::prefs::{AUTO_OPEN_MODES, HomeAutoOpen};
 use crate::ui::face::{
     FaceButton, RingStyle, action_cluster_spaced, face_glyph, hint_text_capsule, hold_hint,
@@ -452,7 +453,7 @@ pub struct State {
     /// Engine worker live. Drives the Browser tile state.
     pub engine_ready: bool,
     /// D-pad/stick repeat for Home movement.
-    nav: crate::domain::pad::NavStepper,
+    nav: NavDispatcher,
     /// Current face holds for hint rings and the SELECT/START capsules.
     pub cross_held: bool,
     pub square_held: bool,
@@ -537,7 +538,7 @@ impl Default for State {
             focus: HomeFocus::Apps,
             launcher_enabled: true,
             engine_ready: false,
-            nav: crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU),
+            nav: NavDispatcher::new(),
             cross_held: false,
             square_held: false,
             triangle_held: false,
@@ -589,6 +590,27 @@ impl Default for State {
     }
 }
 
+fn nav_dir(delta: i32, axis: NavAxis) -> NavDir {
+    match (axis, delta.signum()) {
+        (NavAxis::Horizontal, -1) => NavDir::Left,
+        (NavAxis::Horizontal, _) => NavDir::Right,
+        (NavAxis::Vertical, -1) => NavDir::Up,
+        (NavAxis::Vertical, _) => NavDir::Down,
+    }
+}
+
+/// Shared clamp-only list step for Home. `focus` is written back only through
+/// `NavList`, so the boundary policy and the cue outcome cannot diverge.
+fn move_list(focus: &mut usize, len: usize, axis: NavAxis, delta: i32) -> MoveOutcome {
+    if delta == 0 {
+        return MoveOutcome::Rejected;
+    }
+    let mut list = NavList::new(len, axis).with_focus(*focus);
+    let outcome = list.try_move(nav_dir(delta, axis));
+    *focus = list.focus;
+    outcome
+}
+
 impl State {
     pub fn selected(&self) -> usize {
         self.selected.min(TILES.len() - 1)
@@ -598,49 +620,39 @@ impl State {
         TILES[self.selected()]
     }
 
-    /// Move the app highlight. Clamps at the row edges. Returns true when it
-    /// moved; the edge rejection is silent.
-    pub fn move_selection(&mut self, delta: i32) -> bool {
-        if delta == 0 {
-            return false;
-        }
-        let len = TILES.len() as i32;
-        let next = (self.selected() as i32 + delta).clamp(0, len - 1);
-        if next as usize == self.selected() {
-            return false;
-        }
-        self.selected = next as usize;
-        true
+    /// Move the app highlight. Clamps at the row edges; an edge rejection is
+    /// silent and carries no cue.
+    pub fn move_selection(&mut self, delta: i32) -> MoveOutcome {
+        move_list(&mut self.selected, TILES.len(), NavAxis::Horizontal, delta)
     }
 
     /// Move within the focused row. The apps row is horizontal and the
     /// controllers dock is vertical; an axis only drives its own row.
-    pub fn move_x(&mut self, delta: i32) -> bool {
+    pub fn move_x(&mut self, delta: i32) -> MoveOutcome {
         match self.focus {
             HomeFocus::Apps => self.move_selection(delta),
-            HomeFocus::Controllers => false,
+            HomeFocus::Controllers => MoveOutcome::Rejected,
         }
     }
 
-    pub fn move_y(&mut self, delta: i32) -> bool {
+    pub fn move_y(&mut self, delta: i32) -> MoveOutcome {
         match self.focus {
-            HomeFocus::Apps => false,
+            HomeFocus::Apps => MoveOutcome::Rejected,
             HomeFocus::Controllers => self.move_controller_selection(delta),
         }
     }
 
-    fn move_controller_selection(&mut self, delta: i32) -> bool {
-        if delta == 0 || self.controllers.is_empty() {
-            return false;
+    fn move_controller_selection(&mut self, delta: i32) -> MoveOutcome {
+        let outcome = move_list(
+            &mut self.controller_focus,
+            self.controllers.len(),
+            NavAxis::Vertical,
+            delta,
+        );
+        if outcome.moved() {
+            self.reset_triangle_hold();
         }
-        let len = self.controllers.len() as i32;
-        let next = (self.controller_focus as i32 + delta).clamp(0, len - 1);
-        if next as usize == self.controller_focus {
-            return false;
-        }
-        self.controller_focus = next as usize;
-        self.reset_triangle_hold();
-        true
+        outcome
     }
 
     /// True while the top-right controllers dock owns input.
@@ -900,8 +912,8 @@ impl State {
     pub fn on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
         self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
-        self.nav =
-            crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU);
+        self.nav = NavDispatcher::new();
+        self.nav.prepare_on_open(true);
         self.cross_held = false;
         self.square_held = false;
         self.triangle_held = false;
@@ -929,8 +941,8 @@ impl State {
     pub fn rearm_on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
         self.launcher_enabled = launcher_enabled;
         self.engine_ready = engine_ready;
-        self.nav =
-            crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU);
+        self.nav = NavDispatcher::new();
+        self.nav.prepare_on_open(true);
         self.cross_held = false;
         self.square_held = false;
         self.triangle_held = false;
@@ -992,27 +1004,27 @@ impl State {
         }
     }
 
-    /// Move the settings focus over visible rows. Returns true when it moved.
-    pub fn settings_move(&mut self, delta: i32) -> bool {
+    /// Move the settings focus over visible rows. Returns the move outcome;
+    /// only a real move carries a cue.
+    pub fn settings_move(&mut self, delta: i32) -> MoveOutcome {
         if delta == 0 {
-            return false;
+            return MoveOutcome::Rejected;
         }
         let rows: Vec<usize> = (0..SETTINGS_ROWS.len())
             .filter(|row| self.settings_visible(*row))
             .collect();
         if rows.is_empty() {
-            return false;
+            return MoveOutcome::Rejected;
         }
-        let current = rows
+        let mut position = rows
             .iter()
             .position(|row| *row == self.settings_focus)
-            .unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, rows.len() as i32 - 1) as usize;
-        if rows[next] == self.settings_focus {
-            return false;
+            .unwrap_or(0);
+        let outcome = move_list(&mut position, rows.len(), NavAxis::Vertical, delta);
+        if outcome.moved() {
+            self.settings_focus = rows[position];
         }
-        self.settings_focus = rows[next];
-        true
+        outcome
     }
 
     pub fn settings_value(&self, row: usize) -> String {
@@ -1064,25 +1076,22 @@ impl State {
         self.settings_menu = None;
     }
 
-    /// Move the expanded dropdown highlight. Clamps at the ends. Returns true
-    /// when it moved.
-    pub fn settings_menu_move(&mut self, delta: i32) -> bool {
+    /// Move the expanded dropdown highlight. Clamps at the ends; an edge
+    /// rejection is silent.
+    pub fn settings_menu_move(&mut self, delta: i32) -> MoveOutcome {
         if delta == 0 {
-            return false;
+            return MoveOutcome::Rejected;
         }
         let Some((row, highlight)) = self.settings_menu else {
-            return false;
+            return MoveOutcome::Rejected;
         };
         let count = Self::settings_option_count(row);
-        if count == 0 {
-            return false;
+        let mut focus = highlight;
+        let outcome = move_list(&mut focus, count, NavAxis::Vertical, delta);
+        if outcome.moved() {
+            self.settings_menu = Some((row, focus));
         }
-        let next = (highlight as i32 + delta).clamp(0, count as i32 - 1) as usize;
-        if next == highlight {
-            return false;
-        }
-        self.settings_menu = Some((row, next));
-        true
+        outcome
     }
 
     pub fn settings_option_count(row: usize) -> usize {
@@ -1197,19 +1206,12 @@ impl State {
         self.apps_menu_actions().get(self.apps_menu_focus).copied()
     }
 
-    /// Move the focused app action. Clamps at the ends. Returns true when it
-    /// moved; empty menus and edge rejection stay silent.
-    pub fn apps_menu_move(&mut self, delta: i32) -> bool {
-        let len = self.apps_menu_actions().len() as i32;
-        if delta == 0 || len == 0 {
-            return false;
-        }
-        let next = (self.apps_menu_focus as i32 + delta).clamp(0, len - 1) as usize;
-        if next == self.apps_menu_focus {
-            return false;
-        }
-        self.apps_menu_focus = next;
-        true
+    /// Move the focused app action. Clamps at the ends; empty menus and edge
+    /// rejection stay silent. Both axes drive this vertical menu (the app's
+    /// MoveX/MoveY routes share it), so the caller supplies the axis.
+    pub fn apps_menu_move(&mut self, delta: i32, axis: NavAxis) -> MoveOutcome {
+        let len = self.apps_menu_actions().len();
+        move_list(&mut self.apps_menu_focus, len, axis, delta)
     }
 
     /// Estimated pixel height of the Info changelog wrapped into the fixed
@@ -1387,18 +1389,22 @@ impl State {
     /// only handles nav repeat, held visuals, and the Triangle power-off hold.
     pub fn pad_tick(
         &mut self,
-        sample: &crate::domain::pad::PadSample,
+        reading: &crate::domain::pad::NavReading,
         now: Instant,
         tap: Option<HomeMessage>,
     ) -> Option<HomeMessage> {
         use crate::domain::pad::NavAction;
+        let sample = &reading.sample;
         let mut message = None;
         self.cross_held = sample.cross;
         self.square_held = sample.square;
         self.triangle_held = sample.triangle;
         self.options_held = sample.options;
         self.create_held = sample.create;
-        let nav = self.nav.update(sample, now, true, true);
+        let nav = self
+            .nav
+            .tick(std::slice::from_ref(reading), now, true, true)
+            .action;
         if let Some(action) = nav {
             message = match action {
                 NavAction::Left => Some(HomeMessage::MoveX(-1)),
@@ -2845,17 +2851,17 @@ mod tests {
         let mut state = State::default();
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
         // Left at the first tile is rejected, not wrapped.
-        assert!(!state.move_x(-1));
+        assert!(!state.move_x(-1).moved());
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
-        assert!(state.move_x(1));
+        assert!(state.move_x(1).moved());
         assert_eq!(state.selected_tile(), HomeTile::Browser);
         // Right at the last tile is rejected, not wrapped.
-        assert!(!state.move_x(1));
+        assert!(!state.move_x(1).moved());
         assert_eq!(state.selected_tile(), HomeTile::Browser);
-        assert!(state.move_x(-1));
+        assert!(state.move_x(-1).moved());
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
         // The apps row is horizontal: vertical input is inert.
-        assert!(!state.move_y(1));
+        assert!(!state.move_y(1).moved());
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
     }
 
@@ -2916,28 +2922,28 @@ mod tests {
         assert!(state.toggle_dock(now));
         assert_eq!(state.focus, HomeFocus::Controllers);
         // The dock is vertical: horizontal input must not move it.
-        assert!(!state.move_x(1));
+        assert!(!state.move_x(1).moved());
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("abc")
         );
-        assert!(state.move_y(1));
+        assert!(state.move_y(1).moved());
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("def")
         );
         // The dock clamps at the last row instead of wrapping to the first.
-        assert!(!state.move_y(1));
+        assert!(!state.move_y(1).moved());
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("def")
         );
-        assert!(state.move_y(-1));
+        assert!(state.move_y(-1).moved());
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("abc")
         );
-        assert!(!state.move_y(-1));
+        assert!(!state.move_y(-1).moved());
         assert!(state.collapse_dock(now));
         assert_eq!(state.focus, HomeFocus::Apps);
     }
@@ -3055,12 +3061,12 @@ mod tests {
         assert_eq!(state.settings_value(SETTINGS_HAPTICS), "Off");
         assert_eq!(state.settings_value(SETTINGS_STRENGTH), "40%");
         assert_eq!(state.settings_value(SETTINGS_DOWNLOAD), "5 MB/s");
-        assert!(state.settings_move(1));
+        assert!(state.settings_move(1).moved());
         assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
-        assert!(state.settings_move(-1));
+        assert!(state.settings_move(-1).moved());
         assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
         // Top row: up is rejected, not wrapped to the bottom.
-        assert!(!state.settings_move(-1));
+        assert!(!state.settings_move(-1).moved());
         assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
     }
 
@@ -3089,12 +3095,12 @@ mod tests {
         state.settings_focus = SETTINGS_STRENGTH;
         // Last visible row: down is rejected; the hidden cap row is never
         // entered and movement does not wrap to the top.
-        assert!(!state.settings_move(1));
+        assert!(!state.settings_move(1).moved());
         assert_eq!(
             state.settings_focus, SETTINGS_STRENGTH,
             "movement clamps below the hidden cap row"
         );
-        assert!(state.settings_move(-1));
+        assert!(state.settings_move(-1).moved());
         assert_eq!(state.settings_focus, SETTINGS_HAPTICS);
     }
 
@@ -3107,21 +3113,21 @@ mod tests {
 
         assert!(state.open_settings_menu(SETTINGS_AUTO_OPEN));
         assert_eq!(state.settings_menu_highlight(), Some(1));
-        assert!(state.settings_menu_move(1));
+        assert!(state.settings_menu_move(1).moved());
         assert_eq!(state.settings_menu_highlight(), Some(2));
         assert_eq!(
             state.settings_menu_choice(),
             Some(HomeSettingChoice::AutoOpen(HomeAutoOpen::Any))
         );
         // Last option: down is rejected, not wrapped to the first.
-        assert!(!state.settings_menu_move(1));
+        assert!(!state.settings_menu_move(1).moved());
         assert_eq!(state.settings_menu_highlight(), Some(2));
         state.close_settings_menu();
         assert!(!state.settings_menu_open());
 
         assert!(state.open_settings_menu(SETTINGS_DOWNLOAD));
         assert_eq!(state.settings_menu_highlight(), Some(1));
-        assert!(state.settings_menu_move(-1));
+        assert!(state.settings_menu_move(-1).moved());
         assert_eq!(state.settings_menu_highlight(), Some(0));
         assert_eq!(
             state.settings_menu_choice(),
@@ -3161,18 +3167,18 @@ mod tests {
         state.open_apps_menu(0);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
         // Top action: up is rejected, not wrapped.
-        assert!(!state.apps_menu_move(-1));
+        assert!(!state.apps_menu_move(-1, NavAxis::Vertical).moved());
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
-        assert!(state.apps_menu_move(1));
+        assert!(state.apps_menu_move(1, NavAxis::Vertical).moved());
         assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
         // Bottom action: down is rejected, not wrapped.
-        assert!(!state.apps_menu_move(1));
+        assert!(!state.apps_menu_move(1, NavAxis::Vertical).moved());
         assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
-        assert!(state.apps_menu_move(-1));
+        assert!(state.apps_menu_move(-1, NavAxis::Vertical).moved());
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
         // A closed/empty menu reports no movement.
         state.close_apps_menu();
-        assert!(!state.apps_menu_move(1));
+        assert!(!state.apps_menu_move(1, NavAxis::Vertical).moved());
     }
 
     #[test]
@@ -3294,19 +3300,25 @@ mod tests {
 
     #[test]
     fn controller_cards_track_face_holds() {
-        use crate::domain::pad::PadSample;
+        use crate::domain::pad::{NavReading, PadId, PadSample};
         let mut state = State::default();
+        state.nav.prepare_on_open(true);
         let now = Instant::now();
+        let reading = |sample| NavReading {
+            id: PadId("hid:test".into()),
+            source: "test",
+            sample,
+        };
         let sample = PadSample {
             cross: true,
             triangle: true,
             ..PadSample::default()
         };
-        state.pad_tick(&sample, now, None);
+        state.pad_tick(&reading(sample), now, None);
         assert!(state.cross_held);
         assert!(state.triangle_held);
         state.pad_tick(
-            &PadSample::default(),
+            &reading(PadSample::default()),
             now + std::time::Duration::from_millis(16),
             None,
         );
@@ -3351,26 +3363,34 @@ mod tests {
 
     #[test]
     fn dpad_vertical_emits_move_y_for_the_dock() {
-        use crate::domain::pad::PadSample;
+        use crate::domain::pad::{NavReading, PadId, PadSample};
+        fn reading(sample: PadSample) -> NavReading {
+            NavReading {
+                id: PadId("hid:test".into()),
+                source: "test",
+                sample,
+            }
+        }
         let mut state = State::default();
+        state.nav.prepare_on_open(true);
         let now = Instant::now();
-        let down = PadSample {
+        let down = reading(PadSample {
             dpad_down: true,
             ..PadSample::default()
-        };
+        });
         assert_eq!(
             state.pad_tick(&down, now, None),
             Some(HomeMessage::MoveY(1))
         );
         state.pad_tick(
-            &PadSample::default(),
+            &reading(PadSample::default()),
             now + std::time::Duration::from_millis(16),
             None,
         );
-        let up = PadSample {
+        let up = reading(PadSample {
             dpad_up: true,
             ..PadSample::default()
-        };
+        });
         assert_eq!(
             state.pad_tick(&up, now + std::time::Duration::from_millis(32), None),
             Some(HomeMessage::MoveY(-1))

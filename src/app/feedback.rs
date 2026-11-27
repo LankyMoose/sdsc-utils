@@ -5,6 +5,7 @@
 
 use super::{App, Message};
 use crate::controller::dualsense::rumble::MotorPulse;
+use crate::domain::navigation::{ActionOutcome, MoveOutcome, NavCue};
 use crate::domain::pad::PadId;
 use crate::persist::prefs::{clamp_ui_haptics_strength, clamp_ui_sound_volume};
 use crate::platform::ui_sound::UiSoundKind;
@@ -36,6 +37,33 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn ui_cue_count() -> u64 {
         UI_CUE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn nav_cue_kind(cue: NavCue) -> UiSoundKind {
+        match cue {
+            NavCue::Nav => UiSoundKind::Nav,
+            NavCue::Action => UiSoundKind::Action,
+        }
+    }
+
+    /// The one feedback choke point for navigation outcomes: rejected inputs
+    /// stay silent, an accepted move/action plays exactly its own cue.
+    pub(crate) fn apply_move_outcome(&self, outcome: MoveOutcome) {
+        if let Some(cue) = outcome.cue() {
+            self.play_ui_cue(Self::nav_cue_kind(cue));
+        }
+    }
+
+    pub(crate) fn apply_action_outcome(&self, outcome: ActionOutcome) {
+        if let Some(cue) = outcome.cue() {
+            self.play_ui_cue(Self::nav_cue_kind(cue));
+        }
+    }
+
+    /// For surfaces whose success is not a `MoveOutcome` (scroll position,
+    /// domain navigation), still route the cue through the same mapping.
+    pub(crate) fn apply_nav_cue(&self, cue: NavCue) {
+        self.play_ui_cue(Self::nav_cue_kind(cue));
     }
 
     pub(crate) fn play_ui_haptic(&self, kind: UiSoundKind) {

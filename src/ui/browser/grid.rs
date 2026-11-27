@@ -301,22 +301,19 @@ pub fn focus_after_close(visual: &[TabId], focus: GridFocus, closed: TabId) -> G
     }
 }
 
-/// Result of one tabs-view focus move. `Rejected` means the direction cannot
-/// move focus from here (strip edge, bookmark-row edge, or empty bookmarks);
-/// callers cue only on `Moved`.
+/// Result of one tabs-view focus move. The domain owns the moved/rejected
+/// outcome and cue; the grid owns which focus and row memory to apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GridFocusOutcome {
-    Moved {
-        focus: GridFocus,
-        /// Row focus to store, or `None` when it does not change.
-        row_focus: Option<GridFocus>,
-    },
-    Rejected,
+pub struct GridFocusMove {
+    pub outcome: crate::domain::navigation::MoveOutcome,
+    pub focus: GridFocus,
+    /// Row focus to store, or `None` when it does not change.
+    pub row_focus: Option<GridFocus>,
 }
 
-impl GridFocusOutcome {
+impl GridFocusMove {
     pub fn moved(self) -> bool {
-        matches!(self, Self::Moved { .. })
+        self.outcome.moved()
     }
 }
 
@@ -330,46 +327,77 @@ pub fn move_focus(
     visual: &[TabId],
     strip: &[TabId],
     bookmark_count: usize,
-) -> GridFocusOutcome {
-    let count = strip.len() + 1;
-    let slot = match focus {
-        GridFocus::Plus | GridFocus::Bookmark(_) => 0,
-        GridFocus::Tab(id) => strip
-            .iter()
-            .position(|tab| *tab == id)
-            .map(|index| index + 1)
-            .unwrap_or(0),
+) -> GridFocusMove {
+    use crate::domain::navigation::{MoveOutcome, NavAxis, NavDir, NavList};
+
+    let nav_dir = match dir {
+        JumpDir::Left => Some(NavDir::Left),
+        JumpDir::Right => Some(NavDir::Right),
+        JumpDir::Up => Some(NavDir::Up),
+        JumpDir::Down => Some(NavDir::Down),
     };
+    let mut outcome = MoveOutcome::Rejected;
     let next = match focus {
         GridFocus::Bookmark(current) => match dir {
-            JumpDir::Left if current > 0 => GridFocus::Bookmark(current - 1),
-            JumpDir::Right if current + 1 < bookmark_count => GridFocus::Bookmark(current + 1),
-            JumpDir::Up => match row_focus {
-                GridFocus::Tab(id) if visual.contains(&id) => GridFocus::Tab(id),
-                GridFocus::Plus => GridFocus::Plus,
-                _ => visual
-                    .first()
-                    .copied()
-                    .map(GridFocus::Tab)
-                    .unwrap_or(GridFocus::Plus),
-            },
-            _ => focus,
+            JumpDir::Left | JumpDir::Right => {
+                let mut list =
+                    NavList::new(bookmark_count, NavAxis::Horizontal).with_focus(current);
+                outcome = list.try_move(nav_dir.unwrap_or(NavDir::Left));
+                GridFocus::Bookmark(list.focus)
+            }
+            JumpDir::Up => {
+                let next = match row_focus {
+                    GridFocus::Tab(id) if visual.contains(&id) => GridFocus::Tab(id),
+                    GridFocus::Plus => GridFocus::Plus,
+                    _ => visual
+                        .first()
+                        .copied()
+                        .map(GridFocus::Tab)
+                        .unwrap_or(GridFocus::Plus),
+                };
+                if next != focus {
+                    outcome = MoveOutcome::Moved {
+                        cue: crate::domain::navigation::NavCue::Nav,
+                    };
+                }
+                next
+            }
+            JumpDir::Down => focus,
         },
         GridFocus::Plus | GridFocus::Tab(_) => match dir {
-            JumpDir::Left if slot > 0 => {
-                if slot == 1 {
+            JumpDir::Left | JumpDir::Right => {
+                let slot = match focus {
+                    GridFocus::Plus => 0,
+                    GridFocus::Tab(id) => strip
+                        .iter()
+                        .position(|tab| *tab == id)
+                        .map(|index| index + 1)
+                        .unwrap_or(0),
+                    GridFocus::Bookmark(_) => 0,
+                };
+                let mut list = NavList::new(strip.len() + 1, NavAxis::Horizontal).with_focus(slot);
+                outcome = list.try_move(nav_dir.unwrap_or(NavDir::Left));
+                if list.focus == 0 {
                     GridFocus::Plus
                 } else {
-                    GridFocus::Tab(strip[slot - 2])
+                    GridFocus::Tab(strip[list.focus - 1])
                 }
             }
-            JumpDir::Right if slot + 1 < count => GridFocus::Tab(strip[slot]),
-            JumpDir::Down if bookmark_count > 0 => GridFocus::Bookmark(0),
+            JumpDir::Down if bookmark_count > 0 => {
+                outcome = MoveOutcome::Moved {
+                    cue: crate::domain::navigation::NavCue::Nav,
+                };
+                GridFocus::Bookmark(0)
+            }
             _ => focus,
         },
     };
-    if next == focus {
-        return GridFocusOutcome::Rejected;
+    if !outcome.moved() {
+        return GridFocusMove {
+            outcome,
+            focus,
+            row_focus: None,
+        };
     }
     let row_focus = if matches!(next, GridFocus::Bookmark(_)) {
         // Entering the bookmark row remembers the card to restore on Up.
@@ -381,7 +409,8 @@ pub fn move_focus(
     } else {
         Some(next)
     };
-    GridFocusOutcome::Moved {
+    GridFocusMove {
+        outcome,
         focus: next,
         row_focus,
     }
@@ -2016,61 +2045,61 @@ mod tests {
         );
     }
 
+    use crate::domain::navigation::{MoveOutcome, NavCue};
+
+    fn assert_moved(movement: GridFocusMove, focus: GridFocus, row_focus: Option<GridFocus>) {
+        assert_eq!(movement.outcome, MoveOutcome::Moved { cue: NavCue::Nav });
+        assert_eq!(movement.focus, focus);
+        assert_eq!(movement.row_focus, row_focus);
+    }
+
+    fn assert_rejected(movement: GridFocusMove) {
+        assert_eq!(movement.outcome, MoveOutcome::Rejected);
+    }
+
     #[test]
     fn focus_moves_report_moved_or_rejected() {
         let visual = [TabId(3), TabId(2)];
         let strip = [TabId(3), TabId(2)];
-        assert_eq!(
-            move_focus(
-                JumpDir::Left,
-                GridFocus::Plus,
-                GridFocus::Plus,
-                &visual,
-                &strip,
-                0
-            ),
-            GridFocusOutcome::Rejected,
-            "the plus card is the strip start"
-        );
-        assert_eq!(
-            move_focus(
-                JumpDir::Right,
-                GridFocus::Tab(TabId(2)),
-                GridFocus::Tab(TabId(2)),
-                &visual,
-                &strip,
-                0
-            ),
-            GridFocusOutcome::Rejected,
-            "the last card is the strip end"
-        );
-        assert_eq!(
+        assert_rejected(move_focus(
+            JumpDir::Left,
+            GridFocus::Plus,
+            GridFocus::Plus,
+            &visual,
+            &strip,
+            0,
+        ));
+        assert_rejected(move_focus(
+            JumpDir::Right,
+            GridFocus::Tab(TabId(2)),
+            GridFocus::Tab(TabId(2)),
+            &visual,
+            &strip,
+            0,
+        ));
+        assert_moved(
             move_focus(
                 JumpDir::Right,
                 GridFocus::Plus,
                 GridFocus::Plus,
                 &visual,
                 &strip,
-                0
+                0,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Tab(TabId(3)),
-                row_focus: Some(GridFocus::Tab(TabId(3))),
-            }
+            GridFocus::Tab(TabId(3)),
+            Some(GridFocus::Tab(TabId(3))),
         );
-        assert_eq!(
+        assert_moved(
             move_focus(
                 JumpDir::Left,
                 GridFocus::Tab(TabId(3)),
                 GridFocus::Tab(TabId(3)),
                 &visual,
                 &strip,
-                0
+                0,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Plus,
-                row_focus: Some(GridFocus::Plus),
-            }
+            GridFocus::Plus,
+            Some(GridFocus::Plus),
         );
     }
 
@@ -2078,55 +2107,45 @@ mod tests {
     fn bookmark_left_right_share_the_focus_outcome() {
         let visual = [TabId(1)];
         let strip = [TabId(1)];
-        assert_eq!(
-            move_focus(
-                JumpDir::Left,
-                GridFocus::Bookmark(0),
-                GridFocus::Tab(TabId(1)),
-                &visual,
-                &strip,
-                2
-            ),
-            GridFocusOutcome::Rejected
-        );
-        assert_eq!(
+        assert_rejected(move_focus(
+            JumpDir::Left,
+            GridFocus::Bookmark(0),
+            GridFocus::Tab(TabId(1)),
+            &visual,
+            &strip,
+            2,
+        ));
+        assert_moved(
             move_focus(
                 JumpDir::Right,
                 GridFocus::Bookmark(0),
                 GridFocus::Tab(TabId(1)),
                 &visual,
                 &strip,
-                2
+                2,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Bookmark(1),
-                row_focus: None,
-            }
+            GridFocus::Bookmark(1),
+            None,
         );
-        assert_eq!(
-            move_focus(
-                JumpDir::Right,
-                GridFocus::Bookmark(1),
-                GridFocus::Tab(TabId(1)),
-                &visual,
-                &strip,
-                2
-            ),
-            GridFocusOutcome::Rejected
-        );
-        assert_eq!(
+        assert_rejected(move_focus(
+            JumpDir::Right,
+            GridFocus::Bookmark(1),
+            GridFocus::Tab(TabId(1)),
+            &visual,
+            &strip,
+            2,
+        ));
+        assert_moved(
             move_focus(
                 JumpDir::Left,
                 GridFocus::Bookmark(1),
                 GridFocus::Tab(TabId(1)),
                 &visual,
                 &strip,
-                2
+                2,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Bookmark(0),
-                row_focus: None,
-            }
+            GridFocus::Bookmark(0),
+            None,
         );
     }
 
@@ -2134,46 +2153,38 @@ mod tests {
     fn bookmark_row_remembers_the_card_to_restore() {
         let visual = [TabId(1)];
         let strip = [TabId(1)];
-        assert_eq!(
+        assert_moved(
             move_focus(
                 JumpDir::Down,
                 GridFocus::Tab(TabId(1)),
                 GridFocus::Tab(TabId(1)),
                 &visual,
                 &strip,
-                1
+                1,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Bookmark(0),
-                row_focus: Some(GridFocus::Tab(TabId(1))),
-            }
+            GridFocus::Bookmark(0),
+            Some(GridFocus::Tab(TabId(1))),
         );
-        assert_eq!(
+        assert_moved(
             move_focus(
                 JumpDir::Up,
                 GridFocus::Bookmark(0),
                 GridFocus::Tab(TabId(1)),
                 &visual,
                 &strip,
-                1
+                1,
             ),
-            GridFocusOutcome::Moved {
-                focus: GridFocus::Tab(TabId(1)),
-                row_focus: Some(GridFocus::Tab(TabId(1))),
-            }
+            GridFocus::Tab(TabId(1)),
+            Some(GridFocus::Tab(TabId(1))),
         );
-        assert_eq!(
-            move_focus(
-                JumpDir::Down,
-                GridFocus::Tab(TabId(1)),
-                GridFocus::Tab(TabId(1)),
-                &visual,
-                &strip,
-                0
-            ),
-            GridFocusOutcome::Rejected,
-            "an empty bookmark row rejects Down"
-        );
+        assert_rejected(move_focus(
+            JumpDir::Down,
+            GridFocus::Tab(TabId(1)),
+            GridFocus::Tab(TabId(1)),
+            &visual,
+            &strip,
+            0,
+        ));
     }
 
     #[test]

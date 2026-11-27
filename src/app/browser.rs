@@ -6,6 +6,7 @@
 //! `notes/browser-embedding.md` for the engine/cursor contract.
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
+use crate::domain::navigation::{ActionOutcome, NavCue};
 use crate::domain::pad::{
     NavAction, NavBank, NavStepper, PadAction, PadButton, PadButtonAction, PadId,
 };
@@ -184,10 +185,9 @@ pub struct BrowserAppState {
     /// Browser-window pad bank: face/bumper edges + reader nav. The engine
     /// cursor uses `dpad_stepper` and raw stick samples instead.
     pub nav: NavBank,
-    /// Tabs-view navigation: the shared per-pad [`NavBank`] (menu deadzone,
-    /// repeat, neutral grace, arming) so the grid moves exactly like
-    /// Launcher/Home/OSK.
-    pub grid_nav: NavBank,
+    /// Tabs-view navigation dispatcher: per-pad bank + outcome policy behind
+    /// one surface entry point.
+    pub grid_nav: crate::domain::navigation::NavDispatcher,
     /// Frame pull + release grace for held tabs-view sticks.
     pub grid_nav_clock: GridNavClock,
     /// First fresh Browser surface attempted the persisted-strip restore.
@@ -249,6 +249,52 @@ impl GridNavClock {
     pub(crate) fn reset(&mut self) {
         self.active = false;
         self.neutral_since = None;
+    }
+}
+
+/// Adapter that exposes the tabs-view focus graph to the shared dispatcher.
+/// Focus/row mutations happen here; the app applies scroll and cue afterwards.
+struct BrowserGridSurface<'a> {
+    grid: &'a mut crate::ui::browser::grid::GridState,
+    visual: &'a [crate::browser::engine::TabId],
+    strip: &'a [crate::browser::engine::TabId],
+    bookmarks: usize,
+}
+
+impl crate::domain::navigation::NavSurface for BrowserGridSurface<'_> {
+    fn try_move(
+        &mut self,
+        dir: crate::domain::navigation::NavDir,
+    ) -> crate::domain::navigation::MoveOutcome {
+        use crate::browser::cursor::JumpDir;
+        let jump = match dir {
+            crate::domain::navigation::NavDir::Left => JumpDir::Left,
+            crate::domain::navigation::NavDir::Right => JumpDir::Right,
+            crate::domain::navigation::NavDir::Up => JumpDir::Up,
+            crate::domain::navigation::NavDir::Down => JumpDir::Down,
+        };
+        let focus_move = crate::ui::browser::grid::move_focus(
+            jump,
+            self.grid.focus,
+            self.grid.row_focus,
+            self.visual,
+            self.strip,
+            self.bookmarks,
+        );
+        if focus_move.moved() {
+            self.grid.focus = focus_move.focus;
+            if let Some(row_focus) = focus_move.row_focus {
+                self.grid.row_focus = row_focus;
+            }
+        }
+        focus_move.outcome
+    }
+
+    fn try_action(
+        &mut self,
+        _action: crate::domain::pad::NavAction,
+    ) -> crate::domain::navigation::ActionOutcome {
+        crate::domain::navigation::ActionOutcome::Rejected
     }
 }
 
@@ -360,23 +406,13 @@ fn grid_stick_active(readings: &[crate::ui::launcher::input::NavReading]) -> boo
 /// repeat schedule; no edge sequence is consulted, so a steady held stick
 /// keeps firing First then Repeat at the shared 280/90 cadence.
 fn grid_nav_move(
-    bank: &mut NavBank,
+    dispatcher: &mut crate::domain::navigation::NavDispatcher,
     readings: &[crate::ui::launcher::input::NavReading],
     now: Instant,
 ) -> Option<(crate::browser::cursor::JumpDir, PadId)> {
     use crate::browser::cursor::JumpDir;
     let grid_readings = grid_nav_readings(readings);
-    let tick = bank.tick(
-        &grid_readings,
-        now,
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        false,
-    );
+    let tick = dispatcher.tick(&grid_readings, now, true, true);
     let jump = match tick.action {
         Some(NavAction::Up) => Some(JumpDir::Up),
         Some(NavAction::Down) => Some(JumpDir::Down),
@@ -398,12 +434,6 @@ fn grid_scroll_dx(reading: &crate::ui::launcher::input::NavReading) -> Option<f3
     } else {
         Some(reading.sample.rstick_x * 42.0)
     }
-}
-
-/// The one cue a tabs-view focus move owns: accepted moves play `Nav`, edges
-/// reject silently.
-fn grid_move_cue(outcome: crate::ui::browser::grid::GridFocusOutcome) -> Option<UiSoundKind> {
-    outcome.moved().then_some(UiSoundKind::Nav)
 }
 
 const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -1955,7 +1985,7 @@ impl super::App {
             self.browser.pending_grid_move = None;
             self.browser.grid_scroll_pending = Some(offset);
             self.note_launcher_activity();
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_nav_cue(NavCue::Action);
             crate::platform::trace::event(
                 crate::platform::trace::Lane::Browser,
                 "browser.grid.open",
@@ -1986,7 +2016,7 @@ impl super::App {
         self.browser.dpad_stepper.reset();
         self.browser.grid_nav.prepare_on_open(false);
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_nav_cue(NavCue::Action);
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.grid.open")
             .field("tabs", tabs_count)
             .emit();
@@ -2008,7 +2038,7 @@ impl super::App {
     ) -> Task<Message> {
         match self.close_browser_grid_with(select, None) {
             GridCloseOutcome::Started(task) => {
-                self.play_ui_cue(UiSoundKind::Nav);
+                self.apply_nav_cue(NavCue::Nav);
                 task
             }
             GridCloseOutcome::Rejected => Task::none(),
@@ -2144,9 +2174,7 @@ impl super::App {
                     let (dir, pad) = primed.unwrap_or((dir, pad));
                     self.set_haptic_pad_from_id(Some(&pad));
                     let (outcome, move_task) = self.browser_grid_move_focus(dir);
-                    if let Some(cue) = grid_move_cue(outcome) {
-                        self.play_ui_cue(cue);
-                    }
+                    self.apply_move_outcome(outcome);
                     self.haptic_pad_serial = None;
                     return scroll.chain(move_task);
                 }
@@ -2203,7 +2231,7 @@ impl super::App {
         self.browser.panel.grid.focus = GridFocus::Tab(id);
         match self.close_browser_grid_with(Some(id), Some(GridFocus::Tab(id))) {
             GridCloseOutcome::Started(task) => {
-                self.play_ui_cue(UiSoundKind::Nav);
+                self.apply_nav_cue(NavCue::Nav);
                 task
             }
             GridCloseOutcome::Rejected => Task::none(),
@@ -2232,11 +2260,12 @@ impl super::App {
     /// this is the only cue the final-tab path emits.
     pub(crate) fn close_tab_cue(
         outcome: crate::ui::browser::state::TabCloseOutcome,
-    ) -> Option<UiSoundKind> {
+    ) -> Option<crate::domain::navigation::NavCue> {
+        use crate::domain::navigation::NavCue;
         use crate::ui::browser::state::TabCloseOutcome;
         match outcome {
-            TabCloseOutcome::Closed { .. } => Some(UiSoundKind::Action),
-            TabCloseOutcome::ResetDefault => Some(UiSoundKind::Nav),
+            TabCloseOutcome::Closed { .. } => Some(NavCue::Action),
+            TabCloseOutcome::ResetDefault => Some(NavCue::Nav),
             TabCloseOutcome::Rejected => None,
         }
     }
@@ -2260,8 +2289,8 @@ impl super::App {
         #[cfg(debug_assertions)]
         let cues_before = Self::ui_cue_count();
         let outcome = self.close_browser_tab(id);
-        if let Some(kind) = Self::close_tab_cue(outcome) {
-            self.play_ui_cue(kind);
+        if let Some(cue) = Self::close_tab_cue(outcome) {
+            self.apply_nav_cue(cue);
         }
         #[cfg(debug_assertions)]
         crate::controller::hid::diag::diag_info(format!(
@@ -2374,7 +2403,9 @@ impl super::App {
             .map(str::to_string)
             .unwrap_or_else(|| crate::ui::browser::display_url(&url));
         let bookmarked = self.browser.panel.toggle_bookmark(&url, &title);
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_action_outcome(ActionOutcome::Accepted {
+            cue: NavCue::Action,
+        });
         crate::platform::trace::event(
             crate::platform::trace::Lane::Browser,
             "browser.bookmark.toggle",
@@ -2411,39 +2442,42 @@ impl super::App {
     pub(crate) fn browser_grid_move_focus(
         &mut self,
         dir: crate::browser::cursor::JumpDir,
-    ) -> (crate::ui::browser::grid::GridFocusOutcome, Task<Message>) {
-        use crate::ui::browser::grid::{self, GridFocus, GridFocusOutcome};
+    ) -> (crate::domain::navigation::MoveOutcome, Task<Message>) {
+        use crate::ui::browser::grid::{self, GridFocus};
 
         if !self.browser.panel.grid.is_grid() || self.browser.panel.grid.animating() {
-            return (GridFocusOutcome::Rejected, Task::none());
+            return (
+                crate::domain::navigation::MoveOutcome::Rejected,
+                Task::none(),
+            );
         }
-        let panel = &self.browser.panel;
-        let focus = panel.grid.focus;
-        let visual = panel.grid.visual.clone();
-        let tabs = grid::grid_tabs(panel, &visual);
-        let strip: Vec<crate::browser::engine::TabId> = tabs.iter().map(|tab| tab.id).collect();
-        let outcome = grid::move_focus(
-            dir,
-            focus,
-            panel.grid.row_focus,
-            &visual,
-            &strip,
-            panel.bookmarks.len(),
-        );
-        let GridFocusOutcome::Moved {
-            focus: next,
-            row_focus,
-        } = outcome
-        else {
-            return (outcome, Task::none());
+        let visual = self.browser.panel.grid.visual.clone();
+        let tabs = {
+            let panel = &self.browser.panel;
+            grid::grid_tabs(panel, &visual)
         };
-        self.browser.panel.grid.focus = next;
-        if let Some(row_focus) = row_focus {
-            self.browser.panel.grid.row_focus = row_focus;
+        let strip: Vec<crate::browser::engine::TabId> = tabs.iter().map(|tab| tab.id).collect();
+        let bookmarks = self.browser.panel.bookmarks.len();
+        let action = match dir {
+            crate::browser::cursor::JumpDir::Left => crate::domain::pad::NavAction::Left,
+            crate::browser::cursor::JumpDir::Right => crate::domain::pad::NavAction::Right,
+            crate::browser::cursor::JumpDir::Up => crate::domain::pad::NavAction::Up,
+            crate::browser::cursor::JumpDir::Down => crate::domain::pad::NavAction::Down,
+        };
+        let mut surface = BrowserGridSurface {
+            grid: &mut self.browser.panel.grid,
+            visual: &visual,
+            strip: &strip,
+            bookmarks,
+        };
+        let outcome = self.browser.grid_nav.dispatch_move(&mut surface, action);
+        if !outcome.moved() {
+            return (outcome, Task::none());
         }
+        let focus = self.browser.panel.grid.focus;
         // Callers own the one cue and emit it only for `Moved`
-        // (`grid_move_cue`); rejected edges stay silent.
-        let scroll = match next {
+        // (`apply_move_outcome`); rejected edges stay silent.
+        let scroll = match focus {
             GridFocus::Bookmark(index) => self.grid_scroll_to_bookmark(index),
             _ => self.scroll_grid_focus_into_view(),
         };
@@ -2497,9 +2531,7 @@ impl super::App {
         if let Some((jump, pad)) = grid_nav_move(&mut self.browser.grid_nav, readings, now) {
             self.set_haptic_pad_from_id(Some(&pad));
             let (outcome, move_task) = self.browser_grid_move_focus(jump);
-            if let Some(cue) = grid_move_cue(outcome) {
-                self.play_ui_cue(cue);
-            }
+            self.apply_move_outcome(outcome);
             task = task.chain(move_task);
         }
         task = task.chain(self.browser_grid_scroll_from_pad(readings));
@@ -3256,9 +3288,7 @@ impl super::App {
             {
                 self.set_haptic_pad_from_id(Some(&pad));
                 let (outcome, move_task) = self.browser_grid_move_focus(jump);
-                if let Some(cue) = grid_move_cue(outcome) {
-                    self.play_ui_cue(cue);
-                }
+                self.apply_move_outcome(outcome);
                 task = task.chain(move_task);
             }
         }
@@ -3310,7 +3340,9 @@ impl super::App {
             GridFocus::Tab(id) => self.browser_grid_toggle_bookmark(id),
             GridFocus::Bookmark(index) => {
                 if self.browser.panel.remove_bookmark(index) {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     let len = self.browser.panel.bookmarks.len();
                     self.browser.panel.grid.focus = if len == 0 {
                         GridFocus::Tab(self.browser.panel.active_tab)
@@ -4317,7 +4349,7 @@ mod tests {
                 ..PadSample::default()
             },
         );
-        let mut bank = NavBank::default();
+        let mut bank = crate::domain::navigation::NavDispatcher::new();
         bank.prepare_on_open(true);
         let t0 = Instant::now();
         assert_eq!(
@@ -4369,7 +4401,7 @@ mod tests {
         let neutral = hid_nav_reading("hid:a", PadSample::default());
         let t0 = Instant::now();
         let mut clock = GridNavClock::default();
-        let mut bank = NavBank::default();
+        let mut bank = crate::domain::navigation::NavDispatcher::new();
         bank.prepare_on_open(true);
         assert!(clock.demand(true, t0));
         assert!(grid_nav_move(&mut bank, std::slice::from_ref(&firm), t0).is_some());
@@ -4439,7 +4471,7 @@ mod tests {
             !grid_stick_active(std::slice::from_ref(&dpad)),
             "D-pad must not start the pull ticker"
         );
-        let mut bank = NavBank::default();
+        let mut bank = crate::domain::navigation::NavDispatcher::new();
         bank.prepare_on_open(true);
         let t0 = Instant::now();
         assert_eq!(
@@ -4468,15 +4500,15 @@ mod tests {
 
     #[test]
     fn rejected_grid_moves_do_not_cue() {
-        use crate::ui::browser::grid::{GridFocus, GridFocusOutcome};
-        assert_eq!(grid_move_cue(GridFocusOutcome::Rejected), None);
+        use crate::app::App;
+        use crate::domain::navigation::{MoveOutcome, NavCue};
+        assert_eq!(MoveOutcome::Rejected.cue(), None);
         assert_eq!(
-            grid_move_cue(GridFocusOutcome::Moved {
-                focus: GridFocus::Plus,
-                row_focus: Some(GridFocus::Plus),
-            }),
-            Some(UiSoundKind::Nav)
+            MoveOutcome::Moved { cue: NavCue::Nav }.cue(),
+            Some(NavCue::Nav)
         );
+        assert_eq!(App::nav_cue_kind(NavCue::Nav), UiSoundKind::Nav);
+        assert_eq!(App::nav_cue_kind(NavCue::Action), UiSoundKind::Action);
     }
 
     #[test]
@@ -4605,7 +4637,7 @@ mod tests {
         use crate::app::App;
         use crate::browser::engine::TabId;
 
-        fn cues(panel: &BrowserPanel, id: TabId) -> Vec<UiSoundKind> {
+        fn cues(panel: &BrowserPanel, id: TabId) -> Vec<crate::domain::navigation::NavCue> {
             App::close_tab_cue(panel.tab_close_outcome(id))
                 .into_iter()
                 .collect()
@@ -4614,23 +4646,29 @@ mod tests {
         // Final remaining tab: the reset navigation is silent, the close owns
         // the single Nav cue.
         let panel = BrowserPanel::default();
-        assert_eq!(cues(&panel, TabId::BOOT), vec![UiSoundKind::Nav]);
+        assert_eq!(
+            cues(&panel, TabId::BOOT),
+            vec![crate::domain::navigation::NavCue::Nav]
+        );
 
         // Active non-final and background closes: one Action each.
         let mut panel = BrowserPanel::default();
         let (active, _) = panel.create_tab("https://b.test/".to_string());
         assert_eq!(
             cues(&panel, active),
-            vec![UiSoundKind::Action],
+            vec![crate::domain::navigation::NavCue::Action],
             "closing the active non-final tab"
         );
         assert_eq!(
             cues(&panel, TabId::BOOT),
-            vec![UiSoundKind::Action],
+            vec![crate::domain::navigation::NavCue::Action],
             "closing a background tab"
         );
 
         // Unknown tab: rejected, silent.
-        assert_eq!(cues(&panel, TabId(999)), Vec::<UiSoundKind>::new());
+        assert_eq!(
+            cues(&panel, TabId(999)),
+            Vec::<crate::domain::navigation::NavCue>::new()
+        );
     }
 }

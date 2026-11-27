@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use crate::domain::navigation::{ActionOutcome, NavAxis, NavCue};
 use crate::domain::pad::{PadAction, PadButton, PadButtonAction};
 use crate::platform::ui_sound::UiSoundKind;
 
@@ -627,7 +628,9 @@ impl App {
                 self.save_prefs();
                 self.sync_home_settings();
                 self.sync_home_controllers();
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 Task::none()
             }
             HomeMessage::MoveX(delta) => {
@@ -640,7 +643,7 @@ impl App {
                     let Some(offset) = self.home_state.scroll_info(step) else {
                         return Task::none();
                     };
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     return iced::widget::operation::scroll_to(
                         home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
@@ -651,9 +654,8 @@ impl App {
                     return self.home_settings_adjust(delta);
                 }
                 if self.home_state.apps_menu.is_some() {
-                    if self.home_state.apps_menu_move(delta) {
-                        self.play_ui_cue(UiSoundKind::Nav);
-                    }
+                    let outcome = self.home_state.apps_menu_move(delta, NavAxis::Horizontal);
+                    self.apply_move_outcome(outcome);
                     return Task::none();
                 }
                 // The controllers dock is a vertical surface: horizontal
@@ -661,9 +663,8 @@ impl App {
                 if self.home_state.focus == home_view::HomeFocus::Controllers {
                     return Task::none();
                 }
-                if self.home_state.move_x(delta) {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                }
+                let outcome = self.home_state.move_x(delta);
+                self.apply_move_outcome(outcome);
                 Task::none()
             }
             HomeMessage::MoveY(delta) => {
@@ -675,41 +676,39 @@ impl App {
                     let Some(offset) = self.home_state.scroll_info(step) else {
                         return Task::none();
                     };
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     return iced::widget::operation::scroll_to(
                         home_view::info_scroll_id(),
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
                     );
                 }
                 if self.home_state.settings_open {
-                    let moved = if self.home_state.settings_menu_open() {
+                    let outcome = if self.home_state.settings_menu_open() {
                         self.home_state.settings_menu_move(delta)
                     } else {
                         self.home_state.settings_move(delta)
                     };
-                    if moved {
-                        self.play_ui_cue(UiSoundKind::Nav);
-                    }
+                    self.apply_move_outcome(outcome);
                     return Task::none();
                 }
                 if self.home_state.apps_menu.is_some() {
-                    if self.home_state.apps_menu_move(delta) {
-                        self.play_ui_cue(UiSoundKind::Nav);
-                    }
+                    let outcome = self.home_state.apps_menu_move(delta, NavAxis::Vertical);
+                    self.apply_move_outcome(outcome);
                     return Task::none();
                 }
                 // The apps row is horizontal: Up/Down must not play feedback.
                 if self.home_state.focus == home_view::HomeFocus::Controllers {
                     // The restored dock is a vertical list: Up/Down (and the
                     // keyboard arrows) move the controller selection.
-                    if self.home_state.move_y(delta) {
-                        self.play_ui_cue(UiSoundKind::Nav);
-                    }
+                    let outcome = self.home_state.move_y(delta);
+                    self.apply_move_outcome(outcome);
                 }
                 Task::none()
             }
             HomeMessage::SettingsToggle => {
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 if self.home_state.settings_open {
                     self.home_state.close_settings();
                 } else {
@@ -720,12 +719,15 @@ impl App {
             }
             HomeMessage::PowerOff => self.home_power_off_selected(),
             HomeMessage::AppsMenuOpen(index) => {
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 self.home_state.open_apps_menu(index);
                 Task::none()
             }
             HomeMessage::AppsMenuMove(delta) => {
-                self.home_state.apps_menu_move(delta);
+                let outcome = self.home_state.apps_menu_move(delta, NavAxis::Vertical);
+                self.apply_move_outcome(outcome);
                 Task::none()
             }
             HomeMessage::AppsMenuConfirm => self.apps_menu_confirm(),
@@ -789,7 +791,9 @@ impl App {
         let Some(index) = self.home_state.apps_menu else {
             return Task::none();
         };
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_action_outcome(ActionOutcome::Accepted {
+            cue: NavCue::Action,
+        });
         match action {
             home_view::AppAction::Install | home_view::AppAction::Update => {
                 self.home_state.close_apps_menu();
@@ -908,7 +912,9 @@ impl App {
             self.home_state.close_settings_menu();
             return Task::none();
         };
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_action_outcome(ActionOutcome::Accepted {
+            cue: NavCue::Action,
+        });
         self.home_state.close_settings_menu();
         match choice {
             home_view::HomeSettingChoice::AutoOpen(mode) => {
@@ -1032,7 +1038,9 @@ impl App {
         let serial = row.serial.clone();
         if self.identify(&serial) {
             self.home_state.begin_identify_flash(&serial);
-            self.play_ui_cue(crate::platform::ui_sound::UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
         }
         Task::none()
     }
@@ -1080,10 +1088,7 @@ impl App {
         let tap = tap_actions
             .iter()
             .find_map(|action| home_tap_message(&self.home_state, action));
-        if let Some(message) = self
-            .home_state
-            .pad_tick(&reading.sample, Instant::now(), tap)
-        {
+        if let Some(message) = self.home_state.pad_tick(reading, Instant::now(), tap) {
             let face_held = reading.sample.cross
                 || reading.sample.circle
                 || reading.sample.square

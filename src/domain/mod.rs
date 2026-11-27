@@ -5,5 +5,6 @@
 
 pub mod color;
 pub mod gesture;
+pub mod navigation;
 pub mod pad;
 pub mod protocol;
