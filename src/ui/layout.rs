@@ -290,10 +290,10 @@ pub fn set_shell_level<Message: Send + 'static>(id: window::Id, topmost: bool) -
 /// Show the warm shell offscreen so the first frame with the new entrance
 /// pose is painted before it appears on the monitor. Showing a hidden HWND
 /// directly presents the previous surface (the stale full-size view).
-pub fn show_shell_offscreen<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+pub fn show_shell_offscreen(id: window::Id) -> Task<()> {
     #[cfg(windows)]
     {
-        window::run(id, |window| {
+        window::run(id, move |window| {
             use window::raw_window_handle::RawWindowHandle;
 
             let Ok(handle) = window.window_handle() else {
@@ -307,8 +307,11 @@ pub fn show_shell_offscreen<Message: Send + 'static>(id: window::Id) -> Task<Mes
             // SW_SHOWNOACTIVATE keeps the offscreen prime from taking focus.
             host::show_window(hwnd);
             host::invalidate_hwnd(hwnd);
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: shell prime offscreen id={id:?} offscreen={}",
+                host::window_is_offscreen(hwnd)
+            ));
         })
-        .discard()
     }
     #[cfg(not(windows))]
     {
@@ -348,6 +351,10 @@ pub fn show_shell_at_cover<Message: Send + 'static>(
                 );
             }
             host::invalidate_hwnd(hwnd);
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: shell present cover id={id:?} offscreen={}",
+                host::window_is_offscreen(hwnd)
+            ));
         })
         .discard()
     }

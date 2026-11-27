@@ -238,8 +238,9 @@ pub enum Message {
     ShellPresent(window::Id),
     /// Offscreen prime ran; arm the first-redraw reveal gate.
     ShellRevealArmed(window::Id),
-    /// Window event used by the reveal gate (first `RedrawRequested`).
-    ShellWindowEvent(window::Id, iced::window::Event),
+    /// First shell redraw after the offscreen prime (`listen_raw`; the
+    /// filtered window-event listener intentionally drops RedrawRequested).
+    ShellRedraw(window::Id),
     /// Safety net: re-present/re-focus the shell if the first present was lost.
     ShellFocusFallback(window::Id),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
@@ -414,7 +415,7 @@ impl Message {
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
             | Message::ShellRevealArmed(_)
-            | Message::ShellWindowEvent(_, _)
+            | Message::ShellRedraw(_)
             | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
@@ -562,7 +563,7 @@ impl Message {
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
             | Message::ShellRevealArmed(_)
-            | Message::ShellWindowEvent(_, _)
+            | Message::ShellRedraw(_)
             | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
@@ -1694,8 +1695,16 @@ impl App {
         // Only while the offscreen prime is armed: one redraw is all the
         // reveal gate needs, so this never stays subscribed.
         if self.shell_reveal_armed && !self.shell_presented {
-            subscriptions
-                .push(window::events().map(|(id, event)| Message::ShellWindowEvent(id, event)));
+            // `window::events` uses the filtered listener, which deliberately
+            // drops RedrawRequested. The raw listener is the only way to know
+            // the primed frame painted.
+            subscriptions.push(iced::event::listen_raw(|event, _status, id| {
+                matches!(
+                    event,
+                    iced::Event::Window(iced::window::Event::RedrawRequested(_))
+                )
+                .then_some(Message::ShellRedraw(id))
+            }));
         }
 
         if self.toast_message.is_some() && !self.toast_machine.is_resting() {
@@ -2066,25 +2075,23 @@ impl App {
                 Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
                 None => start,
             };
-            // Shared shell transition: the Launcher is full-bleed, so its
-            // fade is a black veil driven by the same panel alpha Home and
-            // Browser use (reduced motion still fades; movement is gated).
+            // Shared shell transition: the Launcher is full-bleed. Never
+            // scale or resize its view; only fade a black veil using the same
+            // panel alpha Home and Browser animate.
             let start: Element<'_, Message> = if let Some(anim) = self.launcher_shell_anim {
                 let now = Instant::now();
                 let reduced =
                     crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
                 let frame = anim.frame(now, reduced);
-                let card = crate::ui::scale::Scale::new(start, frame.panel.scale)
-                    .offset(iced::Vector::new(0.0, frame.panel.offset_y));
                 let veil = 1.0 - frame.panel.alpha.clamp(0.0, 1.0);
                 if veil > 0.001 {
                     let scrim = container(space())
                         .width(Fill)
                         .height(Fill)
                         .style(crate::ui::theme::scrim(veil));
-                    stack![card, scrim].width(Fill).height(Fill).into()
+                    stack![start, scrim].width(Fill).height(Fill).into()
                 } else {
-                    card.into()
+                    start
                 }
             } else {
                 start
@@ -2309,9 +2316,9 @@ impl App {
             }
             Message::WindowShowNow(id) => self.on_shell_show_now(id),
             Message::ShellOpened(id) => self.on_shell_opened(id),
-            Message::ShellPresent(id) => self.on_shell_present(id),
+            Message::ShellPresent(id) => self.on_shell_present(id, "fallback"),
             Message::ShellRevealArmed(id) => self.on_shell_reveal_armed(id),
-            Message::ShellWindowEvent(id, event) => self.on_shell_window_event(id, event),
+            Message::ShellRedraw(id) => self.on_shell_redraw(id),
             Message::ShellFocusFallback(id) => self.on_shell_focus_fallback(id),
             Message::ShellFadeTick => {
                 let now = Instant::now();

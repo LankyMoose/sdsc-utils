@@ -421,9 +421,9 @@ impl App {
 
     pub(crate) fn open_browser_session(&mut self) -> Task<Message> {
         self.note_launcher_activity();
-        self.apply_action_outcome(ActionOutcome::Accepted {
-            cue: NavCue::Action,
-        });
+        // Screen commits own their one cue (Home tile / PS session path);
+        // the session setup itself stays silent so Home -> Browser cannot
+        // double-sound.
         let _ = self.home_apps.open(crate::app::home::AppId::Browser);
         self.browser.panel.session.open_surface();
         // The card's 16:9 page area drives the engine viewport; sync before
@@ -443,7 +443,7 @@ impl App {
                 crate::controller::hid::diag::diag_info("ui-diag: browser session open (restore)");
                 return task;
             }
-            let task = self.on_browser_go_default();
+            let task = self.on_browser_go_default_silent();
             self.resume_browser_engine();
             crate::controller::hid::diag::diag_info("ui-diag: browser session open (default page)");
             return task;
@@ -1354,20 +1354,21 @@ impl App {
         saved: crate::browser::tabs::SavedTabs,
     ) -> Task<Message> {
         crate::platform::trace::manifest("browser_tabs", &saved);
+        // Screen-open owns the one commit cue; restoring the strip/default
+        // page must not add a second Nav sound to a single Cross/PS press.
         if self.crash_restart_boot {
             crate::platform::app_log::info(
                 "crash-restart: safe page restore (default page, saved page skipped)",
             );
-            return self.on_browser_go_default();
+            return self.on_browser_go_default_silent();
         }
         let restored = self.browser.panel.restore_saved_strip(&saved);
         if !restored {
-            return self.on_browser_go_default();
+            return self.on_browser_go_default_silent();
         }
         self.browser.panel.page.session.open_surface();
         self.save_page();
         self.note_launcher_activity();
-        self.apply_nav_cue(NavCue::Nav);
         if self.browser.engine.is_some() {
             // The engine already preloaded the saved active URL at boot; the
             // session is aligned with it, so no duplicate navigate is needed.
@@ -1886,6 +1887,15 @@ impl App {
             }
             "screen.ps" => self.ps_screen_toggle(),
             "screen.home" => self.return_to_home_screen(),
+            "home.move_x" => {
+                let delta = step
+                    .params
+                    .get("delta")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0) as i32;
+                self.on_home_message(crate::ui::home::HomeMessage::MoveX(delta))
+            }
+            "home.activate" => self.on_home_message(crate::ui::home::HomeMessage::Confirm),
             "manual_add" => {
                 let open = if self.launcher_visible {
                     Task::none()

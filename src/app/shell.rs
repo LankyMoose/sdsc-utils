@@ -59,17 +59,16 @@ impl App {
         if mode == ShellScreen::Browser {
             self.sync_browser_viewport();
         }
-        if crate::platform::debug_quiet::enabled() {
-            return enter.chain(self.on_shell_present(id));
-        }
         // Prime an offscreen frame with the entrance pose, then move the warm
-        // surface onscreen. A fixed delay could present the stale full-size
-        // frame when the first paint is slow: arm on the completed offscreen
-        // show and wait for that window's first redraw event. The timer is
-        // only a lost-event fallback.
+        // surface onscreen. The arming message is produced only after the
+        // window action returns, so it cannot arm before the prime exists.
+        // A redraw already queued from the old surface is ignored; arming
+        // invalidates again so the gate sees a frame drawn after the prime.
+        // The timer is only a lost-event fallback. Quiet QA runs the same
+        // gate (its present step stays offscreen), so automation exercises
+        // the real PS reveal path.
         enter
-            .chain(layout::show_shell_offscreen(id))
-            .chain(Task::done(Message::ShellRevealArmed(id)))
+            .chain(layout::show_shell_offscreen(id).map(move |_| Message::ShellRevealArmed(id)))
             .chain(Task::perform(
                 super::delay(std::time::Duration::from_millis(250)),
                 move |_| Message::ShellPresent(id),
@@ -91,7 +90,7 @@ impl App {
             return Task::none();
         }
         if !self.shell_presented {
-            return self.on_shell_present(id);
+            return self.on_shell_present(id, "focus-fallback");
         }
         let cover =
             crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
@@ -108,30 +107,34 @@ impl App {
     /// The offscreen prime ran; wait for that window's first redraw before
     /// moving it onscreen.
     pub(crate) fn on_shell_reveal_armed(&mut self, id: window::Id) -> Task<Message> {
-        if self.shell_window == Some(id) && !self.shell_hidden && !self.shell_presented {
-            self.shell_reveal_armed = true;
+        if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
+            return Task::none();
         }
-        Task::none()
+        self.shell_reveal_armed = true;
+        // Restart the entrance at the arm point. Preparing the offscreen
+        // prime (and any CEF/session work) can take 100ms+, so an entrance
+        // clock started in `on_shell_show_now` would already be near the
+        // resting pose. The gate then waits for this fresh t=0 redraw.
+        self.shell_reveal_started = Some(std::time::Instant::now());
+        crate::controller::hid::diag::diag_info("ui-diag: shell reveal armed");
+        self.start_shell_enter(self.shell_mode)
     }
 
     /// First redraw of the primed shell: the entrance pose has painted (the
     /// event is broadcast after draw/present), so it is safe to reveal.
-    pub(crate) fn on_shell_window_event(
-        &mut self,
-        id: window::Id,
-        event: iced::window::Event,
-    ) -> Task<Message> {
-        if self.shell_reveal_armed
-            && self.shell_window == Some(id)
-            && matches!(event, iced::window::Event::RedrawRequested(_))
-        {
-            return self.on_shell_present(id);
+    pub(crate) fn on_shell_redraw(&mut self, id: window::Id) -> Task<Message> {
+        if self.shell_reveal_armed && self.shell_window == Some(id) {
+            return self.on_shell_present(id, "redraw");
         }
         Task::none()
     }
 
     /// Present the shell on the monitor after the offscreen entrance frame.
-    pub(crate) fn on_shell_present(&mut self, id: window::Id) -> Task<Message> {
+    pub(crate) fn on_shell_present(
+        &mut self,
+        id: window::Id,
+        source: &'static str,
+    ) -> Task<Message> {
         if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
             return Task::none();
         }
@@ -157,9 +160,22 @@ impl App {
             })
             .unwrap_or(0);
         self.shell_reveal_started = None;
+        // Launcher never applies scale/offset (fade only); report the pose
+        // actually rendered so a resize shows up as scale != 1.
+        let applied_scale = if mode == ShellScreen::Launcher {
+            1.0
+        } else {
+            panel.scale
+        };
+        let applied_y = if mode == ShellScreen::Launcher {
+            0.0
+        } else {
+            panel.offset_y
+        };
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: shell first present mode={mode:?} elapsed_ms={elapsed_ms} scale={:.3} alpha={:.3}",
-            panel.scale, panel.alpha
+            "ui-diag: shell first present mode={mode:?} source={source} elapsed_ms={elapsed_ms} scale={applied_scale:.3} offset_y={applied_y:.1} alpha={:.3} veil={:.3}",
+            panel.alpha,
+            1.0 - panel.alpha
         ));
         let level = self.shell_level_task(mode);
         let toast = self.shell_toast_task(mode);

@@ -31,7 +31,15 @@ impl App {
     /// Sound + optional pad haptic for a UI cue.
     pub(crate) fn play_ui_cue(&self, kind: UiSoundKind) {
         #[cfg(debug_assertions)]
-        UI_CUE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let total = UI_CUE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        #[cfg(debug_assertions)]
+        if matches!(kind, UiSoundKind::Action) {
+            // Action commits are rare; two lines from one press prove a
+            // double cue (Home -> Browser regression).
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: ui cue kind=Action total={total}"
+            ));
+        }
         self.play_ui_sound(kind);
         self.play_ui_haptic(kind);
     }

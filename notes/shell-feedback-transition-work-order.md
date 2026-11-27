@@ -96,6 +96,8 @@ reveal first frame.
    proven by a counter/trace, not a fixed delay.
 6. **No new global timers/subscriptions.** Use the existing shell frame demand
    and pull-model helpers.
+7. **The Launcher view never scales or resizes during a shell transition.**
+   Fade only (black veil driven by the shared panel alpha).
 
 ## 4. Work items
 
@@ -227,7 +229,19 @@ reveal first frame.
 - **REV-1:** `show_shell_offscreen` is followed by `ShellRevealArmed`; the
   first `RedrawRequested` for the shell calls `on_shell_present` (250 ms timer
   only as a lost-event fallback). Trace:
-  `ui-diag: shell first present mode=… elapsed_ms=… scale=… alpha=…`.
+  `ui-diag: shell first present mode=… source=… elapsed_ms=… scale=… alpha=…`.
+  Pre-fix evidence from the quiet QA run: `source=fallback elapsed_ms=269
+  alpha=1.000` (final pose); quiet runs also skipped the prime entirely
+  (`source=quiet`). Root cause: `window::events()` uses the filtered listener,
+  which drops `RedrawRequested`. The gate now uses
+  `iced::event::listen_raw` and restarts the entrance clock at arm; post-fix
+  traces read `source=redraw elapsed_ms=6–16 alpha=0.06–0.16`, and the
+  Launcher reports `scale=1.000` (fade only).
+
+- **Feedback:** Home → Browser played two sounds because
+  `open_browser_session` cued `Action` and the strip restore/default page
+  cued `Nav`. The session/restore path is now silent; one `Action` belongs to
+  the Home tile. Debug Action cues log `ui-diag: ui cue kind=Action total=N`.
 
 ## 5. Acceptance
 
