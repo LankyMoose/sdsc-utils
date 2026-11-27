@@ -28,6 +28,7 @@
 | Launcher Settings OSK proof QA | `python scripts/qa_launcher_osk.py` |
 | Browser pixel QA (render smoke test) | `python scripts/qa_browser_visual.py` |
 | Browser tabs-view QA (plus card, paging, star, bookmarks) | `python scripts/qa_browser_grid.py` |
+| Browser tabs paging QA (12th-tab gutters, L1/R1 pills) | `python scripts/qa_browser_grid_pages.py` |
 
 ## Project structure
 

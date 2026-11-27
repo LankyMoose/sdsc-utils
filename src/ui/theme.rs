@@ -43,6 +43,8 @@ pub const DIM: Color = rgb(128, 136, 148);
 pub const ACCENT: Color = rgb(0x41, 0x41, 0xFB);
 pub const DANGER: Color = rgb(0xBE, 0x00, 0x00);
 pub const WARNING: Color = rgb(0xFF, 0x64, 0x00);
+/// Bookmark/star gold, distinct from warning orange.
+pub const GOLD: Color = rgb(0xF2, 0xC1, 0x4E);
 pub const SUCCESS: Color = rgb(0x35, 0xA0, 0x6B);
 
 /// Legacy hairline-era corner radius (pre-1.7.0 chrome). Prefer [`radius`].

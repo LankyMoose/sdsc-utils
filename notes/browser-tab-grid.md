@@ -37,8 +37,14 @@ bookmark UI, or Browser screen/back behavior.
   pressed during the FLIP is buffered, so the first post-transition move is
   never swallowed.
 - A footer hint island (Launcher glass style, full **pill** radius) shows
-  Open/Close/Bookmark/Back and Page hints; each card has an overlaid bottom
-  title footer with ellipsis.
+  Open/Close/Bookmark/Back; each card has an overlaid bottom title footer with
+  ellipsis. Paging uses one L1/R1 chevron pill per side gutter, only when the
+  strip has more than one page. The side gutters are not reserved at one page:
+  `GridState::layout_side` tweens 0↔1 as the page count crosses one, widening
+  every card (all four columns) while the pills fade in with the gutter.
+- L1/R1 paging is a clipped carousel: the outgoing page slides out one side
+  while the incoming page slides in from the other (`PageSlide`, draw-time
+  clock). Card geometry is identical on both pages, so nothing reflows.
 - **One cue per action.** Opening/closing the tabs view, paging, moving focus,
   bookmarking, and selecting a card each emit exactly one `play_ui_cue` (sound
   and haptics). The plus card/new-tab path and bookmark navigation already cue
@@ -69,8 +75,8 @@ bookmark UI, or Browser screen/back behavior.
   (`StoredTab.loaded == false`) until first activation; their cards show a
   title/URL placeholder.
 - Bookmarks are `bookmarks.json` entries matched by exact URL. The top-right
-  star is filled/warning when the tab's current URL is bookmarked, outline
-  otherwise. Triangle on a focused bookmark removes it. Opening a bookmark
+  star is filled gold (`theme::GOLD`) when the tab's current URL is
+  bookmarked, outline (`theme::MUTED`) otherwise. Triangle on a focused bookmark removes it. Opening a bookmark
   creates a new active tab for its URL (it never replaces the current page).
 - Reduced motion snaps between page and grid; the normal path uses the
   `GridTicker` wrapper to request display-rate redraws without a global timer.
@@ -89,9 +95,13 @@ would otherwise clobber the saved strip before restore.
 
 ```bash
 python scripts/qa_browser_grid.py
+python scripts/qa_browser_grid_pages.py
 ```
 
 Synthetic replay only (no OS input): local pages, `grid.open`, screenshot the
 grid geometry, `grid.bookmark`, `grid.new_tab`, `grid.activate`, and
 page/grid screenshots. `ReplayWait::needs_grid_idle` keeps step boundaries
-after the FLIP lands.
+after the FLIP lands. The paging script seeds 12 tabs (`tab.new`, debug-only
+replay action), checks the two-page gutters and L1/R1 enabled states, walks
+L1/R1, then closes back to one page and re-adds a tab to exercise both
+gutter/card-width tweens.

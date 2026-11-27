@@ -417,7 +417,8 @@ impl BrowserPanel {
         self.stored.len() != before_stored || self.order.len() != before_order
     }
 
-    /// Freeze the tab-grid visual order for a new session (active first).
+    /// Freeze the tab-grid visual order for a new session (stable creation
+    /// order; the active tab only sets focus/page).
     pub fn refresh_grid_visual(&mut self) {
         self.grid
             .refresh_visual(self.active_tab, &self.order.clone());
@@ -440,10 +441,8 @@ impl BrowserPanel {
                 self.grid.visual.push(id);
             }
         }
-        if self.tab_page(self.active_tab).is_some() && !self.grid.visual.contains(&self.active_tab)
-        {
-            self.grid.visual.insert(0, self.active_tab);
-        }
+        self.grid
+            .animate_layout_for_visual(std::time::Instant::now());
     }
 
     /// Restore every persisted tab: the saved active page becomes the live

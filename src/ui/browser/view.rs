@@ -60,6 +60,10 @@ pub enum BrowserMessage {
     GridOpenBookmark(usize),
     /// Grid transition finished (generation-guarded).
     GridAnimDone(u64),
+    /// One frame of the side-gutter/card-width tween.
+    GridLayoutFrame,
+    /// Page-change slide finished (generation-guarded).
+    GridPageAnimDone(u64),
     /// Track the bookmark strip offset for focus chasing.
     BookmarksScrolled(f32),
     /// Page chevrons / L1/R1 in tabs view.
@@ -86,7 +90,11 @@ impl BrowserMessage {
             | Self::PageRelease
             | Self::PagePointerLeft
             | Self::PageWheel { .. } => None,
-            Self::Scrolled(_) | Self::GridAnimDone(_) | Self::BookmarksScrolled(_) => None,
+            Self::Scrolled(_)
+            | Self::GridAnimDone(_)
+            | Self::GridLayoutFrame
+            | Self::GridPageAnimDone(_)
+            | Self::BookmarksScrolled(_) => None,
             Self::GridPagePrev => Some("browser.grid.page_prev"),
             Self::GridPageNext => Some("browser.grid.page_next"),
             Self::ToggleGrid => Some("browser.grid.toggle"),

@@ -130,7 +130,9 @@ def browser_rects(width: int, height: int) -> tuple[tuple[int, int, int, int], t
     return page, tabs
 
 
-def grid_card_rects(width: int, height: int) -> list[tuple[int, int, int, int]]:
+def grid_card_rects(
+    width: int, height: int, side: float = 0.0
+) -> list[tuple[int, int, int, int]]:
     page, tabs = browser_rects(width, height)
     tx, ty, tw, th = tabs
     px, py, pw, ph = page
@@ -139,7 +141,6 @@ def grid_card_rects(width: int, height: int) -> list[tuple[int, int, int, int]]:
     island_h = 44.0
     island_gap = 10.0
     bookmark_h = 88.0
-    side = 38.0
     cols = 4
     rows = 3
     inner_w = tw - 2 * pad
@@ -241,7 +242,7 @@ def main() -> int:
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
-        {"app": "browser", "action": "grid.activate", "params": {"index": 1}},
+        {"app": "browser", "action": "grid.activate", "params": {"index": 0}},
         {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
@@ -343,7 +344,7 @@ def main() -> int:
         red = (192, 57, 43)
         blue = (31, 95, 191)
         cream = (245, 240, 230)
-        warning = (255, 100, 0)
+        gold = (242, 193, 78)
 
         page_a_colors = central_band_colors(images[0][2], width, height, browser_rects(width, height)[0])
         grid_colors = central_band_colors(images[1][2], width, height, cards[1])
@@ -371,10 +372,10 @@ def main() -> int:
             ("page A band", has_color(page_a_colors, red)),
             ("page A cream", has_color(page_a_colors, cream)),
             ("grid active card content", has_color(grid_colors, red) or has_color(grid_colors, cream)),
-            ("bookmark star filled", has_color(star_colors, warning, 42, 1)),
+            ("bookmark star filled", has_color(star_colors, gold, 42, 1)),
             ("page B band", has_color(page_b_colors, blue)),
-            ("two-card grid first tab", has_color(two_grid, blue)),
-            ("two-card grid second tab", has_color(two_grid_second, red)),
+            ("two-card grid first tab", has_color(two_grid, red)),
+            ("two-card grid second tab", has_color(two_grid_second, blue)),
             ("switched page A band", has_color(page_a_again, red)),
             ("closing active tab activates the neighbour", has_color(closed_active, blue)),
             ("PS resume restored the grid", has_color(resumed_grid, blue) or has_color(resumed_grid, cream)),
