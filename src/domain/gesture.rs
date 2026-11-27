@@ -138,6 +138,10 @@ pub enum ChordReleaseTick {
 pub struct ChordReleaseGate {
     latched: bool,
     absent_since: Option<Instant>,
+    /// Last sample fed to the gate. A held sample arriving after a long
+    /// sample gap means the release happened while the edge stream was quiet
+    /// (resting neutrals are dropped), so it is a fresh press.
+    last_tick_at: Option<Instant>,
 }
 
 impl ChordReleaseGate {
@@ -149,12 +153,17 @@ impl ChordReleaseGate {
     pub fn arm(&mut self) {
         self.latched = true;
         self.absent_since = None;
+        // Start the sample-gap clock at the arm itself. If the edge stream
+        // stays quiet (resting neutrals are dropped), the next held sample is
+        // already older than the debounce and must count as a fresh press.
+        self.last_tick_at = Some(Instant::now());
     }
 
     /// Clear without waiting.
     pub fn clear(&mut self) {
         self.latched = false;
         self.absent_since = None;
+        self.last_tick_at = None;
     }
 
     /// Feed whether the required chord is held on any pad this sample.
@@ -168,8 +177,14 @@ impl ChordReleaseGate {
     /// chord returns after a short absence that did not clear the latch.
     pub fn tick(&mut self, chord_held: bool, now: Instant) -> (ChordReleaseTick, bool) {
         if !self.latched {
+            self.last_tick_at = Some(now);
             return (ChordReleaseTick::Open, false);
         }
+        let gap = self
+            .last_tick_at
+            .map(|last| now.saturating_duration_since(last))
+            .unwrap_or_default();
+        self.last_tick_at = Some(now);
         if chord_held {
             if let Some(since) = self.absent_since {
                 self.absent_since = None;
@@ -182,6 +197,13 @@ impl ChordReleaseGate {
                 }
                 // Short bounce: still the same physical press.
                 return (ChordReleaseTick::Blocked, true);
+            }
+            if gap >= CHORD_RELEASE_DEBOUNCE {
+                // No samples at all through the release (resting edges are
+                // dropped): the next held sample is a new press, not the same
+                // sticky hold. Without this the latch can stick forever.
+                self.latched = false;
+                return (ChordReleaseTick::Cleared, false);
             }
             return (ChordReleaseTick::Blocked, false);
         }
@@ -273,6 +295,33 @@ mod tests {
             assert!(!glitch);
         }
         assert!(gate.is_latched());
+    }
+
+    #[test]
+    fn release_gate_first_sample_after_quiet_arm_is_fresh() {
+        // The close press arms the gate; the pad then rests (no neutral edge)
+        // until the next PS press. That first held sample is a new press and
+        // must not be swallowed as the sticky open hold.
+        let mut gate = ChordReleaseGate::default();
+        gate.arm();
+        let (tick, glitch) = gate.tick(true, Instant::now() + Duration::from_secs(2));
+        assert_eq!(tick, ChordReleaseTick::Cleared);
+        assert!(!glitch);
+        assert!(!gate.is_latched());
+    }
+
+    #[test]
+    fn release_gate_no_samples_after_arm_then_press_is_fresh() {
+        let mut gate = ChordReleaseGate::default();
+        let t0 = Instant::now();
+        gate.arm();
+        assert_eq!(gate.tick(true, t0).0, ChordReleaseTick::Blocked);
+        // The release generated no edge at all (resting neutral dropped), and
+        // the next sample is the next physical press seconds later.
+        let (tick, glitch) = gate.tick(true, t0 + Duration::from_secs(5));
+        assert_eq!(tick, ChordReleaseTick::Cleared);
+        assert!(!glitch);
+        assert!(!gate.is_latched());
     }
 
     #[test]
