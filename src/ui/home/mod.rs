@@ -486,6 +486,8 @@ pub struct State {
     pub apps_menu_focus: usize,
     /// Info popup: app index.
     pub apps_info: Option<usize>,
+    /// Pad-driven offset into the Info changelog, clamped to its end.
+    info_scroll_y: f32,
     /// Engine install/download/update in flight.
     pub installing: bool,
     /// Cancellation requested; progress stays frozen until the worker exits.
@@ -556,6 +558,7 @@ impl Default for State {
             apps_menu: None,
             apps_menu_focus: 0,
             apps_info: None,
+            info_scroll_y: 0.0,
             installing: false,
             cancelling: false,
             uninstalling: false,
@@ -595,13 +598,14 @@ impl State {
         TILES[self.selected()]
     }
 
-    /// Move the app highlight, wrapping. Returns true when it moved.
+    /// Move the app highlight. Clamps at the row edges. Returns true when it
+    /// moved; the edge rejection is silent.
     pub fn move_selection(&mut self, delta: i32) -> bool {
         if delta == 0 {
             return false;
         }
         let len = TILES.len() as i32;
-        let next = (self.selected() as i32 + delta).rem_euclid(len);
+        let next = (self.selected() as i32 + delta).clamp(0, len - 1);
         if next as usize == self.selected() {
             return false;
         }
@@ -630,7 +634,7 @@ impl State {
             return false;
         }
         let len = self.controllers.len() as i32;
-        let next = (self.controller_focus as i32 + delta).rem_euclid(len);
+        let next = (self.controller_focus as i32 + delta).clamp(0, len - 1);
         if next as usize == self.controller_focus {
             return false;
         }
@@ -913,6 +917,7 @@ impl State {
         self.reset_triangle_hold();
         self.apps_menu = None;
         self.apps_info = None;
+        self.info_scroll_y = 0.0;
         self.settings_open = false;
         self.settings_focus = 0;
         self.settings_menu = None;
@@ -943,6 +948,7 @@ impl State {
         self.settings_menu = None;
         self.apps_menu = None;
         self.apps_info = None;
+        self.info_scroll_y = 0.0;
         self.install_error = None;
         // Settings owns the screen; a Triangle hold started on the dock must
         // not complete behind it.
@@ -1001,7 +1007,7 @@ impl State {
             .iter()
             .position(|row| *row == self.settings_focus)
             .unwrap_or(0) as i32;
-        let next = (current + delta).rem_euclid(rows.len() as i32) as usize;
+        let next = (current + delta).clamp(0, rows.len() as i32 - 1) as usize;
         if rows[next] == self.settings_focus {
             return false;
         }
@@ -1058,7 +1064,8 @@ impl State {
         self.settings_menu = None;
     }
 
-    /// Move the expanded dropdown highlight, wrapping. Returns true when it moved.
+    /// Move the expanded dropdown highlight. Clamps at the ends. Returns true
+    /// when it moved.
     pub fn settings_menu_move(&mut self, delta: i32) -> bool {
         if delta == 0 {
             return false;
@@ -1070,7 +1077,7 @@ impl State {
         if count == 0 {
             return false;
         }
-        let next = (highlight as i32 + delta).rem_euclid(count as i32) as usize;
+        let next = (highlight as i32 + delta).clamp(0, count as i32 - 1) as usize;
         if next == highlight {
             return false;
         }
@@ -1148,6 +1155,7 @@ impl State {
         self.apps_menu = Some(index);
         self.apps_menu_focus = 0;
         self.apps_info = None;
+        self.info_scroll_y = 0.0;
     }
 
     pub fn close_apps_menu(&mut self) {
@@ -1189,12 +1197,57 @@ impl State {
         self.apps_menu_actions().get(self.apps_menu_focus).copied()
     }
 
-    pub fn apps_menu_move(&mut self, delta: i32) {
+    /// Move the focused app action. Clamps at the ends. Returns true when it
+    /// moved; empty menus and edge rejection stay silent.
+    pub fn apps_menu_move(&mut self, delta: i32) -> bool {
         let len = self.apps_menu_actions().len() as i32;
         if delta == 0 || len == 0 {
-            return;
+            return false;
         }
-        self.apps_menu_focus = (self.apps_menu_focus as i32 + delta).rem_euclid(len) as usize;
+        let next = (self.apps_menu_focus as i32 + delta).clamp(0, len - 1) as usize;
+        if next == self.apps_menu_focus {
+            return false;
+        }
+        self.apps_menu_focus = next;
+        true
+    }
+
+    /// Estimated pixel height of the Info changelog wrapped into the fixed
+    /// 170px scroll well at caption size. Close enough to the real line count
+    /// that pad scrolling stops at the content end instead of cueing into a
+    /// void.
+    fn info_scroll_max(&self) -> f32 {
+        const VIEW_HEIGHT: f32 = 170.0;
+        const LINE_HEIGHT: f32 = 14.0;
+        const LINE_CHARS: f32 = 66.0;
+        let Some(text) = self.engine_changelog.as_deref() else {
+            return 0.0;
+        };
+        let lines: usize = text
+            .lines()
+            .map(|line| {
+                let chars = line.chars().count() as f32;
+                (chars / LINE_CHARS).ceil().max(1.0) as usize
+            })
+            .sum();
+        (lines as f32 * LINE_HEIGHT - VIEW_HEIGHT).max(0.0)
+    }
+
+    /// Step the Info changelog by `delta` pixels. Returns the new absolute
+    /// offset only when it actually moved; a missing/empty changelog and both
+    /// ends stay silent.
+    pub fn scroll_info(&mut self, delta: f32) -> Option<f32> {
+        if self.apps_info.is_none() || delta == 0.0 {
+            return None;
+        }
+        let max = self.info_scroll_max();
+        let next = (self.info_scroll_y + delta).clamp(0.0, max);
+        if (next - self.info_scroll_y).abs() < 0.5 {
+            self.info_scroll_y = next;
+            return None;
+        }
+        self.info_scroll_y = next;
+        Some(next)
     }
 
     pub fn show_app_info(&mut self, index: usize) {
@@ -1202,11 +1255,13 @@ impl State {
             return;
         }
         self.apps_info = Some(index);
+        self.info_scroll_y = 0.0;
         self.apps_menu = None;
     }
 
     pub fn close_app_info(&mut self) {
         self.apps_info = None;
+        self.info_scroll_y = 0.0;
     }
 
     pub fn app_dimmed(&self, app: ManagedApp) -> bool {
@@ -2786,18 +2841,22 @@ mod tests {
     }
 
     #[test]
-    fn selection_wraps_both_ways() {
+    fn selection_clamps_at_edges() {
         let mut state = State::default();
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
-        assert!(state.move_x(1));
-        assert_eq!(state.selected_tile(), HomeTile::Browser);
-        assert!(state.move_x(1));
+        // Left at the first tile is rejected, not wrapped.
+        assert!(!state.move_x(-1));
         assert_eq!(state.selected_tile(), HomeTile::Launcher);
-        assert!(state.move_x(-1));
+        assert!(state.move_x(1));
         assert_eq!(state.selected_tile(), HomeTile::Browser);
+        // Right at the last tile is rejected, not wrapped.
+        assert!(!state.move_x(1));
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
+        assert!(state.move_x(-1));
+        assert_eq!(state.selected_tile(), HomeTile::Launcher);
         // The apps row is horizontal: vertical input is inert.
         assert!(!state.move_y(1));
-        assert_eq!(state.selected_tile(), HomeTile::Browser);
+        assert_eq!(state.selected_tile(), HomeTile::Launcher);
     }
 
     #[test]
@@ -2867,11 +2926,18 @@ mod tests {
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("def")
         );
-        assert!(state.move_y(1));
+        // The dock clamps at the last row instead of wrapping to the first.
+        assert!(!state.move_y(1));
+        assert_eq!(
+            state.controller_selected().map(|r| r.serial.as_ref()),
+            Some("def")
+        );
+        assert!(state.move_y(-1));
         assert_eq!(
             state.controller_selected().map(|r| r.serial.as_ref()),
             Some("abc")
         );
+        assert!(!state.move_y(-1));
         assert!(state.collapse_dock(now));
         assert_eq!(state.focus, HomeFocus::Apps);
     }
@@ -2977,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_rows_cycle_and_report_values() {
+    fn settings_rows_move_and_report_values() {
         let mut state = State::default();
         state.set_settings(true, 70, false, 40, 5 * 1024, HomeAutoOpen::Bluetooth);
         assert_eq!(
@@ -2993,8 +3059,9 @@ mod tests {
         assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
         assert!(state.settings_move(-1));
         assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
-        assert!(state.settings_move(-1));
-        assert_eq!(state.settings_focus, SETTINGS_DOWNLOAD);
+        // Top row: up is rejected, not wrapped to the bottom.
+        assert!(!state.settings_move(-1));
+        assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
     }
 
     #[test]
@@ -3020,15 +3087,15 @@ mod tests {
         assert!(!state.settings_visible(SETTINGS_DOWNLOAD));
         assert!(state.settings_visible(SETTINGS_STRENGTH));
         state.settings_focus = SETTINGS_STRENGTH;
-        assert!(state.settings_move(1));
+        // Last visible row: down is rejected; the hidden cap row is never
+        // entered and movement does not wrap to the top.
+        assert!(!state.settings_move(1));
         assert_eq!(
-            state.settings_focus, SETTINGS_AUTO_OPEN,
-            "movement skips the hidden cap row and wraps"
+            state.settings_focus, SETTINGS_STRENGTH,
+            "movement clamps below the hidden cap row"
         );
-        assert!(state.settings_move(1));
-        assert_eq!(state.settings_focus, SETTINGS_SOUNDS);
         assert!(state.settings_move(-1));
-        assert_eq!(state.settings_focus, SETTINGS_AUTO_OPEN);
+        assert_eq!(state.settings_focus, SETTINGS_HAPTICS);
     }
 
     #[test]
@@ -3046,6 +3113,9 @@ mod tests {
             state.settings_menu_choice(),
             Some(HomeSettingChoice::AutoOpen(HomeAutoOpen::Any))
         );
+        // Last option: down is rejected, not wrapped to the first.
+        assert!(!state.settings_menu_move(1));
+        assert_eq!(state.settings_menu_highlight(), Some(2));
         state.close_settings_menu();
         assert!(!state.settings_menu_open());
 
@@ -3083,19 +3153,55 @@ mod tests {
     }
 
     #[test]
-    fn apps_menu_focus_wraps_over_actions() {
+    fn apps_menu_focus_clamps_over_actions() {
         let mut state = State {
             engine_ready: false,
             ..State::default()
         };
         state.open_apps_menu(0);
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
-        state.apps_menu_move(1);
-        assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
-        state.apps_menu_move(1);
+        // Top action: up is rejected, not wrapped.
+        assert!(!state.apps_menu_move(-1));
         assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
-        state.apps_menu_move(-1);
+        assert!(state.apps_menu_move(1));
         assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
+        // Bottom action: down is rejected, not wrapped.
+        assert!(!state.apps_menu_move(1));
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Info));
+        assert!(state.apps_menu_move(-1));
+        assert_eq!(state.apps_menu_action(), Some(AppAction::Install));
+        // A closed/empty menu reports no movement.
+        state.close_apps_menu();
+        assert!(!state.apps_menu_move(1));
+    }
+
+    #[test]
+    fn info_scroll_clamps_at_the_content_ends() {
+        let mut state = State::default();
+        state.open_apps_menu(0);
+        state.show_app_info(0);
+        state.engine_changelog = None;
+        assert_eq!(state.scroll_info(56.0), None);
+        assert_eq!(state.scroll_info(-56.0), None);
+        state.engine_changelog = Some("one short line".into());
+        assert_eq!(state.scroll_info(56.0), None);
+        state.engine_changelog = Some("changelog line\n".repeat(80));
+        assert_eq!(state.scroll_info(56.0), Some(56.0));
+        assert_eq!(state.scroll_info(-56.0), Some(0.0));
+        // Top of the changelog: up is silent.
+        assert_eq!(state.scroll_info(-56.0), None);
+        let mut steps = 0;
+        while state.scroll_info(56.0).is_some() {
+            steps += 1;
+            assert!(steps < 100, "info scroll never reaches the end");
+        }
+        let bottom = state.info_scroll_y;
+        assert!(bottom > 0.0);
+        // Bottom of the changelog: down is silent.
+        assert_eq!(state.scroll_info(56.0), None);
+        assert_eq!(state.info_scroll_y, bottom);
+        state.close_app_info();
+        assert_eq!(state.info_scroll_y, 0.0);
     }
 
     #[test]

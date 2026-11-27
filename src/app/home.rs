@@ -636,13 +636,14 @@ impl App {
                 }
                 if self.home_state.apps_info.is_some() {
                     // Info owns the screen; movement scrolls the changelog.
+                    let step = 56.0 * delta as f32;
+                    let Some(offset) = self.home_state.scroll_info(step) else {
+                        return Task::none();
+                    };
                     self.play_ui_cue(UiSoundKind::Nav);
-                    return iced::widget::operation::scroll_by(
+                    return iced::widget::operation::scroll_to(
                         home_view::info_scroll_id(),
-                        iced::widget::operation::AbsoluteOffset {
-                            x: 0.0,
-                            y: 56.0 * delta as f32,
-                        },
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
                     );
                 }
                 if self.home_state.settings_open {
@@ -650,8 +651,9 @@ impl App {
                     return self.home_settings_adjust(delta);
                 }
                 if self.home_state.apps_menu.is_some() {
-                    self.home_state.apps_menu_move(delta);
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    if self.home_state.apps_menu_move(delta) {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                    }
                     return Task::none();
                 }
                 // The controllers dock is a vertical surface: horizontal
@@ -669,13 +671,14 @@ impl App {
                     return Task::none();
                 }
                 if self.home_state.apps_info.is_some() {
+                    let step = 56.0 * delta as f32;
+                    let Some(offset) = self.home_state.scroll_info(step) else {
+                        return Task::none();
+                    };
                     self.play_ui_cue(UiSoundKind::Nav);
-                    return iced::widget::operation::scroll_by(
+                    return iced::widget::operation::scroll_to(
                         home_view::info_scroll_id(),
-                        iced::widget::operation::AbsoluteOffset {
-                            x: 0.0,
-                            y: 56.0 * delta as f32,
-                        },
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
                     );
                 }
                 if self.home_state.settings_open {
@@ -690,8 +693,9 @@ impl App {
                     return Task::none();
                 }
                 if self.home_state.apps_menu.is_some() {
-                    self.home_state.apps_menu_move(delta);
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    if self.home_state.apps_menu_move(delta) {
+                        self.play_ui_cue(UiSoundKind::Nav);
+                    }
                     return Task::none();
                 }
                 // The apps row is horizontal: Up/Down must not play feedback.
