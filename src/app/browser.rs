@@ -2211,7 +2211,8 @@ impl super::App {
         } else {
             GridFocus::Tab(page_tabs[next - 1].id)
         };
-        self.play_ui_cue(UiSoundKind::Nav);
+        // The pad path owns the cue (`on_browser_grid_pad`); keeping one here
+        // too made every D-pad focus move play sound/haptics twice.
         self.invalidate_browser_window()
     }
 
