@@ -232,6 +232,42 @@ impl NavDispatcher {
         )
     }
 
+    /// Full-profile tick for Launcher. Keeps the launcher's hold/replace/edit
+    /// flags and returns the same `PadTickResult` the bank produced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_full(
+        &mut self,
+        readings: &[NavReading],
+        now: Instant,
+        allow_nav_move: bool,
+        horizontal_nav: bool,
+        horizontal_games_nav: bool,
+        replace_confirm: bool,
+        editing: bool,
+        hold_cross_close: bool,
+        hold_triangle_power: bool,
+    ) -> PadTickResult {
+        self.bank.tick(
+            readings,
+            now,
+            allow_nav_move,
+            horizontal_nav,
+            horizontal_games_nav,
+            replace_confirm,
+            editing,
+            hold_cross_close,
+            hold_triangle_power,
+        )
+    }
+
+    pub fn hold_progress(&self, now: Instant) -> (f32, f32) {
+        self.bank.hold_progress(now)
+    }
+
+    pub fn has_hold_activity(&self) -> bool {
+        self.bank.has_hold_activity()
+    }
+
     /// Resolve a nav action against a surface. Only an accepted move carries a
     /// cue; the app has one `apply` helper for that outcome.
     pub fn dispatch_move<S: NavSurface>(

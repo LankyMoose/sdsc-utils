@@ -57,8 +57,7 @@ use crate::ui::configure::{
 use crate::ui::cursor_hide;
 use crate::ui::launcher::art_worker::ArtOwner;
 use crate::ui::launcher::input::{
-    self as launcher_input, CrossHold, FaceHeld, NavAction, NavBank, NavLogSnapshot, NavProfile,
-    NavStepper,
+    self as launcher_input, CrossHold, FaceHeld, NavAction, NavLogSnapshot, NavProfile, NavStepper,
 };
 use crate::ui::launcher::view::{self as launcher_view, LauncherMessage};
 use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
@@ -845,7 +844,7 @@ pub struct App {
     home_face_latch_until: Option<Instant>,
     /// When Launcher was last revealed (unfocus grace).
     launcher_revealed_at: Option<Instant>,
-    pad_nav: NavBank,
+    pad_nav: crate::domain::navigation::NavDispatcher,
     /// Source-action delivery gate (sequence dedupe + owner arming).
     pad_actions: PadActionGate,
     /// Source taps waiting for a pad frame to run through the surface handler.
@@ -1267,7 +1266,7 @@ impl App {
             ps_release: ChordReleaseDetector::default(),
             home_face_latch_until: None,
             launcher_revealed_at: None,
-            pad_nav: NavBank::default(),
+            pad_nav: crate::domain::navigation::NavDispatcher::new(),
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
             pending_browser_trace: None,

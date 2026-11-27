@@ -6,7 +6,7 @@
 //! messages. No app message is produced per pad sample.
 
 use super::{OskMessage, OskState, view};
-use crate::domain::pad::{NavAction, NavBank, NavReading, OskInputSlot, dpad_only};
+use crate::domain::pad::{NavAction, NavReading, OskInputSlot, dpad_only};
 use iced::advanced::Shell;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
@@ -41,7 +41,7 @@ pub struct OskSurface<'a> {
 pub struct SurfaceState {
     last_seq: u64,
     was_open: bool,
-    nav: NavBank,
+    nav: crate::domain::navigation::NavDispatcher,
     /// Last poll saw a non-neutral pad; keep polling even if the slot seq
     /// stalls so repeat cadence still fires from the widget clock.
     last_active: bool,
@@ -205,9 +205,7 @@ impl OskSurface<'_> {
             })
             .collect();
         let mut emitted = false;
-        let tick = state
-            .nav
-            .tick(&masked, now, true, true, false, false, false, false, false);
+        let tick = state.nav.tick(&masked, now, true, true);
         if let Some(action) = tick.action
             && let Some(pad) = tick.action_pad
             && matches!(

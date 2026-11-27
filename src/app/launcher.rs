@@ -16,6 +16,7 @@ use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
 use crate::browser::engine::{EngineCommand, EngineEvent};
 use crate::browser::keys::RawKey;
+use crate::domain::navigation::{ActionOutcome, NavCue};
 use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
 use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
@@ -104,27 +105,35 @@ impl App {
             LauncherMessage::Close => self.on_launcher_close(),
             LauncherMessage::Noop => Task::none(),
             LauncherMessage::DismissEditConfirm => {
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 self.launcher_state.dismiss_edit_confirm(Instant::now());
                 Task::none()
             }
             LauncherMessage::ToggleEdit => match self.toggle_launcher_edit() {
                 Some(task) => {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     task
                 }
                 None => Task::none(),
             },
             LauncherMessage::CycleSort => match self.on_start_cycle_sort() {
                 Some(task) => {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     task
                 }
                 None => Task::none(),
             },
             LauncherMessage::AddShortcut => {
                 if self.launcher_state.editing && !self.launcher_state.overlay_blocking() {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     self.pick_manual_shortcut()
                 } else {
                     Task::none()
@@ -134,7 +143,9 @@ impl App {
                 let before = self.launcher_state.manual_add.is_some();
                 let task = self.begin_manual_edit();
                 if !before && self.launcher_state.manual_add.is_some() {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                 }
                 task
             }
@@ -159,13 +170,17 @@ impl App {
                 Task::none()
             }
             LauncherMessage::ManualPickIcon => {
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 self.pick_manual_icon()
             }
             LauncherMessage::ManualClearIcon => {
                 if let Some(draft) = self.launcher_state.manual_add.as_mut() {
                     draft.icon_path = None;
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                 }
                 Task::none()
             }
@@ -173,7 +188,9 @@ impl App {
                 let now = Instant::now();
                 let open = !self.launcher_state.settings.open;
                 if self.launcher_state.request_settings(open, now) {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: launcher settings {}",
                         if open { "open" } else { "close" }
@@ -269,13 +286,17 @@ impl App {
         if self.launcher_state.editing {
             match self.edit_toggle_selected() {
                 Some(task) => {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     task
                 }
                 None => Task::none(),
             }
         } else if self.launch_selected() {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             // A freshly-armed replace confirm stays open on its modal: the
             // close preserves it now, so this guard only skips the close
             // while the modal owns the screen — the game already launched.
@@ -299,7 +320,7 @@ impl App {
             .begin_strip_anim(prev_game as f32, Instant::now());
         self.launcher_state.reset_backdrop_fade();
         let task = self.warm_launcher_art_task();
-        self.play_ui_cue(UiSoundKind::Nav);
+        self.apply_nav_cue(NavCue::Nav);
         task
     }
 
@@ -309,7 +330,7 @@ impl App {
         let direction = self.launcher_state.move_selection(delta);
         let mut task = Task::none();
         if direction.is_some() {
-            self.play_ui_cue(UiSoundKind::Nav);
+            self.apply_nav_cue(NavCue::Nav);
             if self.launcher_state.game_selected != prev_game {
                 self.launcher_state
                     .begin_strip_anim(prev_game as f32, Instant::now());
@@ -324,29 +345,39 @@ impl App {
     /// draft → replace confirm → save guard → edit mode → Launcher itself).
     pub(crate) fn on_launcher_close(&mut self) -> Task<Message> {
         if self.launcher_state.settings.open {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             let now = Instant::now();
             if self.launcher_state.request_settings(false, now) {
                 crate::controller::hid::diag::diag_info("ui-diag: launcher settings close");
             }
             Task::none()
         } else if self.launcher_state.manual_add.is_some() {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             self.cancel_manual_add()
         } else if self.launcher_state.replace_confirm.is_some() {
             // Cancel unwinds through the exit tween (content clears when it
             // settles); reduced motion clears instantly.
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             self.launcher_state.dismiss_replace(Instant::now());
             Task::none()
         } else if self.launcher_state.edit_confirm.is_some() {
             // Second Cancel backs out of the question: draft kept, stay in
             // edit mode (unwinds through the exit tween like any dismiss).
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             self.launcher_state.dismiss_edit_confirm(Instant::now());
             Task::none()
         } else if self.launcher_state.editing {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             if self.edit_draft_dirty() {
                 // Dirty exit asks first; clean exits cancel silently as before.
                 self.launcher_state.arm_edit_confirm(Instant::now());
@@ -355,7 +386,9 @@ impl App {
                 self.cancel_launcher_edit()
             }
         } else if self.launcher_visible {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             self.return_to_home_screen()
         } else {
             Task::none()
@@ -389,7 +422,9 @@ impl App {
 
     pub(crate) fn open_browser_session(&mut self) -> Task<Message> {
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_action_outcome(ActionOutcome::Accepted {
+            cue: NavCue::Action,
+        });
         let _ = self.home_apps.open(crate::app::home::AppId::Browser);
         self.browser.panel.session.open_surface();
         // The card's 16:9 page area drives the engine viewport; sync before
@@ -529,7 +564,7 @@ impl App {
                 .apply_failed(generation, "Browser engine not installed".to_string());
         }
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
+        self.apply_nav_cue(NavCue::Nav);
         self.resume_browser_engine();
         self.save_page();
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.open")
@@ -927,7 +962,7 @@ impl App {
             return Task::none();
         }
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
+        self.apply_nav_cue(NavCue::Nav);
         self.start_history_travel("browser.history.pick", "action", index, Some(url));
         Task::none()
     }
@@ -986,7 +1021,9 @@ impl App {
             pending.generation = Some(generation);
         }
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Action);
+        self.apply_action_outcome(ActionOutcome::Accepted {
+            cue: NavCue::Action,
+        });
         let tab = self.browser_tab();
         if let Some(flow) = flow {
             crate::platform::trace::event(crate::platform::trace::Lane::Engine, "command")
@@ -1331,7 +1368,7 @@ impl App {
         self.browser.panel.page.session.open_surface();
         self.save_page();
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
+        self.apply_nav_cue(NavCue::Nav);
         if self.browser.engine.is_some() {
             // The engine already preloaded the saved active URL at boot; the
             // session is aligned with it, so no duplicate navigate is needed.
@@ -1954,7 +1991,7 @@ impl App {
                 if let Some(draft) = self.launcher_state.manual_add.as_mut() {
                     draft.focus = draft.focus.next();
                 }
-                self.play_ui_cue(UiSoundKind::Nav);
+                self.apply_nav_cue(NavCue::Nav);
                 Task::none()
             }
             NavAction::Confirm => {
@@ -1971,7 +2008,9 @@ impl App {
                             }
                         });
                 if let Some(target) = target {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     self.request_osk_open(target)
                 } else {
                     Task::none()
@@ -2055,11 +2094,15 @@ impl App {
             if self.launcher_state.edit_confirm_closing() {
                 return Task::none();
             }
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             return self.complete_edit_discard();
         }
         if self.launcher_state.manual_add.is_some() {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             return self.confirm_manual_add();
         }
         // Replace confirm requires hold-Cross / hold-Enter (see pad poll / key hold).
@@ -2069,14 +2112,18 @@ impl App {
         if self.launcher_state.editing {
             return match self.edit_toggle_selected() {
                 Some(task) => {
-                    self.play_ui_cue(UiSoundKind::Action);
+                    self.apply_action_outcome(ActionOutcome::Accepted {
+                        cue: NavCue::Action,
+                    });
                     task
                 }
                 None => Task::none(),
             };
         }
         if self.launch_selected() {
-            self.play_ui_cue(UiSoundKind::Action);
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
             // Same as `on_launcher_launch`: keep a fresh replace-confirm modal
             // alive instead of closing (and wiping) it on the arming update.
             if self.launcher_state.replace_confirm.is_some() {
@@ -2871,7 +2918,7 @@ impl App {
         let horizontal_nav = true;
         // Horizontal Games strip: left/right scroll games.
         let horizontal_games_nav = self.immersive_horizontal_games_nav();
-        let mut tick = self.pad_nav.tick(
+        let mut tick = self.pad_nav.tick_full(
             readings,
             now,
             allow_nav_move,
@@ -3021,7 +3068,9 @@ impl App {
             let r2_pressed = r2 && !self.manual_add_r2_latched;
             self.manual_add_r2_latched = r2;
             if r2_pressed {
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 return self.on_launcher_message(LauncherMessage::Confirm);
             }
             if let Some(action) = tick.action {
@@ -3377,7 +3426,7 @@ impl App {
     ) -> Task<Message> {
         let snapshot = self.launcher_settings_snapshot();
         let opened = self.launcher_state.settings.toggle_menu(row, &snapshot);
-        self.play_ui_cue(UiSoundKind::Nav);
+        self.apply_nav_cue(NavCue::Nav);
         if opened {
             self.scroll_settings_focus_into_view(launcher_view::ScrollReveal::Either)
         } else {
@@ -3468,7 +3517,7 @@ impl App {
             NavAction::Up => {
                 let before = self.launcher_state.settings.focus;
                 if self.launcher_state.settings.move_focus(-1, &snapshot) {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     let after = self.launcher_state.settings.focus;
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: launcher settings focus={after}"
@@ -3482,7 +3531,7 @@ impl App {
             NavAction::Down => {
                 let before = self.launcher_state.settings.focus;
                 if self.launcher_state.settings.move_focus(1, &snapshot) {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     let after = self.launcher_state.settings.focus;
                     crate::controller::hid::diag::diag_info(format!(
                         "ui-diag: launcher settings focus={after}"
@@ -3535,12 +3584,14 @@ impl App {
             NavAction::Down => self.step_selector_menu(crate::domain::navigation::NavDir::Down),
             NavAction::Confirm => {
                 let select = row.selector_select(highlight);
-                self.play_ui_cue(UiSoundKind::Action);
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 self.on_launcher_message(select)
             }
             NavAction::Cancel | NavAction::ToggleSettings => {
                 self.launcher_state.settings.close_menus();
-                self.play_ui_cue(UiSoundKind::Nav);
+                self.apply_nav_cue(NavCue::Nav);
                 Task::none()
             }
             _ => Task::none(),
