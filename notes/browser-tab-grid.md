@@ -21,9 +21,9 @@ bookmark UI, or Browser screen/back behavior.
 
 - Home -> Browser opens the **tabs view** (not the page). **Share/Create**
   toggles page<->tabs; **Circle** from the page returns to the tabs view, and
-  Circle from the tabs view returns Home. Create in the tabs view still exits
-  to the page; the last remaining tab is never removed (closing it resets that
-  tab to the default page and opens the page view).
+  Circle from the tabs view returns Home. Share/Create is page-only and is
+  unbound in the tabs view. The last remaining tab is never removed: closing
+  it resets that tab to the default page and stays in the tabs view.
 - Tabs view is headerless, fixed **4 columns � 3 rows**. Slot 0 is ALWAYS the
   plus card, followed by up to 11 tabs (frozen visual order, active first).
   A 12th tab starts page 2; pages are swapped with the side chevrons, L1/R1,

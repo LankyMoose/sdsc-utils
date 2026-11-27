@@ -589,8 +589,9 @@ impl App {
             return self.invalidate_browser_window();
         }
         if closed_active {
-            // Last tab: keep the card and reset it to the default page, then
-            // leave the tabs view on that page. (Zero tabs is not allowed.)
+            // Last tab: keep the card and reset it to the default page. Stay
+            // in the tabs view; the user opens the card when they want the
+            // page. (Zero tabs is not allowed.)
             crate::platform::trace::event(
                 crate::platform::trace::Lane::Browser,
                 "browser.tab.close",
@@ -598,8 +599,7 @@ impl App {
             .field("tab", id.0)
             .field("next", "last_tab_default")
             .emit();
-            let default = self.on_browser_go_default();
-            return default.chain(self.close_browser_grid_with(None, false));
+            return self.on_browser_go_default();
         }
         if panel.remove_stored_tab(id) {
             if let Some(engine) = &self.browser.engine {

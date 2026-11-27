@@ -3056,7 +3056,8 @@ impl super::App {
         if let Some(action) = button {
             self.set_haptic_pad_from_id(Some(&action.pad));
             let action = match action.button {
-                PadButton::Create => self.close_browser_grid(None),
+                // Share/Create is page-only; in tabs view it is unbound.
+                PadButton::Create => Task::none(),
                 PadButton::Circle => self.return_to_home_screen(),
                 PadButton::Cross => self.browser_grid_activate_focus(),
                 PadButton::Square => self.browser_grid_close_focused_tab(),
