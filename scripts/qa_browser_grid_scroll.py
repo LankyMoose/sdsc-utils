@@ -2,8 +2,8 @@
 """Browser tabs row QA (newest-first strip, scrollbar, carry-over).
 
 Seeds more tabs than fit on screen, checks the newest tab opens at the start
-of the strip with a visible horizontal scrollbar, walks the focus to the
-oldest tab at the far end (scrolling it into view), then returns Home and
+of the strip with a visible horizontal scrollbar, holds the left stick right
+until the repeat scrolls the oldest tab into view, then returns Home and
 checks that the focused tab was carried into tabs.json.
 """
 
@@ -78,8 +78,15 @@ def main() -> int:
         step("grid.open"),
         step("wait"),
         step("screenshot"),
-        # Walk to the oldest tab at the far end; the strip scrolls after it.
-        *([step("grid.focus", dir="right")] * 8),
+        # Hold the left stick right: the grid frame tick must repeat past a
+        # single card and scroll the oldest tab into view. Four screenshots
+        # span ~1s (First + ~8 repeats at the MENU cadence).
+        step("pad.stick", x=1.0),
+        step("screenshot"),
+        step("screenshot"),
+        step("screenshot"),
+        step("screenshot"),
+        step("pad.stick", x=0.0),
         step("wait"),
         step("screenshot"),
         step("screen.home"),
@@ -146,11 +153,11 @@ def main() -> int:
                 if sandbox
                 else []
             )
-            if len(shots) >= 2:
+            if len(shots) >= 6:
                 break
             time.sleep(0.25)
-        if len(shots) < 2:
-            print(f"error: expected 2 screenshots, found {len(shots)}", file=sys.stderr)
+        if len(shots) < 6:
+            print(f"error: expected 6 screenshots, found {len(shots)}", file=sys.stderr)
             return 1
         print(f"sandbox={sandbox}")
         print("shots=" + ", ".join(path.name for path in shots))
@@ -174,13 +181,19 @@ def main() -> int:
         )
         lane_bright = bright_pixels(region_colors(images[0][2], width, lane))
         scrolled_right = central_band_colors(
-            images[1][2],
+            images[4][2],
             width,
             height,
             (row_right - card_w // 2, cards[0][1], card_w // 2, cards[0][3]),
         )
         scrolled_left = central_band_colors(
-            images[1][2],
+            images[4][2],
+            width,
+            height,
+            (cards[0][0], cards[0][1], cards[0][2], cards[0][3]),
+        )
+        released_left = central_band_colors(
+            images[5][2],
             width,
             height,
             (cards[0][0], cards[0][1], cards[0][2], cards[0][3]),
@@ -192,8 +205,12 @@ def main() -> int:
                 has_color(opening_plus, (65, 65, 251), 55, 1),
             ),
             ("overflow shows the horizontal scrollbar", lane_bright > 20),
+            ("held stick repeats past the first card", not has_color(scrolled_left, BLUE)),
             ("the oldest tab scrolls into view at the end", has_color(scrolled_right, RED)),
-            ("the newest tab left the viewport", not has_color(scrolled_left, BLUE)),
+            (
+                "releasing the stick stays at the end",
+                not has_color(released_left, BLUE),
+            ),
         ]
         for label, ok in checks:
             print(f"check {label}: {'ok' if ok else 'FAIL'}")

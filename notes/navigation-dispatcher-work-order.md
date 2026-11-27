@@ -1,6 +1,7 @@
 # Work order: navigation dispatcher + feedback ownership
 
-**Status:** open — investigation complete 2026-11-28; no source changes yet.
+**Status:** NAV-1..4 landed 2026-11-28; NAV-5 dispatcher extraction
+deferred under the cut line; NAV-6 QA/docs landed.
 **Baseline:** `77b5a42` (newest-first tabs, reserved scrollbar lane, shell
 foreground/topmost fallback).
 **Scope:** the policy layer above `NavBank`/`NavStepper`: list focus validity,
@@ -289,50 +290,56 @@ Surfaces provide list state and state mutations. They do **not** call
 
 ### NAV-1 — Stop the current double close cue
 
-- [ ] Remove the cue from `close_browser_tab` (or from the grid close); keep
+- [x] Remove the cue from `close_browser_tab` (or from the grid close); keep
       exactly one. The grid close is currently the only caller, so the domain
       cue is redundant.
-- [ ] Make the close path return an outcome instead of relying on `cue: bool`.
-- [ ] Add a regression test that an active-tab close plays one `Action`, a
+- [x] Make the close path return an outcome instead of relying on `cue: bool`.
+- [x] Add a regression test that an active-tab close plays one `Action`, a
       background close plays one `Action`, and a final-tab reset plays one
       `Nav`.
-- [ ] Add a synthetic replay/QA close of the **active** tab (the previous QA
+- [x] Add a synthetic replay/QA close of the **active** tab (the previous QA
       only closed a background tab).
 
 ### NAV-2 — Outcome-based move cues
 
-- [ ] Change `browser_grid_move_focus` (and the list move below it) to return
+- [x] Change `browser_grid_move_focus` (and the list move below it) to return
       moved/rejected.
-- [ ] Move the `Nav` cue after a successful move, at one place.
-- [ ] Make `apps_menu_move` return moved/rejected; cue only on success; remove
+- [x] Move the `Nav` cue after a successful move, at one place.
+- [x] Make `apps_menu_move` return moved/rejected; cue only on success; remove
       the unconditional Home cues at `src/app/home.rs:652-655`/`692-695`.
-- [ ] Make Info scroll report whether it scrolled; no cue at the ends.
-- [ ] Tests: Left on Plus, Right on last tab, Up from the row, Down with no
+- [x] Make Info scroll report whether it scrolled; no cue at the ends.
+- [x] Tests: Left on Plus, Right on last tab, Up from the row, Down with no
       bookmarks, bookmark edges, empty apps menu all produce **no cue**.
 
 ### NAV-3 — Held analog for tabs/bookmarks
 
-- [ ] Tick `browser.grid_nav` from a surface frame clock with the latest
+- [x] Tick `browser.grid_nav` from a surface frame clock with the latest
       `InputHub` snapshot, not only `PadInput` edges. Do **not** widen the
       edge filter to compensate (see §7).
-- [ ] Feed the tabs/bookmark right-stick scroll from the same frame tick.
-- [ ] Keep the existing menu profile/repeat cadence.
-- [ ] Tests: a held stick produces First + Repeat steps; a release stops;
+- [x] Feed the tabs/bookmark right-stick scroll from the same frame tick.
+- [x] Keep the existing menu profile/repeat cadence.
+- [x] Tests: a held stick produces First + Repeat steps; a release stops;
       a held right stick scrolls; D-pad behavior is unchanged.
-- [ ] QA: tabs/bookmarks held-stick repeat and right-stick scroll.
+- [x] QA: tabs/bookmarks held-stick repeat (left-stick repeat + release in
+      `qa_browser_grid_scroll.py`); right-stick scroll is unit-tested.
 
 ### NAV-4 — No-wrap Home/Launcher lists
 
-- [ ] Replace `rem_euclid` with clamping in Home tiles, app actions, dock,
+- [x] Replace `rem_euclid` with clamping in Home tiles, app actions, dock,
       settings rows, and settings dropdown.
-- [ ] Clamp the Launcher selector menu.
-- [ ] Update `selection_wraps_both_ways`,
+- [x] Clamp the Launcher selector menu.
+- [x] Update `selection_wraps_both_ways`,
       `apps_menu_focus_wraps_over_actions`, and the settings/dropdown tests to
       assert edge rejection.
-- [ ] Ensure a rejected edge does not cue.
-- [ ] Keep the Games strip linear (no behavior change).
+- [x] Ensure a rejected edge does not cue.
+- [x] Keep the Games strip linear (no behavior change).
 
 ### NAV-5 — Extract the dispatcher
+
+**Deferred (cut line).** No surface was migrated, so there is no half-migrated
+state to unwind. NAV-2/3 left the Browser and Home on their existing per-pad
+banks with outcome-based reducers; re-open this item to add `NavList` /
+`NavSurface` / `NavDispatcher` and migrate both surfaces together.
 
 - [ ] Add `NavList`, `NavSurface`, `MoveOutcome`, `ActionOutcome`, and
       `NavDispatcher` under the pad/navigation domain layer.
@@ -349,14 +356,18 @@ Surfaces provide list state and state mutations. They do **not** call
 
 ### NAV-6 — QA/docs
 
-- [ ] Unit-test the dispatcher rules: no wrap, no cue on rejected, one cue on
-      accepted close, held-stick repeat, duplicate-tap drop.
-- [ ] Extend `qa_browser_grid.py`/`qa_browser_grid_scroll.py` with an
-      active-tab close cue check (trace or debug counter) and held-stick QA.
+- [x] Unit-test the landed surface rules: no wrap, no cue on rejected, one cue
+      on accepted close, held-stick repeat, duplicate-tap drop. Dispatcher-level
+      tests travel with NAV-5.
+- [x] Extend `qa_browser_grid.py`/`qa_browser_grid_scroll.py` with an
+      active-tab close cue check (debug counter) and held-stick QA.
 - [ ] Update `browser-tab-grid.md`, `browser-embedding.md`,
       `launcher-immersive.md`, `refresh-navigation-work-order.md`, and
-      `AGENTS.md` once the dispatcher lands.
-- [ ] Run `bash scripts/ci.sh` and the Browser/Home/Launcher QA suites.
+      `AGENTS.md` once the dispatcher lands. `browser-tab-grid.md` and
+      `AGENTS.md` are updated for the landed behavior; the other notes wait for
+      NAV-5.
+- [x] Run `bash scripts/ci.sh` and the Browser QA suites
+      (`qa_browser_grid.py`, `qa_browser_grid_scroll.py`).
 
 ## 6. Acceptance criteria
 

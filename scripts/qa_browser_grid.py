@@ -2,8 +2,10 @@
 """Browser tab-grid QA (synthetic replay, no OS input).
 
 Opens the Share/Create grid over local pages, verifies card geometry and the
-bookmark star, creates a second tab, and switches back through the grid.
-Screenshots are mapped to replay steps by write order.
+bookmark star, creates a second tab, and switches back through the grid. It
+closes a background tab and then the active non-final tab, asserting one cue
+per close from the debug tally. Screenshots are mapped to replay steps by
+write order.
 """
 
 from __future__ import annotations
@@ -252,6 +254,18 @@ def main() -> int:
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.close_tab", "params": {"index": 0}},
         {"app": "browser", "action": "screenshot", "params": {}},
+        # Active-tab close: new C is active and non-final, so it takes the
+        # Action-cue path while A stays alive as the fallback tab.
+        {
+            "app": "browser",
+            "action": "grid.new_tab",
+            "params": {"url": page_b.as_uri()},
+        },
+        {"app": "browser", "action": "wait", "params": {}},
+        {"app": "browser", "action": "grid.open", "params": {}},
+        {"app": "browser", "action": "screenshot", "params": {}},
+        {"app": "browser", "action": "grid.close_tab", "params": {"index": 0}},
+        {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "screen.ps", "params": {}},
         {"app": "browser", "action": "screen.ps", "params": {}},
         {"app": "browser", "action": "wait", "params": {}},
@@ -321,12 +335,12 @@ def main() -> int:
                 (sandbox / "shots").glob("shot-*.png"),
                 key=lambda p: p.stat().st_mtime_ns,
             ) if sandbox else []
-            if len(shots) >= 9:
+            if len(shots) >= 11:
                 break
             time.sleep(0.25)
-        if len(shots) < 8:
+        if len(shots) < 11:
             print(
-                f"error: expected 9 screenshots, found {len(shots)}",
+                f"error: expected 11 screenshots, found {len(shots)}",
                 file=sys.stderr,
             )
             return 1
@@ -361,8 +375,10 @@ def main() -> int:
         two_grid = central_band_colors(images[4][2], width, height, cards[1])
         two_grid_second = central_band_colors(images[4][2], width, height, cards[2])
         page_a_again = central_band_colors(images[5][2], width, height, browser_rects(width, height)[0])
-        closed_active = central_band_colors(images[7][2], width, height, cards[1])
-        resumed_grid = central_band_colors(images[8][2], width, height, cards[1])
+        closed_background = central_band_colors(images[7][2], width, height, cards[1])
+        new_active_tab = central_band_colors(images[8][2], width, height, cards[1])
+        closed_active = central_band_colors(images[9][2], width, height, cards[1])
+        resumed_grid = central_band_colors(images[10][2], width, height, cards[1])
 
         plus_w, plus_h = cards[0][2], cards[0][3]
         tab_w, tab_h = cards[1][2], cards[1][3]
@@ -380,7 +396,9 @@ def main() -> int:
             ("two-card grid first tab", has_color(two_grid, blue)),
             ("two-card grid second tab", has_color(two_grid_second, red)),
             ("switched page A band", has_color(page_a_again, red)),
-            ("closing a stored tab keeps the active page", has_color(closed_active, red)),
+            ("closing a stored tab keeps the active page", has_color(closed_background, red)),
+            ("new active tab opens newest first", has_color(new_active_tab, blue)),
+            ("closing the active tab falls back to page A", has_color(closed_active, red)),
             ("PS resume restored the grid", has_color(resumed_grid, red) or has_color(resumed_grid, cream)),
         ]
         for label, ok in checks:
@@ -412,6 +430,24 @@ def main() -> int:
             if not ok:
                 print("error: Launcher PS/Circle path did not run", file=sys.stderr)
                 return 1
+        # Two close actions (background B, active C): each path must emit
+        # exactly one cue. The debug counter wraps the whole close reducer, so
+        # a resurrected domain cue would read cues=2.
+        close_cues = [
+            line
+            for line in log_text.splitlines()
+            if "ui-diag: browser tab close cues=" in line
+        ]
+        cues_ok = len(close_cues) == 2 and all(
+            line.endswith("cues=1") for line in close_cues
+        )
+        print(f"check one cue per tab close: {'ok' if cues_ok else 'FAIL'}")
+        if not cues_ok:
+            print(
+                f"error: expected 2 tab-close cue tallies of 1, found {close_cues}",
+                file=sys.stderr,
+            )
+            return 1
         windows = qa_offscreen.visible_windows(proc.pid)
         print(f"post-circle windows={len(windows)}")
         if not windows:

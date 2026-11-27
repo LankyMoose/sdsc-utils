@@ -41,24 +41,30 @@ bookmark UI, or Browser screen/back behavior.
 - Closing a tab **keeps the selected index** (`focus_after_close`): the next
   card slides into the freed slot; closing the last card selects the new last
   card; closing the final remaining tab keeps that tab (it resets to the
-  default page, zero tabs are not allowed). Closing always plays exactly one
-  `play_ui_cue` (sound + haptics); `close_browser_tab` itself is silent.
+  default page, zero tabs are not allowed). Every close emits exactly one
+  `play_ui_cue`: `Action` for a real close, `Nav` for the final-tab reset. The
+  domain `close_browser_tab` is silent and returns a `TabCloseOutcome`; the
+  caller owns the cue.
 - D-pad **and left analog stick** move card focus through the shared per-pad
   `NavBank` (MENU deadzone, repeat, neutral grace, and post-open arming); the
   left stick is shaped by `NavProfile::MENU` and the right stick is excluded.
-  Cross opens, Square closes, Triangle bookmarks. Down enters the bookmark
-  strip; Up returns to the row card that had focus. The bank arms immediately
-  when the entrance FLIP lands, and a direction pressed during the FLIP is
-  buffered, so the first post-transition move is never swallowed.
+  The grid's own frame tick samples `InputHub::latest_reading` while a nav
+  input is non-neutral, so a held stick repeats without waking the Browser
+  edge filter. Cross opens, Square closes, Triangle bookmarks. Down enters the
+  bookmark strip; Up returns to the row card that had focus. The bank arms
+  immediately when the entrance FLIP lands, and a direction pressed during the
+  FLIP is buffered, so the first post-transition move is never swallowed.
 - A footer hint island (Launcher glass style, full **pill** radius) shows
   Open/Close/Bookmark/Back; each card has an overlaid bottom title footer with
   ellipsis.
 - **One cue per action.** Opening/closing the tabs view, moving focus,
   bookmarking, closing a tab, and selecting a card each emit exactly one
-  `play_ui_cue` (sound and haptics). The plus card/new-tab path and bookmark
-  navigation already cue from the tab/navigation call, so their grid close is
-  silent (`close_browser_grid_with(..., false)`); selecting a card cues when
-  the FLIP starts and the late tab activation stays silent.
+  `play_ui_cue` (sound and haptics), and only when the action actually
+  changed state: a boundary move (left on plus, right on the last tab, up from
+  the row, down with no bookmarks, bookmark-strip ends) is consumed silently.
+  The plus card/new-tab path and bookmark navigation already cue from the
+  tab/navigation call, so their grid close returns a silent outcome; selecting
+  a card cues when the FLIP starts and the late tab activation stays silent.
 - **No engine resize.** The FLIP overlay draws the tab's existing `FrameSlot`
   texture at an animating rectangle; card aspect equals the live page viewport
   aspect. Entering shrinks the page into the selected card; selecting a card
@@ -96,12 +102,13 @@ boot-time engine events that would otherwise clobber the saved strip before
 restore. Circle->Home runs `persist_grid_selection`, which activates the focused
 card first, so the next Browser open focuses the selection the user left behind.
 
-## Open work order
+## Navigation policy
 
-Navigation validity/cue ownership and held-analog sampling for this surface are
-tracked by [navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
-The current grid still cues before a move is known to be valid and only sees
-analog samples through the Browser edge filter.
+Move cues are outcome-based: `browser_grid_move_focus` reports moved or
+rejected, and only a moved focus plays `Nav`. Held analog is sampled from the
+`InputHub` snapshot on the grid's frame tick, not inferred from Browser edge
+filter wake-ups. The remaining dispatcher extraction is tracked by
+[navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
 
 ## QA
 
@@ -113,6 +120,9 @@ python scripts/qa_browser_grid_scroll.py
 Synthetic replay only (no OS input): local pages, `grid.open`, screenshot the
 compact card/row geometry, `grid.bookmark`, `grid.new_tab`, `grid.activate`, and
 page/grid screenshots. `ReplayWait::needs_grid_idle` keeps step boundaries
-after the FLIP lands. The row script seeds more tabs than fit, checks the strip
-opens scrolled to the active last tab, walks focus back to the plus card, and
-asserts Circle->Home wrote the focused tab as the active `tabs.json` entry.
+after the FLIP lands. The grid script closes a background tab and then the
+active non-final tab, and asserts a debug cue tally of exactly one per close.
+The row script seeds more tabs than fit, checks the newest-first strip and
+scrollbar, holds the left stick until repeat scrolls the oldest tab into view,
+releases, and asserts Circle->Home wrote the focused tab as the active
+`tabs.json` entry.
