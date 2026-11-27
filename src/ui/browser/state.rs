@@ -105,6 +105,18 @@ pub struct StoredTab {
     pub loaded: bool,
 }
 
+/// Silent result of closing one tab. The caller owns the single UI cue, so the
+/// close operation itself never sounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabCloseOutcome {
+    /// A real close. `next` is the tab active afterwards.
+    Closed { next: crate::browser::engine::TabId },
+    /// The final tab: reset it to the default page instead of leaving none.
+    ResetDefault,
+    /// Unknown id or nothing to close.
+    Rejected,
+}
+
 /// Browser app panel. The page surface and cursor live here; load lifecycle
 /// (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
@@ -375,6 +387,23 @@ impl BrowserPanel {
     /// Overwrite `tabs.json` with the current page.
     pub fn save_tabs(&self) {
         crate::browser::tabs::save(&self.snapshot_tabs());
+    }
+
+    /// Decide what closing `id` would do without mutating anything. The close
+    /// action is a silent state transition; this is the outcome it reports.
+    pub fn tab_close_outcome(&self, id: crate::browser::engine::TabId) -> TabCloseOutcome {
+        if self.tab_page(id).is_none() {
+            return TabCloseOutcome::Rejected;
+        }
+        if id != self.active_tab {
+            return TabCloseOutcome::Closed {
+                next: self.active_tab,
+            };
+        }
+        match self.order.iter().copied().find(|tab| *tab != id) {
+            Some(next) => TabCloseOutcome::Closed { next },
+            None => TabCloseOutcome::ResetDefault,
+        }
     }
 
     /// Resolve any tab id to its page state (live or stored).

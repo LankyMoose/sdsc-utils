@@ -207,6 +207,13 @@ use std::time::Instant;
 
 use super::Message;
 
+/// Silent result of closing the tabs view. The transition and its cue are
+/// separate: the caller emits the one cue when a close actually started.
+pub(crate) enum GridCloseOutcome {
+    Started(Task<Message>),
+    Rejected,
+}
+
 /// Map source-side tap actions to the Browser's semantic nav actions.
 /// Tap only: no hold actions, no history selector, no hints/status.
 fn browser_tap_action(actions: &[PadAction]) -> Option<(PadId, NavAction)> {
@@ -876,11 +883,14 @@ impl super::App {
                     let open = self.open_browser_tab(Some(url.to_string()));
                     let id = self.browser.panel.active_tab;
                     // Opening the tab already cues; the close FLIP is silent.
-                    open.chain(self.close_browser_grid_with(
+                    let close = match self.close_browser_grid_with(
                         Some(id),
-                        false,
                         Some(crate::ui::browser::grid::GridFocus::Tab(id)),
-                    ))
+                    ) {
+                        GridCloseOutcome::Started(task) => task,
+                        GridCloseOutcome::Rejected => Task::none(),
+                    };
+                    open.chain(close)
                 } else {
                     self.browser_grid_open_plus()
                 }
@@ -1868,22 +1878,27 @@ impl super::App {
         &mut self,
         select: Option<crate::browser::engine::TabId>,
     ) -> Task<Message> {
-        self.close_browser_grid_with(select, true, None)
+        match self.close_browser_grid_with(select, None) {
+            GridCloseOutcome::Started(task) => {
+                self.play_ui_cue(UiSoundKind::Nav);
+                task
+            }
+            GridCloseOutcome::Rejected => Task::none(),
+        }
     }
 
-    /// Close the tabs view. `cue` is false when the initiating action already
-    /// played one (the plus card opens a tab, which cues itself), so a single
-    /// press never emits two navigation sounds/haptics.
+    /// Close the tabs view. Silent: the caller owns the cue. Callers whose
+    /// initiating action already cued (tab open/bookmark open) use the task
+    /// without emitting another.
     pub(crate) fn close_browser_grid_with(
         &mut self,
         select: Option<crate::browser::engine::TabId>,
-        cue: bool,
         source: Option<crate::ui::browser::grid::GridFocus>,
-    ) -> Task<Message> {
+    ) -> GridCloseOutcome {
         use crate::ui::browser::grid::{GridFocus, GridMode};
 
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
-            return Task::none();
+            return GridCloseOutcome::Rejected;
         }
         let select = select.filter(|id| self.browser.panel.tab_page(*id).is_some());
         let reduced =
@@ -1903,14 +1918,11 @@ impl super::App {
             .field("select", select.is_some())
             .field("reduced_motion", true)
             .emit();
-            if cue {
-                self.play_ui_cue(UiSoundKind::Nav);
-            }
             if let Some(id) = pending {
-                return self.activate_browser_tab(id);
+                return GridCloseOutcome::Started(self.activate_browser_tab(id));
             }
             self.sync_live_mouse();
-            return self.invalidate_browser_window();
+            return GridCloseOutcome::Started(self.invalidate_browser_window());
         }
         let tab = select.unwrap_or(self.browser.panel.active_tab);
         let source_focus = source
@@ -1940,9 +1952,6 @@ impl super::App {
             entering: false,
             card: source_focus,
         });
-        if cue {
-            self.play_ui_cue(UiSoundKind::Nav);
-        }
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.grid.close")
             .field("tab", tab.0)
             .field("select", select.is_some())
@@ -1953,10 +1962,12 @@ impl super::App {
             )),
             move |_| Message::Browser(crate::ui::browser::BrowserMessage::GridAnimDone(generation)),
         );
-        activation
-            .chain(self.invalidate_browser_window())
-            .chain(self.pending_grid_scroll_later())
-            .chain(done)
+        GridCloseOutcome::Started(
+            activation
+                .chain(self.invalidate_browser_window())
+                .chain(self.pending_grid_scroll_later())
+                .chain(done),
+        )
     }
 
     pub(crate) fn finish_browser_grid_transition(&mut self, generation: u64) -> Task<Message> {
@@ -2039,7 +2050,13 @@ impl super::App {
             return Task::none();
         }
         self.browser.panel.grid.focus = GridFocus::Tab(id);
-        self.close_browser_grid_with(Some(id), true, Some(GridFocus::Tab(id)))
+        match self.close_browser_grid_with(Some(id), Some(GridFocus::Tab(id))) {
+            GridCloseOutcome::Started(task) => {
+                self.play_ui_cue(UiSoundKind::Nav);
+                task
+            }
+            GridCloseOutcome::Rejected => Task::none(),
+        }
     }
 
     pub(crate) fn browser_grid_open_plus(&mut self) -> Task<Message> {
@@ -2053,7 +2070,24 @@ impl super::App {
         let open = self.open_browser_tab(None);
         let id = self.browser.panel.active_tab;
         // `open_browser_tab` already plays the tab-open cue.
-        open.chain(self.close_browser_grid_with(Some(id), false, Some(GridFocus::Plus)))
+        let close = match self.close_browser_grid_with(Some(id), Some(GridFocus::Plus)) {
+            GridCloseOutcome::Started(task) => task,
+            GridCloseOutcome::Rejected => Task::none(),
+        };
+        open.chain(close)
+    }
+
+    /// The one cue a tab close owns. `ResetDefault` navigates silently, so
+    /// this is the only cue the final-tab path emits.
+    pub(crate) fn close_tab_cue(
+        outcome: crate::ui::browser::state::TabCloseOutcome,
+    ) -> Option<UiSoundKind> {
+        use crate::ui::browser::state::TabCloseOutcome;
+        match outcome {
+            TabCloseOutcome::Closed { .. } => Some(UiSoundKind::Action),
+            TabCloseOutcome::ResetDefault => Some(UiSoundKind::Nav),
+            TabCloseOutcome::Rejected => None,
+        }
     }
 
     pub(crate) fn browser_grid_close_tab(
@@ -2070,13 +2104,11 @@ impl super::App {
         let focus = self.browser.panel.grid.focus;
         let next_focus =
             crate::ui::browser::grid::focus_after_close(&self.browser.panel.grid.visual, focus, id);
-        // The final tab resets to the default page, which already plays the
-        // navigation cue; every real close owns exactly one action cue.
-        let final_tab = self.browser.panel.order.len() <= 1;
-        if !final_tab {
-            self.play_ui_cue(UiSoundKind::Action);
+        // The close is silent; the outcome owns the single cue.
+        let outcome = self.close_browser_tab(id);
+        if let Some(kind) = Self::close_tab_cue(outcome) {
+            self.play_ui_cue(kind);
         }
-        let task = self.close_browser_tab(id);
         let panel = &mut self.browser.panel;
         panel.sync_grid_visual();
         panel.grid.focus = next_focus;
@@ -2087,7 +2119,7 @@ impl super::App {
             GridFocus::Bookmark(_) => Task::none(),
             _ => self.scroll_grid_focus_into_view(),
         };
-        scroll.chain(task).chain(self.invalidate_browser_window())
+        scroll.chain(self.invalidate_browser_window())
     }
 
     /// Persist the focused tabs-view card as the active tab when the screen
@@ -2209,7 +2241,12 @@ impl super::App {
         // tab's card, which close_browser_grid_with scrolls into view.
         let open = self.open_browser_tab(Some(bookmark.url));
         let id = self.browser.panel.active_tab;
-        open.chain(self.close_browser_grid_with(Some(id), false, Some(GridFocus::Tab(id))))
+        // `open_browser_tab` already cues; the close FLIP stays silent.
+        let close = match self.close_browser_grid_with(Some(id), Some(GridFocus::Tab(id))) {
+            GridCloseOutcome::Started(task) => task,
+            GridCloseOutcome::Rejected => Task::none(),
+        };
+        open.chain(close)
     }
 
     pub(crate) fn browser_grid_move_focus(
@@ -4238,5 +4275,40 @@ mod tests {
             20.0,
         );
         assert_eq!(late, 1);
+    }
+
+    /// NAV-1 close matrix: every close path owns exactly one cue.
+    #[test]
+    fn tab_close_matrix_emits_exactly_one_cue() {
+        use crate::app::App;
+        use crate::browser::engine::TabId;
+
+        fn cues(panel: &BrowserPanel, id: TabId) -> Vec<UiSoundKind> {
+            App::close_tab_cue(panel.tab_close_outcome(id))
+                .into_iter()
+                .collect()
+        }
+
+        // Final remaining tab: the reset navigation is silent, the close owns
+        // the single Nav cue.
+        let panel = BrowserPanel::default();
+        assert_eq!(cues(&panel, TabId::BOOT), vec![UiSoundKind::Nav]);
+
+        // Active non-final and background closes: one Action each.
+        let mut panel = BrowserPanel::default();
+        let (active, _) = panel.create_tab("https://b.test/".to_string());
+        assert_eq!(
+            cues(&panel, active),
+            vec![UiSoundKind::Action],
+            "closing the active non-final tab"
+        );
+        assert_eq!(
+            cues(&panel, TabId::BOOT),
+            vec![UiSoundKind::Action],
+            "closing a background tab"
+        );
+
+        // Unknown tab: rejected, silent.
+        assert_eq!(cues(&panel, TabId(999)), Vec::<UiSoundKind>::new());
     }
 }

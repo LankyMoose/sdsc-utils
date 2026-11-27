@@ -422,7 +422,13 @@ impl App {
     /// Browser default page. Hardcoded until the settings screen lands, then a
     /// pref; navigation is via page links/search plus back/forward/reload.
     pub(crate) fn on_browser_go_default(&mut self) -> Task<Message> {
-        self.navigate_browser_to(crate::browser::BROWSER_DEFAULT_URL.to_string())
+        self.navigate_browser_to_with_cue(crate::browser::BROWSER_DEFAULT_URL.to_string(), true)
+    }
+
+    /// Default-page reset for the final-tab close: the caller owns the one
+    /// `Nav` cue, so the navigation itself must stay silent.
+    fn on_browser_go_default_silent(&mut self) -> Task<Message> {
+        self.navigate_browser_to_with_cue(crate::browser::BROWSER_DEFAULT_URL.to_string(), false)
     }
 
     /// Active tab id for engine commands. The backend gates input to the
@@ -531,90 +537,96 @@ impl App {
     }
 
     /// Close one tab. The final tab is reset to the default page rather than
-    /// leaving the Browser with no live surface.
-    pub(crate) fn close_browser_tab(&mut self, id: crate::browser::engine::TabId) -> Task<Message> {
-        let panel = &mut self.browser.panel;
-        let closed_active = id == panel.active_tab;
-        let mut next = None;
-        if closed_active {
-            next = panel.order.iter().copied().find(|tab| *tab != id);
-        }
-        if let Some(next) = next {
-            let loaded = panel.tab_loaded(next);
-            let title = panel
-                .tab_page(next)
-                .and_then(|page| page.session.title().map(str::to_string));
-            // Swapping puts the old live page into the target's stored slot;
-            // drop that slot immediately — the closed tab is gone.
-            panel.activate_tab(next);
-            panel.remove_stored_tab(id);
-            let url = panel.session.url().to_string();
-            panel.session.open_surface();
-            let mut generation = None;
-            if !loaded {
-                let generation_value = panel.session.begin_load(url.clone());
-                if let Some(title) = title {
-                    panel.session.note_title(Some(title));
+    /// leaving the Browser with no live surface. Silent: the caller owns the
+    /// single cue for the outcome it receives.
+    pub(crate) fn close_browser_tab(
+        &mut self,
+        id: crate::browser::engine::TabId,
+    ) -> crate::ui::browser::state::TabCloseOutcome {
+        use crate::ui::browser::state::TabCloseOutcome;
+        let outcome = self.browser.panel.tab_close_outcome(id);
+        match outcome {
+            TabCloseOutcome::Rejected => {}
+            TabCloseOutcome::ResetDefault => {
+                // Last tab: keep the card and reset it to the default page.
+                // Stay in the tabs view; the user opens the card when they
+                // want the page. (Zero tabs is not allowed.) The reset
+                // navigation is silent; the close caller emits the Nav cue.
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Browser,
+                    "browser.tab.close",
+                )
+                .field("tab", id.0)
+                .field("next", "last_tab_default")
+                .emit();
+                let _ = self.on_browser_go_default_silent();
+            }
+            TabCloseOutcome::Closed { next } if next != self.browser.panel.active_tab => {
+                let panel = &mut self.browser.panel;
+                let loaded = panel.tab_loaded(next);
+                let title = panel
+                    .tab_page(next)
+                    .and_then(|page| page.session.title().map(str::to_string));
+                // Swapping puts the old live page into the target's stored
+                // slot; drop that slot immediately — the closed tab is gone.
+                panel.activate_tab(next);
+                panel.remove_stored_tab(id);
+                let url = panel.session.url().to_string();
+                panel.session.open_surface();
+                let mut generation = None;
+                if !loaded {
+                    let generation_value = panel.session.begin_load(url.clone());
+                    if let Some(title) = title {
+                        panel.session.note_title(Some(title));
+                    }
+                    generation = Some(generation_value);
                 }
-                generation = Some(generation_value);
-            }
-            if let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::CloseTab { tab: id });
-                if let Some(generation) = generation {
-                    let frame = std::sync::Arc::clone(panel.session.frame_slot());
-                    engine.send(EngineCommand::OpenTab {
-                        tab: next,
-                        url,
-                        generation,
-                        frame,
-                    });
+                if let Some(engine) = &self.browser.engine {
+                    engine.send(EngineCommand::CloseTab { tab: id });
+                    if let Some(generation) = generation {
+                        let frame = std::sync::Arc::clone(panel.session.frame_slot());
+                        engine.send(EngineCommand::OpenTab {
+                            tab: next,
+                            url,
+                            generation,
+                            frame,
+                        });
+                    }
+                    engine.send(EngineCommand::SetActiveTab { tab: next });
+                } else if let Some(generation) = generation {
+                    panel
+                        .session
+                        .apply_failed(generation, "Browser engine not installed".to_string());
                 }
-                engine.send(EngineCommand::SetActiveTab { tab: next });
-            } else if let Some(generation) = generation {
-                panel
-                    .session
-                    .apply_failed(generation, "Browser engine not installed".to_string());
+                self.note_launcher_activity();
+                self.resume_browser_engine();
+                self.save_page();
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Browser,
+                    "browser.tab.close",
+                )
+                .field("tab", id.0)
+                .field("next", next.0)
+                .emit();
+                let _ = self.invalidate_browser_window();
             }
-            self.note_launcher_activity();
-            self.play_ui_cue(UiSoundKind::Action);
-            self.resume_browser_engine();
-            self.save_page();
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "browser.tab.close",
-            )
-            .field("tab", id.0)
-            .field("next", next.0)
-            .emit();
-            return self.invalidate_browser_window();
-        }
-        if closed_active {
-            // Last tab: keep the card and reset it to the default page. Stay
-            // in the tabs view; the user opens the card when they want the
-            // page. (Zero tabs is not allowed.)
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "browser.tab.close",
-            )
-            .field("tab", id.0)
-            .field("next", "last_tab_default")
-            .emit();
-            return self.on_browser_go_default();
-        }
-        if panel.remove_stored_tab(id) {
-            if let Some(engine) = &self.browser.engine {
-                engine.send(EngineCommand::CloseTab { tab: id });
+            TabCloseOutcome::Closed { .. } => {
+                let panel = &mut self.browser.panel;
+                panel.remove_stored_tab(id);
+                if let Some(engine) = &self.browser.engine {
+                    engine.send(EngineCommand::CloseTab { tab: id });
+                }
+                self.save_page();
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Browser,
+                    "browser.tab.close",
+                )
+                .field("tab", id.0)
+                .emit();
+                let _ = self.invalidate_browser_window();
             }
-            self.save_page();
-            crate::platform::trace::event(
-                crate::platform::trace::Lane::Browser,
-                "browser.tab.close",
-            )
-            .field("tab", id.0)
-            .emit();
-            return self.invalidate_browser_window();
         }
-        Task::none()
+        outcome
     }
 
     /// Re-sync the pad cursor as the engine mouse for the live tab (after
@@ -684,6 +696,10 @@ impl App {
     }
 
     pub(crate) fn navigate_browser_to(&mut self, url: String) -> Task<Message> {
+        self.navigate_browser_to_with_cue(url, true)
+    }
+
+    fn navigate_browser_to_with_cue(&mut self, url: String, cue: bool) -> Task<Message> {
         self.cancel_history_travel("navigate");
         let current = self.browser.panel.session.url().to_string();
         let raw = if url.trim().is_empty() { current } else { url };
@@ -715,7 +731,9 @@ impl App {
             pending.generation = Some(generation);
         }
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
+        if cue {
+            self.play_ui_cue(UiSoundKind::Nav);
+        }
         if self.browser.engine.is_none() {
             // The engine is mandatory; Home tile handles the missing-engine
             // install flow before a window ever opens.
