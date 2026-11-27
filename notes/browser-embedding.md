@@ -166,8 +166,11 @@ meters still use the legacy per-surface bank.
   content: one horizontally scrollable, newest-first row of page-aspect cards (plus
   first), a bookmark strip, and the footer island. A reserved scrollbar lane
   appears below the row when tabs overflow. D-pad and the left stick move card
-  focus through the shared per-pad `NavBank` (MENU deadzone/repeat/neutral
-  grace/arming) and scroll the focused card into view; Cross expands the
+  focus through the shared `NavDispatcher` (per-pad `NavBank` plus the
+  `NavList` clamp/outcome policy: MENU deadzone/repeat/neutral grace/arming)
+  and scroll the focused card into view; held sticks are sampled from the
+  `InputHub` snapshot on the grid's own frame tick, and boundary moves are
+  rejected silently. Cross expands the
   focused card (or the plus card/new tab/bookmark), Square closes the focused
   tab (the last tab resets to the default page instead of leaving zero tabs),
   Triangle toggles its bookmark, Down enters the bookmark strip (Up returns to

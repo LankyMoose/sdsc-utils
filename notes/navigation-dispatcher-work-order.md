@@ -1,7 +1,9 @@
 # Work order: navigation dispatcher + feedback ownership
 
-**Status:** NAV-1..4 landed 2026-11-28; NAV-5 dispatcher extraction
-deferred under the cut line; NAV-6 QA/docs landed.
+**Status:** NAV-1..6 landed 2026-11-28. The dispatcher covers Browser
+tabs/bookmarks, Home tiles/app actions/dock/settings, and Launcher selector
+menus; the Launcher Games-strip bank and OSK pull surface keep their existing
+mechanics (no behavior change).
 **Baseline:** `77b5a42` (newest-first tabs, reserved scrollbar lane, shell
 foreground/topmost fallback).
 **Scope:** the policy layer above `NavBank`/`NavStepper`: list focus validity,
@@ -336,36 +338,39 @@ Surfaces provide list state and state mutations. They do **not** call
 
 ### NAV-5 — Extract the dispatcher
 
-**Deferred (cut line).** No surface was migrated, so there is no half-migrated
-state to unwind. NAV-2/3 left the Browser and Home on their existing per-pad
-banks with outcome-based reducers; re-open this item to add `NavList` /
-`NavSurface` / `NavDispatcher` and migrate both surfaces together.
+Landed in `src/domain/navigation.rs`: `NavList`, `NavSurface`, `MoveOutcome`,
+`ActionOutcome`, `NavCue`, and `NavDispatcher` (per-pad bank + menu tick +
+policy entry points).
 
-- [ ] Add `NavList`, `NavSurface`, `MoveOutcome`, `ActionOutcome`, and
+- [x] Add `NavList`, `NavSurface`, `MoveOutcome`, `ActionOutcome`, and
       `NavDispatcher` under the pad/navigation domain layer.
-- [ ] Migrate Browser tabs/bookmarks first: delete the per-surface move logic
-      and `browser.grid_nav` orchestration; the surface exposes list state and
-      `try_move`/`try_action`.
-- [ ] Migrate Home apps (tiles + app actions) next; then Home dock/settings.
+- [x] Migrate Browser tabs/bookmarks first: `GridFocusOutcome` and
+      `grid_move_cue` are gone; `grid::move_focus` returns a
+      `GridFocusMove { outcome, focus, row_focus }` and `browser.grid_nav` is
+      the dispatcher.
+- [x] Migrate Home apps (tiles + app actions) next; then Home dock/settings.
+      All four movement paths and the app menu use `NavList`; Home's
+      `NavStepper` field is replaced by `NavDispatcher`.
 - [ ] Migrate Launcher and OSK after parity; remove per-surface
-      `NavStepper`/`NavBank` fields.
-- [ ] Keep `PadActionGate` at the input boundary for tap dedupe/latch; the
+      `NavStepper`/`NavBank` fields. Launcher selector menus are migrated; the
+      Games strip (`view::move_selection` + `App::pad_nav`) and the OSK pull
+      surface keep their banks so their feel is unchanged.
+- [x] Keep `PadActionGate` at the input boundary for tap dedupe/latch; the
       dispatcher never re-implements edge dedupe.
-- [ ] Remove `cue: bool`-style parameters and direct `play_ui_cue` calls from
-      navigation/action reducers.
+- [x] Remove `cue: bool`-style parameters and direct `play_ui_cue` calls from
+      navigation/action reducers. Cues go through
+      `App::apply_move_outcome`/`apply_action_outcome`/`apply_nav_cue`; page
+      cursor and hold cues stay on their own paths.
 
 ### NAV-6 — QA/docs
 
-- [x] Unit-test the landed surface rules: no wrap, no cue on rejected, one cue
-      on accepted close, held-stick repeat, duplicate-tap drop. Dispatcher-level
-      tests travel with NAV-5.
+- [x] Unit-test the dispatcher rules: no wrap, no cue on rejected, one cue on
+      accepted close, held-stick repeat, duplicate-tap drop.
 - [x] Extend `qa_browser_grid.py`/`qa_browser_grid_scroll.py` with an
       active-tab close cue check (debug counter) and held-stick QA.
-- [ ] Update `browser-tab-grid.md`, `browser-embedding.md`,
+- [x] Update `browser-tab-grid.md`, `browser-embedding.md`,
       `launcher-immersive.md`, `refresh-navigation-work-order.md`, and
-      `AGENTS.md` once the dispatcher lands. `browser-tab-grid.md` and
-      `AGENTS.md` are updated for the landed behavior; the other notes wait for
-      NAV-5.
+      `AGENTS.md` once the dispatcher lands.
 - [x] Run `bash scripts/ci.sh` and the Browser QA suites
       (`qa_browser_grid.py`, `qa_browser_grid_scroll.py`).
 

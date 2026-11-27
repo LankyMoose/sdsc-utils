@@ -45,8 +45,9 @@ bookmark UI, or Browser screen/back behavior.
   `play_ui_cue`: `Action` for a real close, `Nav` for the final-tab reset. The
   domain `close_browser_tab` is silent and returns a `TabCloseOutcome`; the
   caller owns the cue.
-- D-pad **and left analog stick** move card focus through the shared per-pad
-  `NavBank` (MENU deadzone, repeat, neutral grace, and post-open arming); the
+- D-pad **and left analog stick** move card focus through the shared
+  `NavDispatcher` (per-pad `NavBank` + `NavList` clamp/outcome policy; MENU
+  deadzone, repeat, neutral grace, and post-open arming); the
   left stick is shaped by `NavProfile::MENU` and the right stick is excluded.
   The grid's own frame tick samples `InputHub::latest_reading` while a nav
   input is non-neutral, so a held stick repeats without waking the Browser
@@ -104,11 +105,14 @@ card first, so the next Browser open focuses the selection the user left behind.
 
 ## Navigation policy
 
-Move cues are outcome-based: `browser_grid_move_focus` reports moved or
-rejected, and only a moved focus plays `Nav`. Held analog is sampled from the
-`InputHub` snapshot on the grid's frame tick, not inferred from Browser edge
-filter wake-ups. The remaining dispatcher extraction is tracked by
-[navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
+Move cues are outcome-based: `grid::move_focus` returns a `GridFocusMove`
+carrying the domain `MoveOutcome`, and only `Moved` plays `Nav`. The tabs
+surface runs through `NavDispatcher` (`src/domain/navigation.rs`), which owns
+the per-pad `NavBank`, the clamp-only `NavList` policy, and the cue mapping.
+Held analog is sampled from the `InputHub` snapshot on the grid's frame tick,
+not inferred from Browser edge filter wake-ups. Launcher selector menus use the
+same list policy; the Games strip and OSK pull surface keep their existing
+mechanics.
 
 ## QA
 
