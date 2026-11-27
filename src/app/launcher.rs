@@ -7,9 +7,9 @@ use super::Win32DialogParent;
 #[cfg(debug_assertions)]
 use super::stamp_hitch_report;
 use super::{
-    App, LAUNCHER_CURSOR_IDLE_HIDE, LAUNCHER_NAV_NOT_READY_MS, LauncherKeyAction, Message,
-    PAD_POLL_SLOW_MS, PAD_POLL_STALL_MS, PadInputOwner, RELOAD_FEEDBACK_DELAY,
-    RUNNING_CHECK_INTERVAL, SCROLL_RESTORE_AUTHORITY, SNAPSHOT_STALE_MS, chord_held_on_any_pad,
+    App, LAUNCHER_NAV_NOT_READY_MS, LauncherKeyAction, Message, PAD_POLL_SLOW_MS,
+    PAD_POLL_STALL_MS, PadInputOwner, RELOAD_FEEDBACK_DELAY, RUNNING_CHECK_INTERVAL,
+    SCROLL_RESTORE_AUTHORITY, SHELL_CURSOR_IDLE_HIDE, SNAPSHOT_STALE_MS, chord_held_on_any_pad,
     delay, is_manual_target_missing, spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
@@ -357,7 +357,7 @@ impl App {
             }
         } else if self.launcher_visible {
             self.play_ui_cue(UiSoundKind::Action);
-            self.close_launcher()
+            self.return_to_home_screen()
         } else {
             Task::none()
         }
@@ -432,6 +432,190 @@ impl App {
         self.browser.panel.active_tab
     }
 
+    /// Switch the live tab. Dormant stored tabs create their engine view on
+    /// first activation; loaded tabs just foreground their existing view.
+    pub(crate) fn activate_browser_tab(
+        &mut self,
+        id: crate::browser::engine::TabId,
+    ) -> Task<Message> {
+        if id == self.browser.panel.active_tab {
+            return Task::none();
+        }
+        let loaded = self.browser.panel.tab_loaded(id);
+        let title = self
+            .browser
+            .panel
+            .tab_page(id)
+            .and_then(|page| page.session.title().map(str::to_string));
+        if !self.browser.panel.activate_tab(id) {
+            return Task::none();
+        }
+        let url = self.browser.panel.session.url().to_string();
+        self.browser.panel.session.open_surface();
+        let mut generation = None;
+        if !loaded {
+            let generation_value = self.browser.panel.session.begin_load(url.clone());
+            if let Some(title) = title {
+                self.browser.panel.session.note_title(Some(title));
+            }
+            generation = Some(generation_value);
+            if self.browser.engine.is_none() {
+                self.browser
+                    .panel
+                    .session
+                    .apply_failed(generation_value, "Browser engine not installed".to_string());
+            }
+        }
+        if let Some(engine) = &self.browser.engine {
+            if let Some(generation) = generation {
+                let frame = std::sync::Arc::clone(self.browser.panel.session.frame_slot());
+                engine.send(EngineCommand::OpenTab {
+                    tab: id,
+                    url,
+                    generation,
+                    frame,
+                });
+            }
+            engine.send(EngineCommand::SetActiveTab { tab: id });
+        }
+        self.note_launcher_activity();
+        self.play_ui_cue(UiSoundKind::Nav);
+        self.resume_browser_engine();
+        self.save_page();
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.switch")
+            .field("tab", id.0)
+            .field("loaded", loaded)
+            .emit();
+        self.invalidate_browser_window()
+    }
+
+    /// Open a new foreground tab (grid plus card, popup, future bookmark
+    /// action). The new page loads from birth through `OpenTab`.
+    pub(crate) fn open_browser_tab(&mut self, url: Option<String>) -> Task<Message> {
+        if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
+            crate::controller::hid::diag::diag_info("ui-diag: browser tab cap reached");
+            return Task::none();
+        }
+        let url = url.unwrap_or_else(|| crate::browser::BROWSER_DEFAULT_URL.to_string());
+        let url = crate::browser::nav::resolve_navigate_target(&url);
+        if url.is_empty() {
+            return Task::none();
+        }
+        let (id, generation) = self.browser.panel.create_tab(url.clone());
+        self.browser.panel.sync_grid_visual();
+        if let Some(engine) = &self.browser.engine {
+            let frame = std::sync::Arc::clone(self.browser.panel.session.frame_slot());
+            engine.send(EngineCommand::OpenTab {
+                tab: id,
+                url,
+                generation,
+                frame,
+            });
+            engine.send(EngineCommand::SetActiveTab { tab: id });
+        } else {
+            self.browser
+                .panel
+                .session
+                .apply_failed(generation, "Browser engine not installed".to_string());
+        }
+        self.note_launcher_activity();
+        self.play_ui_cue(UiSoundKind::Nav);
+        self.resume_browser_engine();
+        self.save_page();
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.open")
+            .field("tab", id.0)
+            .field("tabs", self.browser.panel.order.len())
+            .emit();
+        self.invalidate_browser_window()
+    }
+
+    /// Close one tab. The final tab is reset to the default page rather than
+    /// leaving the Browser with no live surface.
+    pub(crate) fn close_browser_tab(&mut self, id: crate::browser::engine::TabId) -> Task<Message> {
+        let panel = &mut self.browser.panel;
+        let closed_active = id == panel.active_tab;
+        let mut next = None;
+        if closed_active {
+            next = panel.order.iter().copied().find(|tab| *tab != id);
+        }
+        if let Some(next) = next {
+            let loaded = panel.tab_loaded(next);
+            let title = panel
+                .tab_page(next)
+                .and_then(|page| page.session.title().map(str::to_string));
+            // Swapping puts the old live page into the target's stored slot;
+            // drop that slot immediately — the closed tab is gone.
+            panel.activate_tab(next);
+            panel.remove_stored_tab(id);
+            let url = panel.session.url().to_string();
+            panel.session.open_surface();
+            let mut generation = None;
+            if !loaded {
+                let generation_value = panel.session.begin_load(url.clone());
+                if let Some(title) = title {
+                    panel.session.note_title(Some(title));
+                }
+                generation = Some(generation_value);
+            }
+            if let Some(engine) = &self.browser.engine {
+                engine.send(EngineCommand::CloseTab { tab: id });
+                if let Some(generation) = generation {
+                    let frame = std::sync::Arc::clone(panel.session.frame_slot());
+                    engine.send(EngineCommand::OpenTab {
+                        tab: next,
+                        url,
+                        generation,
+                        frame,
+                    });
+                }
+                engine.send(EngineCommand::SetActiveTab { tab: next });
+            } else if let Some(generation) = generation {
+                panel
+                    .session
+                    .apply_failed(generation, "Browser engine not installed".to_string());
+            }
+            self.note_launcher_activity();
+            self.play_ui_cue(UiSoundKind::Action);
+            self.resume_browser_engine();
+            self.save_page();
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.tab.close",
+            )
+            .field("tab", id.0)
+            .field("next", next.0)
+            .emit();
+            return self.invalidate_browser_window();
+        }
+        if closed_active {
+            // Last tab: keep it. Closing the only surface would leave the
+            // Browser with nothing to show, and silently navigating it away is
+            // worse than a no-op.
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.tab.close",
+            )
+            .field("tab", id.0)
+            .field("next", "last_tab_noop")
+            .emit();
+            return Task::none();
+        }
+        if panel.remove_stored_tab(id) {
+            if let Some(engine) = &self.browser.engine {
+                engine.send(EngineCommand::CloseTab { tab: id });
+            }
+            self.save_page();
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.tab.close",
+            )
+            .field("tab", id.0)
+            .emit();
+            return self.invalidate_browser_window();
+        }
+        Task::none()
+    }
+
     /// Re-sync the pad cursor as the engine mouse for the live tab (after
     /// resume, tab switch, or popup adopt — hover state went stale).
     pub(crate) fn sync_live_mouse(&mut self) {
@@ -471,6 +655,7 @@ impl App {
 
     pub(crate) fn close_browser_surface(&mut self) -> Task<Message> {
         self.cancel_history_travel("surface_closed");
+        self.settle_browser_grid_for_close();
         let _ = self.home_apps.close(crate::app::home::AppId::Browser);
         self.browser.panel.close_surface();
         // A held D-pad must not jump the cursor of the next opened page.
@@ -1096,9 +1281,10 @@ impl App {
         Task::none()
     }
 
-    /// First-open restore from `tabs.json`: v0 is single-tab, so only the
-    /// saved active page survives. Backend views are fresh, so the page
-    /// re-navigates and engine history starts over by construction.
+    /// First-open restore from `tabs.json`: restore the whole strip. The
+    /// saved active page becomes the live boot page (the engine preloaded its
+    /// URL); other tabs stay dormant until first activated. Backend views are
+    /// fresh, so engine history starts over by construction.
     /// Crash-restart boots use the default page instead (the restored page is
     /// the one that killed CEF).
     pub(crate) fn restore_browser_page(
@@ -1106,34 +1292,17 @@ impl App {
         saved: crate::browser::tabs::SavedTabs,
     ) -> Task<Message> {
         crate::platform::trace::manifest("browser_tabs", &saved);
-        let page = saved
-            .tabs
-            .get(saved.active.min(saved.tabs.len().saturating_sub(1)))
-            .filter(|page| !page.url.is_empty() && page.url != crate::browser::BLANK_PAGE_URL);
         if self.crash_restart_boot {
             crate::platform::app_log::info(
                 "crash-restart: safe page restore (default page, saved page skipped)",
             );
             return self.on_browser_go_default();
         }
-        let Some(page) = page else {
+        let restored = self.browser.panel.restore_saved_strip(&saved);
+        if !restored {
             return self.on_browser_go_default();
-        };
-        let url = page.url.clone();
-        let title = (!page.title.is_empty()).then(|| page.title.clone());
-        {
-            let panel = &mut self.browser.panel;
-            panel.stored.clear();
-            panel.order.clear();
-            panel.active_tab = crate::browser::engine::TabId::BOOT;
-            panel.reset_live_page();
-            panel.page.session.open_surface();
-            panel.page.session.begin_load(url.clone());
-            if let Some(title) = title {
-                panel.page.session.note_title(Some(title));
-            }
-            panel.order.push(crate::browser::engine::TabId::BOOT);
         }
+        self.browser.panel.page.session.open_surface();
         self.save_page();
         self.note_launcher_activity();
         self.play_ui_cue(UiSoundKind::Nav);
@@ -1141,9 +1310,14 @@ impl App {
             // The engine already preloaded the saved active URL at boot; the
             // session is aligned with it, so no duplicate navigate is needed.
             self.sync_browser_theme();
-            crate::controller::hid::diag::diag_info("ui-diag: browser restore page");
+            crate::controller::hid::diag::diag_info(format!(
+                "ui-diag: browser restore strip tabs={} active={}",
+                self.browser.panel.order.len(),
+                self.browser.panel.active_tab.0
+            ));
             Task::none()
         } else {
+            let url = self.browser.panel.session.url().to_string();
             self.navigate_browser_to(url)
         }
     }
@@ -1184,9 +1358,8 @@ impl App {
     /// Engine worker event. Deliberately no activity stamp: frames flow
     /// continuously while visible and must not defeat idle-dim.
     ///
-    /// v0 is single-tab; background events still route to a stored page if one
-    /// exists (dormant multi-tab data), but popups/tab lifecycle never create
-    /// or adopt a tab.
+    /// Background-tab events route to the stored page; foreground events feed
+    /// the live page. The Share grid reads both through `grid_tabs`.
     pub(crate) fn on_engine_event(&mut self, event: EngineEvent) -> Task<Message> {
         match event {
             EngineEvent::FrameSlot { tab, slot } => return self.on_frame_slot(tab, slot),
@@ -1398,8 +1571,7 @@ impl App {
     }
 
     /// Background-tab event: same per-tab state updates as the live path,
-    /// but never touches the live page UI. v0 has no tab switcher, so this
-    /// only keeps dormant stored data coherent.
+    /// but never touches the live page UI. Keeps stored grid cards coherent.
     fn route_background_event(&mut self, tab: crate::browser::engine::TabId, event: EngineEvent) {
         // URL/title changes persist the page; the borrow ends before the
         // save (which reborrows the panel).
@@ -1643,6 +1815,15 @@ impl App {
         step: &crate::platform::trace::replay::ReplayStep,
     ) -> Task<Message> {
         match step.action.as_str() {
+            "open" => {
+                if self.launcher_visible {
+                    Task::none()
+                } else {
+                    self.open_launcher()
+                }
+            }
+            "screen.ps" => self.ps_screen_toggle(),
+            "screen.home" => self.return_to_home_screen(),
             "manual_add" => {
                 let open = if self.launcher_visible {
                     Task::none()
@@ -2426,8 +2607,8 @@ impl App {
         // only source-side taps (and the PS chord) cross the app boundary.
         if self.osk.state.open {
             if self.home_chord_fires(&readings) {
-                crate::controller::hid::diag::diag_info("ui-diag: PS opens home over OSK");
-                return self.close_osk("home").chain(self.toggle_home());
+                crate::controller::hid::diag::diag_info("ui-diag: PS dismisses screen over OSK");
+                return self.close_osk("home").chain(self.ps_screen_toggle());
             }
             return self.on_osk_tap_actions(tap_actions);
         }
@@ -2930,18 +3111,17 @@ impl App {
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: reopen gesture fire held={held}"
             ));
-            self.open_home()
+            self.ps_screen_toggle()
         } else {
             Task::none()
         }
     }
 
-    /// Rising-edge PS chord while Launcher is open opens Home. Home is
-    /// the only PS target now: PS never closes Launcher directly. True modals
-    /// (replace/edit/manual dialogs, open or animating settings, ambient
-    /// tuning) swallow the chord so PS cannot strand them mid-dialog. The
-    /// release gate consumes the sticky hold so the opening press cannot
-    /// immediately re-fire.
+    /// Rising-edge PS chord while Launcher is open dismisses the screen; the
+    /// next PS restores Launcher. True modals (replace/edit/manual dialogs,
+    /// open or animating settings, ambient tuning) swallow the chord so PS
+    /// cannot strand them mid-dialog. The release gate consumes the sticky
+    /// hold so the opening press cannot immediately re-fire.
     pub(crate) fn toggle_home_on_reopen_chord(
         &mut self,
         readings: &[launcher_input::NavReading],
@@ -2982,8 +3162,8 @@ impl App {
                 // unlatched, even with the chord absent. Only a genuine new
                 // press (detector rising edge) opens Home.
                 if self.gesture_detectors.update(&required, readings) {
-                    crate::controller::hid::diag::diag_info("ui-diag: PS opens home");
-                    Some(self.toggle_home())
+                    crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Launcher");
+                    Some(self.ps_screen_toggle())
                 } else {
                     None
                 }
@@ -3171,6 +3351,7 @@ impl App {
         // Scope flip may CloseStart when USB pads no longer qualify; never opens.
         let ctx = crate::session::ApplyContext {
             home_visible: self.home_visible,
+            managed_app_visible: self.browser_visible || self.launcher_visible,
             fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -4036,6 +4217,7 @@ impl App {
         if !self.session.prefs.home_enabled {
             return Task::none();
         }
+        self.clear_ps_resume();
         // An explicit open wins over a pending deferred destroy.
         self.launcher_close_armed = false;
         // Edit state (editing mode, drafts, confirms) survives closes like
@@ -4114,6 +4296,8 @@ impl App {
             );
             return Task::none();
         }
+        // The outgoing screen keeps the native cursor hidden across the swap.
+        self.shell_opening = true;
         // Launcher and Browser are mutually exclusive.
         let close_browser = if self.browser_visible {
             self.close_browser_window()
@@ -4128,7 +4312,7 @@ impl App {
             height: 1080.0,
         });
         self.launcher_monitor_cover = Some(cover);
-        self.clear_start_activity();
+        self.reset_shell_activity();
         // Enter veil stays solid until LauncherOpened arms the capped clock.
         self.launcher_state.begin_transition_phase(
             launcher_mode::TransitionPhase::EnterImmersive,
@@ -4248,55 +4432,63 @@ impl App {
     }
 
     /// Mouse move/click/wheel: wake idle/sleep and show the cursor.
-    pub(crate) fn note_start_cursor_activity(&mut self) {
+    pub(crate) fn note_shell_cursor_activity(&mut self) {
         let now = Instant::now();
         self.launcher_last_activity = now;
-        self.launcher_cursor_last_active = now;
-        self.set_start_cursor_hidden(false);
+        self.shell_cursor_last_active = now;
+        self.set_shell_cursor_hidden(false);
         self.wake_start_idle(now, false);
     }
 
     /// Reset activity clocks without treating it as a sleep-wake (open/close).
-    pub(crate) fn clear_start_activity(&mut self) {
+    /// Does NOT re-show the pointer: screen swaps preserve the shell cursor.
+    pub(crate) fn reset_shell_activity(&mut self) {
         let now = Instant::now();
         self.launcher_last_activity = now;
-        self.launcher_cursor_last_active = now;
-        self.set_start_cursor_hidden(false);
+        self.shell_cursor_last_active = now;
         self.launcher_state.reset_idle_dim();
     }
 
-    pub(crate) fn set_start_cursor_hidden(&mut self, hidden: bool) {
-        if self.launcher_cursor_hidden == hidden {
+    /// Reset only the global cursor idle clock (Browser/Home open/close).
+    pub(crate) fn reset_shell_cursor_clock(&mut self) {
+        self.shell_cursor_last_active = Instant::now();
+    }
+
+    pub(crate) fn set_shell_cursor_hidden(&mut self, hidden: bool) {
+        // Automated/quiet sessions never hide the host cursor.
+        let hidden = hidden && !crate::platform::debug_quiet::input_dropped();
+        if self.shell_cursor_hidden == hidden {
             return;
         }
-        self.launcher_cursor_hidden = hidden;
+        self.shell_cursor_hidden = hidden;
         if hidden {
-            crate::controller::hid::diag::diag_info("ui-diag: launcher cursor hide");
+            crate::controller::hid::diag::diag_info("ui-diag: shell cursor hide");
         } else {
-            crate::controller::hid::diag::diag_info("ui-diag: launcher cursor show");
+            crate::controller::hid::diag::diag_info("ui-diag: shell cursor show");
         }
     }
 
-    pub(crate) fn tick_start_cursor_idle(&mut self, now: Instant) {
-        if !self.launcher_visible {
-            self.set_start_cursor_hidden(false);
+    pub(crate) fn tick_shell_cursor_idle(&mut self, now: Instant) {
+        let shell_visible = self.home_visible || self.browser_visible || self.launcher_visible;
+        if !shell_visible || crate::platform::debug_quiet::input_dropped() {
+            self.set_shell_cursor_hidden(false);
             return;
         }
         if !cursor_on_primary_monitor() {
-            self.set_start_cursor_hidden(false);
+            self.set_shell_cursor_hidden(false);
             return;
         }
         // The cover spans the full monitor including the taskbar, but
-        // taskbar input never reaches Launcher — hiding there strands the
+        // taskbar input never reaches the shell — hiding there strands the
         // cursor with no self-unhide path (notably across a blocking
         // tray-menu modal loop).
         if !crate::platform::host::Host::cursor_in_work_area() {
-            self.set_start_cursor_hidden(false);
+            self.set_shell_cursor_hidden(false);
             return;
         }
-        let idle = now.saturating_duration_since(self.launcher_cursor_last_active);
-        if idle >= LAUNCHER_CURSOR_IDLE_HIDE {
-            self.set_start_cursor_hidden(true);
+        let idle = now.saturating_duration_since(self.shell_cursor_last_active);
+        if idle >= SHELL_CURSOR_IDLE_HIDE {
+            self.set_shell_cursor_hidden(true);
         }
     }
 
@@ -4376,13 +4568,18 @@ impl App {
         if self.launcher_close_armed {
             return Task::none();
         }
-        // Capture before clear: destroying a hidden-cursor window skips the
-        // restore present (winit only pushes on change) and leaks a global
-        // ShowCursor(FALSE). The armed phase below lets the restore land.
-        let was_hidden = self.launcher_cursor_hidden;
+        // Destroying a hidden-cursor window skips the restore present (winit
+        // only pushes on change) and leaks a global ShowCursor(FALSE). Only
+        // arm the deferred destroy when this close leaves no shell screen:
+        // a swap keeps the pointer hidden and the replacement window owns it.
+        let last_shell = !self.home_visible && !self.browser_visible && !self.shell_opening;
+        let restore_cursor = self.shell_cursor_hidden && last_shell;
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Launcher while the hide is in flight.
         self.launcher_visible = false;
+        if restore_cursor {
+            self.set_shell_cursor_hidden(false);
+        }
         let rehost_toast = self.rehost_toast_after_composite();
         self.launcher_nav_ready = false;
         self.launcher_revealed_at = None;
@@ -4396,7 +4593,7 @@ impl App {
         self.art.cancel(generation);
         self.launcher_state.art_awaiting_paint = false;
         self.launcher_monitor_cover = None;
-        self.clear_start_activity();
+        self.reset_shell_activity();
         self.haptic_pad_serial = None;
         self.hid_worker.rumble_stop_all();
         self.pad_nav.reset();
@@ -4413,7 +4610,7 @@ impl App {
         // Focus-close often leaves the reopen chord held (e.g. PS); latch until
         // a debounced full release so the next PadPoll cannot immediately reopen.
         self.arm_chord_release_latch();
-        if was_hidden && self.launcher_window.is_some() {
+        if restore_cursor && self.launcher_window.is_some() {
             // Deferred destroy: the flag already cleared above, so the next
             // loop pass rebuilds with a visible interaction and pushes the
             // restore to the OS before FinishStartClose tears down the HWND.

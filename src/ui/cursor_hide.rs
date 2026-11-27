@@ -1,4 +1,5 @@
-//! Force `mouse::Interaction::Hidden` over the Launcher tree (idle immersive hide).
+//! Force `mouse::Interaction::Hidden` over a shell screen tree (Home/Browser/
+//! Launcher) while the global shell cursor is idle-hidden.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;

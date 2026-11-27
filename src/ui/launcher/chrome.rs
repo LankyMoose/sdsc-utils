@@ -207,7 +207,7 @@ pub(crate) fn footer_hint<'a>(state: &'a State, flat_hints: bool) -> Element<'a,
     // there are deliberately no dialog arms here, and ownership forces
     // idle press visuals behind either dim.
     let press = HintPress::for_owner(state, HintPressOwner::Browse);
-    // Circle closes (Cancel while editing) regardless of the dock state.
+    // Circle returns Home (Cancel while editing) regardless of dock state.
     let circle_label = crate::ui::launcher::mode::cancel_circle_label(state.editing);
 
     // Split layout: secondary (sort / controllers / Settings) left,

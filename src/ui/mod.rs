@@ -5,6 +5,7 @@ pub mod browser;
 pub mod chrome;
 pub mod color;
 pub mod configure;
+pub mod cursor_hide;
 #[cfg(debug_assertions)]
 pub mod debug_bounds;
 pub mod face;

@@ -101,6 +101,17 @@ fn pad_input_active_at(last_input_at: Option<Instant>, now: Instant) -> bool {
     last_input_at.is_some_and(|at| now.saturating_duration_since(at) < ACTIVE_INPUT_WINDOW)
 }
 
+/// Poll identity for one HID path. A real serial hint wins; serial-less
+/// interfaces fall back to the path's previously resolved serial so a hot
+/// poll can still report a pad that is only known from the sample loop.
+fn poll_key_for_hint(hint: &str, resolved: Option<&Serial>) -> Option<Serial> {
+    if is_storable_serial(hint) {
+        Some(Serial::normalize(hint))
+    } else {
+        resolved.cloned()
+    }
+}
+
 /// Pure decision: skip opening a path with `fails` consecutive failures as of
 /// `last`, evaluated at `now`.
 fn backoff_skip_at(fails: u32, last: Instant, now: Instant) -> bool {
@@ -262,6 +273,10 @@ struct DeviceCache {
     probe_backoff: HashMap<String, ProbeBackoff>,
     /// Throttles the per-poll `probe skip` diag line to once per 30s.
     last_probe_skip_log: Option<Instant>,
+    /// HID path → serial resolved by opening the device. Some DualSense USB
+    /// interfaces expose no serial-number string, so the hot poll path needs
+    /// this to recognize an already-sampled pad without a full probe.
+    resolved_paths: HashMap<String, Serial>,
     presence: Arc<Mutex<Vec<String>>>,
     launch_paths: LaunchPaths,
     launch_serials: Arc<Mutex<Vec<Serial>>>,
@@ -299,6 +314,7 @@ impl DeviceCache {
             open_backoff: HashMap::new(),
             probe_backoff: HashMap::new(),
             last_probe_skip_log: None,
+            resolved_paths: HashMap::new(),
             presence,
             launch_paths: LaunchPaths::new(),
             launch_serials,
@@ -337,6 +353,8 @@ impl DeviceCache {
         self.open_backoff
             .retain(|path, _| listed.contains(path.as_str()));
         self.probe_backoff
+            .retain(|path, _| listed.contains(path.as_str()));
+        self.resolved_paths
             .retain(|path, _| listed.contains(path.as_str()));
         if let Ok(mut guard) = self.presence.lock() {
             *guard = paths;
@@ -385,6 +403,20 @@ impl DeviceCache {
                 },
             );
         }
+    }
+
+    /// Remember the serial a HID path resolved to after an open. Serial-less
+    /// USB gamepad interfaces depend on this for hot polls.
+    fn note_resolved_path(&mut self, path: &str, serial: &str) {
+        if !is_storable_serial(serial) {
+            return;
+        }
+        self.resolved_paths
+            .insert(path.to_string(), Serial::normalize(serial));
+    }
+
+    fn resolved_serial_for_path(&self, path: &str) -> Option<&Serial> {
+        self.resolved_paths.get(path)
     }
 
     fn drop_serial(&mut self, serial: &str) {
@@ -507,6 +539,10 @@ impl DeviceCache {
             if Serial::normalize(identity.as_str()) != target {
                 continue;
             }
+            if is_storable_serial(identity.as_ref()) {
+                self.resolved_paths
+                    .insert(path.clone(), Serial::normalize(identity.as_ref()));
+            }
             let is_bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
             let is_usb = matches!(info.bus_type(), BusType::Usb);
             let kind = driver::find_for_info(info)
@@ -618,6 +654,10 @@ impl DeviceCache {
                 && self.devices.contains_key(&Serial::normalize(identity_hint))
             {
                 let path = info.path().to_string_lossy().into_owned();
+                if is_storable_serial(identity_hint) {
+                    self.resolved_paths
+                        .insert(path.clone(), Serial::normalize(identity_hint));
+                }
                 let identity = Serial::normalize(identity_hint);
                 if let Some(serial) = self
                     .launch_paths
@@ -660,6 +700,10 @@ impl DeviceCache {
                 }
             };
             let identity = resolve_device_identity(info, &device);
+            if is_storable_serial(identity.as_ref()) {
+                self.resolved_paths
+                    .insert(path.clone(), Serial::normalize(identity.as_ref()));
+            }
             if let Some(serial) = self.launch_paths.take_serial_for_path(&path, &identity) {
                 self.queue_launch_serial(serial);
             }
@@ -2243,7 +2287,13 @@ fn poll_incremental(
     // Fresh live batteries (single lock; released before any HID I/O).
     let live_snapshot: HashMap<
         Serial,
-        (String, battery::BatteryReading, Instant, Option<Instant>),
+        (
+            String,
+            battery::BatteryReading,
+            Instant,
+            Option<Instant>,
+            ControllerKind,
+        ),
     > = live_pads
         .lock()
         .map(|guard| {
@@ -2257,6 +2307,7 @@ fn poll_incremental(
                             pad.reading.clone(),
                             pad.updated_at,
                             pad.last_input_at,
+                            pad.kind,
                         ),
                     )
                 })
@@ -2287,7 +2338,7 @@ fn poll_incremental(
         cache.probe_skipped_paths().into_iter().collect();
     let live_fresh = live_snapshot
         .values()
-        .any(|(_, _, at, _)| now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE);
+        .any(|(_, _, at, _, _)| now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE);
     if input_hot && live_fresh {
         skip_probe.extend(cache.failed_probe_paths());
     }
@@ -2295,16 +2346,40 @@ fn poll_incremental(
 
     let mut statuses: Vec<ControllerStatus> = Vec::with_capacity(devices.len());
     for (path, hint) in devices {
-        let key = Serial::normalize(&hint);
+        let key = poll_key_for_hint(&hint, cache.resolved_serial_for_path(&path))
+            .unwrap_or_else(|| Serial::normalize(&hint));
         // An actively used pad (input within ~3s) is never probed: its battery
         // comes from the live input stream. Applies even when the cached
         // handle was dropped.
         let actively_used = live_snapshot
             .get(&key)
-            .is_some_and(|(_, _, _, input_at)| pad_input_active_at(*input_at, now));
+            .is_some_and(|(_, _, _, input_at, _)| pad_input_active_at(*input_at, now));
+        // A live sample already proves the pad is present and carries its
+        // battery. Emit status straight from it, even when the cached handle
+        // is gone and a full probe would be skipped while input is hot.
+        // Without this, a serial-less USB interface that missed one poll could
+        // never re-enter the session while the user kept using the pad.
+        if is_storable_serial(key.as_ref())
+            && let Some((product, reading, at, input_at, kind)) = live_snapshot.get(&key)
+            && (pad_input_active_at(*input_at, now)
+                || now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
+                || input_hot)
+            && let Some(driver) = driver::find_for_kind(*kind)
+        {
+            if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, key.as_ref()) {
+                launch_quiet.push(serial);
+            }
+            statuses.push(poll::status_from_reading(
+                driver,
+                product,
+                reading,
+                key.clone(),
+            ));
+            continue;
+        }
         // Known pad on a live handle: fresh samples cost zero HID reads.
-        if is_storable_serial(&hint) && cache.devices.contains_key(&key) {
-            if let Some((product, reading, at, input_at)) = live_snapshot.get(&key)
+        if is_storable_serial(key.as_ref()) && cache.devices.contains_key(&key) {
+            if let Some((product, reading, at, input_at, _)) = live_snapshot.get(&key)
                 && (pad_input_active_at(*input_at, now)
                     || now.saturating_duration_since(*at) < POLL_LIVE_BATTERY_STALE
                     // While input is hot, the sample loop is the sole reader:
@@ -2469,6 +2544,7 @@ fn poll_incremental(
             continue;
         };
         timing.io_ms += io_ms;
+        cache.note_resolved_path(&path, &serial);
         if let Some(serial) = cache.launch_paths.take_serial_for_path(&path, &serial) {
             launch_quiet.push(serial);
         }
@@ -2795,6 +2871,27 @@ mod tests {
             Some(now),
             now + Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn serialless_hid_path_reuses_resolved_serial() {
+        let resolved = Serial::normalize("444648164f65");
+        assert_eq!(
+            poll_key_for_hint("", Some(&resolved)),
+            Some(resolved.clone()),
+            "empty serial hint must reuse the path's resolved serial"
+        );
+        assert_eq!(
+            poll_key_for_hint("unknown", Some(&resolved)),
+            Some(resolved.clone()),
+            "non-storable hints fall back to the resolved serial"
+        );
+        assert_eq!(
+            poll_key_for_hint("aa:bb:cc", Some(&resolved)),
+            Some(Serial::normalize("aa:bb:cc")),
+            "a real hint always wins"
+        );
+        assert_eq!(poll_key_for_hint("", None), None);
     }
 
     #[test]

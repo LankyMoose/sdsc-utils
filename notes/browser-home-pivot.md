@@ -15,6 +15,11 @@ overlay, app selection, the engine backend, or MSIX packaging.
 > again, and the optional CEF engine DLC is the only optional payload. See
 > [single-process-browser.md](single-process-browser.md).
 >
+> **Screen model update:** Home is now a peer screen, not a topmost overlay on
+> managed apps. PS hides/restores the current screen; Circle from
+> Launcher/Browser returns Home; auto-open is suppressed while a managed app is
+> visible. The phase-1/2 "topmost Home" mechanics below are historical.
+>
 > **v0 update (Phases A–C landed, v0.1 header):** the in-process Browser is
 > single-tab with one header row — Back/L1 · URL well (Triangle edits) ·
 > Forward/R1 — above the page cursor/text surface. The OSK is system owned;
@@ -69,11 +74,13 @@ half-measures, no `fetch.rs` text fallback).
   set. Toast/popup/Settings keep current levels. **Home is the exception:**
   `AlwaysOnTop`, raised last (above toast/Settings/popup). Topmost still loses
   to exclusive-fullscreen scanout — documented limitation, best-effort only.
-- **PS:** toggles Home from anywhere, including over running games. Pad works
-  unfocused (HID is direct); mouse/keyboard in Home over a focused game are
-  best-effort. Auto-open behavior (toast-first latch, USB scope, `AfterToast`
-  settle, PS-chord suppression, `WindowClosed` retry) moves from Launcher to Home;
-  pref key migrates (`Never`/`Bluetooth`/`Any`, default `Any`).
+- **PS:** toggles the current screen between visible and desktop: Browser,
+  Launcher, and Home are peers and the next PS restores the exact dismissed
+  screen. **Circle** from Launcher/Browser returns to Home. Home never opens
+  as an overlay on top of a managed app; controller auto-open is suppressed
+  while Launcher/Browser is visible. Auto-open behavior (toast-first latch,
+  USB scope, `AfterToast` settle, PS-chord suppression, `WindowClosed` retry)
+  belongs to Home; pref key migrates (`Never`/`Bluetooth`/`Any`, default `Any`).
 - **Browser window:** fullscreen immersive. v0.1 renders one header row
   (Back/L1 · URL well · Forward/R1) above the page; the tab strip/toolbar/
   bookmarks/status strip remain the future target, not current geometry.
@@ -82,15 +89,16 @@ half-measures, no `fetch.rs` text fallback).
 
 ```
 sdsc-utils (tray + HID + manager)
-├── Home overlay (small, topmost) — PS toggle, auto-open target
+├── Home screen (full-screen hub; topmost over desktop/games, never over managed apps)
 │   ├── Launcher (always)
 │   └── Browser (or install tile) — Triangle opens actions/Info
 ├── Launcher app (Normal window — games, scan, art; browser fields removed)
 └── Browser app (Normal fullscreen window — own engine + chrome)
 ```
 
-Home is modal: owns the pad while open; the underlying app keeps its last frame
-but takes no input. Close (PS/Circle/launch) returns focus to the previous app.
+Home is a peer screen: PS dismisses/restores the current screen, Circle
+returns to Home, and launching a tile closes Home before the app comes
+forward. PS never stacks Home over a running Launcher/Browser.
 
 ## Phases (each lands green; `bash scripts/ci.sh`)
 

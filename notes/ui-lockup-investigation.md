@@ -73,7 +73,7 @@ Shell client mode has no local `INPUT_SNAPSHOT` (`shell: client mode (service ow
 - `hid-diag: worker stall kind=op|idle last_op=... gap_ms=... tier=250|500|1000|2000|5000`
 - `start-nav: no … snapshot` / `snapshot restored` / `snapshot stale`
 - `ui-diag: pad-input stall` / `pad-poll stall` / `pad-poll slow` / `process-enum`
-- `ui-diag: launcher cursor hide` / `start cursor show` — immersive idle cursor hide (debug builds)
+- `ui-diag: shell cursor hide|show` — idle cursor hide shared by Home/Browser/Launcher (debug builds)
 - `HITCH_MARK kind=lightbar|input source=hotkey|button` — shell client also `client=1`
 - `shell: client mode (service owns HID + tray)` — local snapshot is unused; do not trust `NeverPublished` on F8 without `client=1`
 - `PANIC at file:line:col: …` — custom hook in [`app_log::init`](../src/platform/app_log.rs); required because `windows_subsystem = "windows"` discards stderr panic text (exit 101 with an empty console)

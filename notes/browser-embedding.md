@@ -76,9 +76,15 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   The URL well is 420–680px wide; equal side slots keep it centred with an 8px
   gap to each capsule. `BrowserPanel` owns the URL draft/edit state; the page
   starts below a 44px row + 1px rule.
+- `src/ui/browser/grid.rs` — Share/Create tab grid: pure card/bookmark layout,
+  frozen visual order, star overlay, and the FLIP transition over the existing
+  per-tab `FrameSlot` texture. The engine viewport is never resized; the card
+  aspect is the live page aspect, so content does not reflow or stretch.
 - `src/app/browser.rs` — top-level `BrowserAppState`, window lifecycle,
-  pad/key routing, URL editor (`OskTarget::BrowserUrl`), and `BrowserMessage`
-  reducer.
+  pad/key routing, URL editor (`OskTarget::BrowserUrl`), tab operations, grid
+  reducer, and `BrowserMessage` reducer. Tab open/switch/close helpers live
+  beside the Launcher browser glue (`open_browser_tab`, `activate_browser_tab`,
+  `close_browser_tab`).
 
 ## Current input/UX contract (pad)
 
@@ -109,17 +115,18 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
   window size from `window::resize_events()` rather than a creation-time
   `window::size()` query, which can return the pre-fullscreen default.
 
-PS opens the topmost Home over Launcher, Browser, or a game; while Home is
-open it owns pad input and the app underneath is gated. Selecting Browser
-closes Home and opens the standalone fullscreen Browser window. Browser close
-(Circle with no modal, or Home/PS) suspends the engine and returns focus to
-Launcher when it is visible. Circle cancels an active URL edit instead of
-closing; Escape cancels the edit but never closes.
+PS is a screen hide/resume toggle: while Browser owns the pad a PS press
+dismisses the window to the desktop (engine suspended, cached page and grid
+state preserved) and the next PS restores the same Browser. Circle from the
+page (no active URL edit) suspends the Browser and returns to the Home screen;
+Home is a peer full-screen surface, never an overlay on a running managed app.
+Circle cancels an active URL edit instead of leaving; Escape cancels the edit
+but never leaves.
 
 Input priority is **Home → Browser → Launcher**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
-sees browser presses. PS is checked in the Browser pad path too, so it opens
-Home over Browser exactly like over Launcher.
+sees browser presses. PS is checked in the Browser pad path too, so it
+dismisses the Browser exactly like the Launcher.
 
 Face/Options/Create/L3/R3 taps are normalized at the HID source by
 `domain::pad::PadInterpreter`: raw drained reports are debounced, and ordered
@@ -152,7 +159,22 @@ meters still use the legacy per-surface bank.
   semantic back/forward/reload actions from the OS binding table (tap only);
   L3 toggles magnet; R3 dumps an issue bundle. Circle suspends/closes the
   Browser when no URL edit owns the pad (if editing, it cancels the edit
-  first); Escape cancels the edit only. Home/PS also closes.
+  first); Escape cancels the edit only. PS dismisses to desktop; Circle goes
+  to Home.
+- **Share/Create toggles the tabs view.** It has no Browser header. D-pad and
+  the left stick move card focus through the shared per-pad `NavBank` (MENU
+  deadzone/repeat/neutral grace/arming); Cross expands the focused
+  card (or the plus card/new tab/bookmark), Square closes the focused tab,
+  Triangle toggles its bookmark, Down from the last card row enters the
+  bookmark strip, and Share/Circle leaves back to the active page. L1/R1 swap
+  pages (chevron buttons do the same); right stick scrolls the bookmark strip.
+  Mouse click/wheel work. L1/R1/Options page-history actions are disabled while
+  tabs view owns the surface. Slot 0 is always the plus card; 11 tabs per page;
+  card and plus aspect matches the live page aspect. The FLIP overlay reuses
+  the tab's `FrameSlot`; the engine is not resized, so page pixels/aspect are
+  exact. Background tabs show their last painted frame; restored unopened tabs
+  show a card placeholder. Each card has a bottom title footer with ellipsis,
+  and a Launcher-style glass island shows the action hints.
 - Real keyboard input goes to the page as `RAWKEYDOWN` + `CHAR` + `KEYUP`
   (text needs the separate `CHAR` leg). `Ctrl+R` and `Alt+Left`/`Alt+Right`
   stay app shortcuts; while the URL well is editing, printable keys/backspace/
@@ -180,17 +202,19 @@ meters still use the legacy per-surface bank.
   `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.screenshot`
   steps and closes the Browser window at `replay.done`; never use OS input
   injection for QA and do not leave test windows on screen.
-- v0 is single-tab with one header row (`‹ L1` · URL well · `R1 ›`). History
+- v0 is multi-tab with one header row (`‹ L1` · URL well · `R1 ›`). History
   hints enable on either source: CEF capability
   or the canonical session stack, so a post-commit capability lag cannot dim
   Back while it still works.
   The URL well ellipsizes long URLs at the end; while editing it shows the
-  draft tail (leading ellipsis) so the caret stays visible. Tab/session/
-  bookmark backends and the exact DevTools history-jump path stay dormant for
-  the redesign; no tab strip, bookmark/history UI, or status chrome is
-  rendered. The last page persists to `tabs.json` and is restored on open
-  (crash-restart boots use the default page).
-- The saved page is not written until the first Browser open has restored
+  draft tail (leading ellipsis) so the caret stays visible. The full strip
+  restores from `tabs.json` (active page live, background tabs dormant until
+  first activation) and every tab operation rewrites it. Popups remain denied.
+  Share/Create opens the animated tab grid; Cross on a card expands it back to
+  the page, Square closes it, Triangle toggles its bookmark, and the bookmark
+  strip below the grid scrolls horizontally. The URL editor remains Triangle;
+  no tab strip/bookmark/history/status chrome is rendered in page mode.
+- The saved strip is not written until the first Browser open has restored
   it. The engine preloads the saved active URL at boot and its early
   `TitleChanged`/`UrlChanged` events used to persist a one-tab file before
   the restore read it; `BrowserAppState::tabs_restored` gates that.

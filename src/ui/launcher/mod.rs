@@ -4,7 +4,6 @@ pub mod art_worker;
 pub mod browser_frame;
 pub mod chrome;
 pub mod clock;
-pub mod cursor_hide;
 pub mod gesture;
 pub mod icon_cache;
 pub mod idle;

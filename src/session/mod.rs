@@ -77,6 +77,9 @@ pub enum SessionEffect {
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyContext {
     pub home_visible: bool,
+    /// A managed app (Launcher/Browser) owns the screen. Auto-open must never
+    /// interrupt it, and Home is a peer screen rather than an overlay.
+    pub managed_app_visible: bool,
     pub fullscreen: bool,
     pub now: Instant,
     pub lightbar_enabled: bool,
@@ -255,6 +258,7 @@ impl DeviceSession {
                 !prev_present,
                 next_present,
                 ctx.home_visible,
+                ctx.managed_app_visible,
                 self.cooldown_active(ctx.now),
                 ctx.fullscreen,
             )
@@ -429,6 +433,7 @@ mod tests {
     fn ctx(home_visible: bool) -> ApplyContext {
         ApplyContext {
             home_visible,
+            managed_app_visible: false,
             fullscreen: false,
             now: Instant::now(),
             lightbar_enabled: false,
@@ -487,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn no_auto_open_when_managed_app_visible() {
+        let mut session = session_with(HomeAutoOpen::Any);
+        let mut ctx = ctx(false);
+        ctx.managed_app_visible = true;
+        let effects = session.apply_controllers(vec![bt_pad("aa")], ctx);
+        assert!(!has_open_home(&effects));
+        assert!(queued_bodies(&effects).contains(&"Connected".to_string()));
+    }
+
+    #[test]
     fn auto_open_never_never_opens_but_still_toasts() {
         let mut session = session_with(HomeAutoOpen::Never);
         let effects = session.apply_controllers(vec![bt_pad("aa")], ctx(false));
@@ -504,6 +519,7 @@ mod tests {
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
             home_visible: false,
+            managed_app_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,
@@ -541,6 +557,7 @@ mod tests {
         let t0 = Instant::now();
         let ctx_at = |now: Instant| ApplyContext {
             home_visible: false,
+            managed_app_visible: false,
             fullscreen: false,
             now,
             lightbar_enabled: false,

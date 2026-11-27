@@ -30,10 +30,17 @@ pub fn should_auto_open_home(
     previous_empty: bool,
     next_nonempty: bool,
     already_open: bool,
+    managed_app_visible: bool,
     cooldown_active: bool,
     fullscreen: bool,
 ) -> bool {
-    enabled && previous_empty && next_nonempty && !already_open && !cooldown_active && !fullscreen
+    enabled
+        && previous_empty
+        && next_nonempty
+        && !already_open
+        && !managed_app_visible
+        && !cooldown_active
+        && !fullscreen
 }
 
 /// Close Home when qualifying presence drops 1→0 while the window is visible.
@@ -170,20 +177,31 @@ mod tests {
 
     #[test]
     fn opens_on_clean_zero_to_one() {
-        assert!(should_auto_open_home(true, true, true, false, false, false));
+        assert!(should_auto_open_home(
+            true, true, true, false, false, false, false
+        ));
     }
 
     #[test]
-    fn skips_when_disabled_empty_open_cooldown_or_fullscreen() {
+    fn skips_when_disabled_empty_open_cooldown_fullscreen_or_app_open() {
         assert!(!should_auto_open_home(
-            false, true, true, false, false, false
+            false, true, true, false, false, false, false
         ));
         assert!(!should_auto_open_home(
-            true, false, true, false, false, false
+            true, false, true, false, false, false, false
         ));
-        assert!(!should_auto_open_home(true, true, true, true, false, false));
-        assert!(!should_auto_open_home(true, true, true, false, true, false));
-        assert!(!should_auto_open_home(true, true, true, false, false, true));
+        assert!(!should_auto_open_home(
+            true, true, true, true, false, false, false
+        ));
+        assert!(!should_auto_open_home(
+            true, true, true, false, true, false, false
+        ));
+        assert!(!should_auto_open_home(
+            true, true, true, false, false, true, false
+        ));
+        assert!(!should_auto_open_home(
+            true, true, true, false, false, false, true
+        ));
     }
 
     #[test]
@@ -201,7 +219,7 @@ mod tests {
         let prev = has_home_presence(&[], false);
         let next = has_home_presence(&[usb_pad("aa:bb")], false);
         assert!(!should_auto_open_home(
-            true, !prev, next, false, false, false
+            true, !prev, next, false, false, false, false
         ));
     }
 
@@ -212,7 +230,7 @@ mod tests {
         assert!(!prev);
         assert!(next);
         assert!(should_auto_open_home(
-            true, !prev, next, false, false, false
+            true, !prev, next, false, false, false, false
         ));
     }
 
@@ -239,6 +257,7 @@ mod tests {
             true,
             !has_home_presence(&[], true),
             has_home_presence(&usb, true),
+            false,
             false,
             false,
             false

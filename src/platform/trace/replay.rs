@@ -54,6 +54,12 @@ impl ReplayPlan {
         self.steps.get(self.index).map(|step| step.app.as_str())
     }
 
+    /// Action of the next step, for replay driver exceptions (screen
+    /// transitions must not auto-open the Browser).
+    pub fn peek_action(&self) -> Option<&str> {
+        self.steps.get(self.index).map(|step| step.action.as_str())
+    }
+
     pub fn next_step(&mut self) -> Option<ReplayStep> {
         let step = self.steps.get(self.index).cloned();
         if step.is_some() {

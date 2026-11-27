@@ -45,6 +45,25 @@ pub enum BrowserMessage {
         dy: i32,
     },
     Scrolled(f32),
+    /// Share/Create toggles the tab grid.
+    ToggleGrid,
+    /// Mouse/card activation (visual card identity, never an index).
+    GridActivate(crate::browser::engine::TabId),
+    /// Mouse clicked the plus card.
+    GridOpenPlus,
+    /// Mouse clicked a card's close affordance.
+    GridCloseTab(crate::browser::engine::TabId),
+    /// Mouse clicked a card's star.
+    GridToggleBookmark(crate::browser::engine::TabId),
+    /// Mouse clicked a bookmark chip.
+    GridOpenBookmark(usize),
+    /// Grid transition finished (generation-guarded).
+    GridAnimDone(u64),
+    /// Track the bookmark strip offset for focus chasing.
+    BookmarksScrolled(f32),
+    /// Page chevrons / L1/R1 in tabs view.
+    GridPagePrev,
+    GridPageNext,
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
     /// Debug replay: capture after the scheduled settle delay.
@@ -66,7 +85,15 @@ impl BrowserMessage {
             | Self::PageRelease
             | Self::PagePointerLeft
             | Self::PageWheel { .. } => None,
-            Self::Scrolled(_) => None,
+            Self::Scrolled(_) | Self::GridAnimDone(_) | Self::BookmarksScrolled(_) => None,
+            Self::GridPagePrev => Some("browser.grid.page_prev"),
+            Self::GridPageNext => Some("browser.grid.page_next"),
+            Self::ToggleGrid => Some("browser.grid.toggle"),
+            Self::GridActivate(_) => Some("browser.tab.switch"),
+            Self::GridOpenPlus => Some("browser.tab.open"),
+            Self::GridCloseTab(_) => Some("browser.tab.close"),
+            Self::GridToggleBookmark(_) => Some("browser.bookmark.toggle"),
+            Self::GridOpenBookmark(_) => Some("browser.bookmark.open"),
             #[cfg(debug_assertions)]
             Self::Shot(_) | Self::Capture => None,
         }
@@ -480,20 +507,27 @@ pub fn root_view(
     stage_h: f32,
     backdrop_alpha: f32,
     cursor: CursorSurfaceSpec,
+    cursor_hidden: bool,
 ) -> Element<'_, BrowserMessage> {
     let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
     let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
-    let card = container(browser_view(
-        panel,
-        engine_available,
-        page_w,
-        page_h,
-        cursor,
-    ))
-    .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
-    .style(theme::menu_panel)
-    .width(Length::Fixed(layout.card_w))
-    .height(Length::Fixed(layout.card_h));
+    let in_grid = panel.grid.mode != crate::ui::browser::grid::GridMode::Page;
+    let page_surface: Element<'_, BrowserMessage> = if in_grid {
+        // Tabs view has no header; it uses the full card interior.
+        crate::ui::browser::grid::page_view(
+            panel,
+            engine_available,
+            page_w,
+            page_h + BROWSER_HEADER_TOTAL,
+        )
+    } else {
+        browser_view(panel, engine_available, page_w, page_h, cursor)
+    };
+    let card = container(page_surface)
+        .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
+        .style(theme::menu_panel)
+        .width(Length::Fixed(layout.card_w))
+        .height(Length::Fixed(layout.card_h));
     let transparent = crate::ui::chrome::transparent_windows();
     let root: Element<'_, BrowserMessage> = container(card)
         .width(Fill)
@@ -512,12 +546,12 @@ pub fn root_view(
             ..container::Style::default()
         })
         .into();
-    // Controller mode owns the sole pointer (pad ring); a real mouse shows the
-    // OS cursor with CEF's hover shape instead. Automated sessions never hide
+    // The native pointer is owned by the shell cursor clock (idle hide) and
+    // the browser's controller-vs-mouse mode. Automated sessions never hide
     // the host cursor.
-    let surface: Element<'_, BrowserMessage> = crate::ui::launcher::cursor_hide::force_cursor(
+    let surface: Element<'_, BrowserMessage> = crate::ui::cursor_hide::force_cursor(
         root,
-        !panel.page_mouse_active && !crate::platform::debug_quiet::input_dropped(),
+        cursor_hidden && !crate::platform::debug_quiet::input_dropped(),
     )
     .into();
     let card_x = (stage_w - layout.card_w) * 0.5;
@@ -530,7 +564,8 @@ pub fn root_view(
         ),
         iced::Size::new(1.0, 1.0),
     );
-    let ime_enabled = !crate::platform::debug_quiet::input_dropped()
+    let ime_enabled = !in_grid
+        && !crate::platform::debug_quiet::input_dropped()
         && !panel.url_editing
         && panel.session.has_frame();
     crate::ui::input_method::ime_bridge(surface, ime_enabled, cursor)

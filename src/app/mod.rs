@@ -52,8 +52,8 @@ use crate::ui::configure::{
     self as configure_view, AnalyticsPanel, ConfigureMessage, ConfigureState, PadInputPanel,
     Section,
 };
+use crate::ui::cursor_hide;
 use crate::ui::launcher::art_worker::ArtOwner;
-use crate::ui::launcher::cursor_hide;
 use crate::ui::launcher::gesture::{self, ChordReleaseGate};
 use crate::ui::launcher::input::{
     self as launcher_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavBank,
@@ -117,8 +117,9 @@ const SNAPSHOT_STALE_MS: u128 = 100;
 const LAUNCHER_NAV_NOT_READY_MS: u128 = 200;
 /// Ignore Launcher WindowUnfocused briefly after reveal (toast z-order focus blips).
 const LAUNCHER_UNFOCUS_GRACE: Duration = Duration::from_millis(150);
-/// Hide the mouse cursor after this idle while immersive Launcher covers the primary.
-const LAUNCHER_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
+/// Hide the native cursor after this idle on Home/Browser/Launcher. One shell
+/// cursor state spans all three screens, so swapping screens never re-shows it.
+const SHELL_CURSOR_IDLE_HIDE: Duration = Duration::from_secs(2);
 /// Kick Steam scan if Launcher never opened / settled (tray-only boot).
 const STEAM_SCAN_IDLE_FALLBACK: Duration = Duration::from_secs(2);
 
@@ -267,12 +268,17 @@ pub enum Message {
     /// Deferred Launcher HWND destruction (second close phase; see
     /// `launcher_close_armed`). Lets the cursor-restore present land first.
     FinishStartClose,
+    /// Deferred Browser HWND destruction (cursor-restore present lands first).
+    FinishBrowserClose,
     /// Drive launcher animation frames.
     LauncherFrame,
-    /// Low-rate idle timer (cursor hide / sleep) while no animation needs frames.
+    /// Low-rate idle timer (sleep/dim) while no animation needs frames.
     LauncherIdleTick,
-    /// Mouse move/button/wheel on a window — resets start activity (cursor + idle/sleep).
-    LauncherCursorActivity(window::Id),
+    /// Low-rate shell cursor clock: hides the native pointer after idle on any
+    /// of Home/Browser/Launcher, and restores it when all three are gone.
+    ShellCursorTick,
+    /// Mouse move/button/wheel on a window — resets shell cursor and start activity.
+    ShellCursorActivity(window::Id),
     /// Single-flight art worker milestone (selected / near / job done).
     LauncherArtEvent(crate::ui::launcher::art_worker::ArtEvent),
     Launcher(LauncherMessage),
@@ -407,9 +413,11 @@ impl Message {
             | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
+            | Message::FinishBrowserClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
-            | Message::LauncherCursorActivity(_)
+            | Message::ShellCursorTick
+            | Message::ShellCursorActivity(_)
             | Message::LauncherArtEvent(_)
             | Message::BrowserEngine(_)
             | Message::SteamScanDone(_)
@@ -541,8 +549,10 @@ impl Message {
             | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
+            | Message::FinishBrowserClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
+            | Message::ShellCursorTick
             | Message::BrowserHistoryTimeout
             | Message::OskOpened(_)
             | Message::EngineInstallDone { .. }
@@ -570,7 +580,7 @@ impl Message {
             | Message::Launcher(_)
             | Message::BrowserRawKey { .. }
             | Message::BrowserIme { .. }
-            | Message::LauncherCursorActivity(_)
+            | Message::ShellCursorActivity(_)
             | Message::Osk(_)
             | Message::PadInput(_) => true,
             Message::LauncherKey { .. } => true,
@@ -756,6 +766,12 @@ pub struct App {
     home_window: Option<window::Id>,
     /// True while Home is revealed; modal owner of pad input.
     home_visible: bool,
+    /// Screen PS dismissed and the next PS restores. `None` = next PS opens
+    /// Home. Circle/tile transitions clear it so a stale screen never resurfaces.
+    ps_resume: Option<home::ShellScreen>,
+    /// A PS resume was requested while the Launcher window was still closing;
+    /// the WindowClosed path retries it.
+    ps_resume_pending: bool,
     /// Actual logical size of Home window (always the monitor cover).
     home_stage: (f32, f32),
     /// Home HWND is created hidden until its final size + DWM transition
@@ -772,6 +788,10 @@ pub struct App {
     /// OS first. Destroying a hidden-cursor window skips that push and
     /// leaks a global `ShowCursor(FALSE)` (winit only pushes on change).
     launcher_close_armed: bool,
+    /// Browser equivalent: destruction waits one loop pass when the last shell
+    /// screen is closing with a hidden cursor, so the visible interaction can
+    /// present before the HWND is destroyed.
+    browser_close_armed: bool,
     /// Last Launcher-window paint (for the transition paint-gap witness;
     /// `Cell` because `view()` only gets `&self`).
     last_start_paint_at: std::cell::Cell<Option<Instant>>,
@@ -798,14 +818,18 @@ pub struct App {
     crash_restart_boot: bool,
     /// Last user activity on Launcher (mouse / keyboard / pad) for idle/sleep.
     launcher_last_activity: Instant,
-    /// Last mouse activity on Launcher (cursor hide only — pad must not unhide).
-    launcher_cursor_last_active: Instant,
+    /// Last shell-screen (Home/Browser/Launcher) mouse activity; one clock for
+    /// all three so a screen swap does not re-show the pointer.
+    shell_cursor_last_active: Instant,
     /// When the PS Home opened over a visible Launcher. On Home close, Launcher's
     /// animation stamps and idle clock are shifted forward by this pause so
     /// the frozen splash art resumes instead of snapping ahead.
     launcher_home_pause: Option<Instant>,
-    /// When true, Launcher view forces [`mouse::Interaction::Hidden`].
-    launcher_cursor_hidden: bool,
+    /// When true, every shell view forces [`mouse::Interaction::Hidden`].
+    shell_cursor_hidden: bool,
+    /// A shell screen is opening (Home/Browser/Launcher). Keeps the cursor
+    /// hidden across a swap before the replacement window exists.
+    shell_opening: bool,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
     launcher_file_dialog_open: bool,
     /// After open / hide: ignore reopen until a debounced full release.
@@ -1201,12 +1225,15 @@ impl App {
             browser_backdrop_fade: None,
             home_window: None,
             home_visible: false,
+            ps_resume: None,
+            ps_resume_pending: false,
             home_stage: (crate::ui::home::HOME_WIDTH, crate::ui::home::HOME_HEIGHT),
             home_pending_show: false,
             home_shell_anim: None,
             home_monitor_cover: None,
             home_state: crate::ui::home::State::default(),
             launcher_close_armed: false,
+            browser_close_armed: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
             launcher_nav_ready: false,
@@ -1225,9 +1252,10 @@ impl App {
             launcher_monitor_cover: None,
             crash_restart_boot,
             launcher_last_activity: Instant::now(),
-            launcher_cursor_last_active: Instant::now(),
+            shell_cursor_last_active: Instant::now(),
             launcher_home_pause: None,
-            launcher_cursor_hidden: false,
+            shell_cursor_hidden: false,
+            shell_opening: false,
             launcher_file_dialog_open: false,
             chord_release_gate: ChordReleaseGate::default(),
             home_face_latch_until: None,
@@ -1315,7 +1343,7 @@ impl App {
         // frame so it never appears near the top-left corner.
         app.browser.panel.cursor.reset_for_page();
 
-        // Disk-persisted bookmarks stay loaded as dormant data (no v0 UI).
+        // Disk-persisted bookmarks feed the Share grid star and bookmark row.
         app.browser.panel.bookmarks = crate::browser::bookmarks::load();
 
         // Show the tray immediately; the daemon owns it for its whole lifetime.
@@ -1584,8 +1612,8 @@ impl App {
                         | mouse::Event::ButtonPressed(_)
                         | mouse::Event::ButtonReleased(_)
                         | mouse::Event::WheelScrolled { .. },
-                    ) => Some(Message::LauncherCursorActivity(id)),
-                    iced::Event::Touch(_) => Some(Message::LauncherCursorActivity(id)),
+                    ) => Some(Message::ShellCursorActivity(id)),
+                    iced::Event::Touch(_) => Some(Message::ShellCursorActivity(id)),
                     iced::Event::InputMethod(event) => Some(Message::BrowserIme { id, event }),
                     _ => None,
                 }
@@ -1720,10 +1748,18 @@ impl App {
             }
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::LauncherFrame));
         } else if self.launcher_visible && !self.home_visible && !self.osk.state.open {
-            // No animation needs frames: keep the wall-clock idle/sleep and
-            // cursor-hide state moving at 2Hz instead of a 60Hz ambient tick.
+            // No animation needs frames: keep the wall-clock idle/sleep state
+            // moving at 2Hz instead of a 60Hz ambient tick.
             subscriptions.push(
                 iced::time::every(Duration::from_millis(500)).map(|_| Message::LauncherIdleTick),
+            );
+        }
+        // One native-cursor clock for the whole shell. It keeps running across
+        // Launcher/Home/Browser swaps and is the only thing that hides/shows
+        // the pointer while a shell screen is visible.
+        if self.home_visible || self.browser_visible || self.launcher_visible {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(500)).map(|_| Message::ShellCursorTick),
             );
         }
         // A history jump that never reports a landing/error must still settle.
@@ -1885,6 +1921,7 @@ impl App {
                 h,
                 backdrop_alpha,
                 cursor,
+                self.shell_cursor_hidden || !self.browser.panel.page_mouse_active,
             )
             .map(Message::Browser);
         }
@@ -1911,12 +1948,15 @@ impl App {
             // overwrites that window with the scrim, so draw the same card in
             // Home's full-screen window too. The HWND toast is hidden in
             // this mode, so there is no duplicate.
-            if self.home_stage.0 > crate::ui::home::HOME_WIDTH + 1.0
+            let home_surface: Element<'_, Message> = if self.home_stage.0
+                > crate::ui::home::HOME_WIDTH + 1.0
                 && let Some(toast) = self.immersive_toast_overlay()
             {
-                return stack![home_panel, toast].width(Fill).height(Fill).into();
-            }
-            return home_panel;
+                stack![home_panel, toast].width(Fill).height(Fill).into()
+            } else {
+                home_panel
+            };
+            return cursor_hide::force_cursor(home_surface, self.shell_cursor_hidden).into();
         }
 
         if Some(window) == self.launcher_window {
@@ -1985,11 +2025,7 @@ impl App {
                 Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
                 None => start,
             };
-            return cursor_hide::force_cursor(
-                start,
-                self.launcher_cursor_hidden && self.launcher_visible,
-            )
-            .into();
+            return cursor_hide::force_cursor(start, self.shell_cursor_hidden).into();
         }
 
         if Some(window) == self.toast_window {
@@ -2106,12 +2142,10 @@ impl App {
                 crate::controller::hid::diag::diag_info(format!("ui-diag: tray menu {id}"));
                 match id.as_str() {
                     SETTINGS_ID => {
-                        // Tray engaged while Launcher is up: the press never reaches
-                        // Launcher (taskbar sits above the cover), so unhide here or
-                        // the native menu opens under a hidden cursor.
-                        if self.launcher_visible {
-                            self.note_start_cursor_activity();
-                        }
+                        // Tray engaged while a shell screen is up: the press never
+                        // reaches it (taskbar sits above the cover), so unhide here
+                        // or the native menu opens under a hidden cursor.
+                        self.note_shell_cursor_activity();
                         self.open_configure()
                     }
                     QUIT_ID => self.update(Message::Exit),
@@ -2121,9 +2155,7 @@ impl App {
             Message::TrayLeftClick(anchor) => {
                 crate::controller::hid::diag::diag_info("ui-diag: tray left-click");
                 self.tray_anchor = anchor;
-                if self.launcher_visible {
-                    self.note_start_cursor_activity();
-                }
+                self.note_shell_cursor_activity();
                 self.toggle_popup()
             }
 
@@ -2274,11 +2306,18 @@ impl App {
 
             Message::LauncherOpened(id) => self.on_start_opened(id),
             Message::FinishStartClose => self.finish_start_close(),
+            Message::FinishBrowserClose => {
+                if self.browser_close_armed {
+                    self.browser_close_armed = false;
+                    self.finish_browser_window_close()
+                } else {
+                    Task::none()
+                }
+            }
             Message::LauncherArtEvent(ev) => self.on_start_art_event(ev),
             Message::LauncherFrame => self.on_start_frame(),
             Message::LauncherIdleTick => {
                 let now = Instant::now();
-                self.tick_start_cursor_idle(now);
                 if self.tick_start_idle(now) {
                     self.pad_nav.prepare_on_open(false);
                     crate::controller::hid::diag::diag_info(
@@ -2287,11 +2326,18 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LauncherCursorActivity(id) => {
+            Message::ShellCursorTick => {
+                self.tick_shell_cursor_idle(Instant::now());
+                Task::none()
+            }
+            Message::ShellCursorActivity(id) => {
                 if !crate::platform::debug_quiet::input_dropped() {
                     let close = self.close_osk("mouse");
-                    if Some(id) == self.launcher_window && self.launcher_visible {
-                        self.note_start_cursor_activity();
+                    let on_shell = (Some(id) == self.launcher_window && self.launcher_visible)
+                        || (Some(id) == self.browser_window && self.browser_visible)
+                        || (Some(id) == self.home_window && self.home_visible);
+                    if on_shell {
+                        self.note_shell_cursor_activity();
                     }
                     if Some(id) == self.browser_window && self.browser_visible {
                         // Any real pointer activity on the Browser window wins
@@ -2407,6 +2453,23 @@ impl App {
     // returns `Task<Message>` exactly like its arm did. No logic change.
     // -----------------------------------------------------------------------
 
+    /// Backstop for OS-initiated closes: once no shell window remains, drop the
+    /// opening flag and restore the pointer. A visible replacement screen keeps
+    /// the cursor state untouched so swaps stay hidden.
+    fn restore_cursor_if_desktop(&mut self) {
+        if self.home_window.is_none()
+            && self.browser_window.is_none()
+            && self.launcher_window.is_none()
+            && !self.home_visible
+            && !self.browser_visible
+            && !self.launcher_visible
+        {
+            self.shell_opening = false;
+            self.reset_shell_cursor_clock();
+            self.set_shell_cursor_hidden(false);
+        }
+    }
+
     fn on_window_closed(&mut self, id: window::Id) -> Task<Message> {
         if Some(id) == self.popup_window {
             self.popup_window = None;
@@ -2418,11 +2481,13 @@ impl App {
         } else if Some(id) == self.browser_window {
             self.browser_window = None;
             self.browser_visible = false;
+            self.browser_close_armed = false;
             self.browser_monitor_cover = None;
             if self.browser.panel.session.is_open() {
                 let _ = self.close_browser_surface();
             }
-            Task::none()
+            self.restore_cursor_if_desktop();
+            self.maybe_resume_ps_after_close()
         } else if Some(id) == self.osk.window {
             self.on_osk_window_closed(id)
         } else if Some(id) == self.home_window {
@@ -2430,6 +2495,7 @@ impl App {
             self.home_visible = false;
             self.home_shell_anim = None;
             self.resume_launcher_after_home(Instant::now());
+            self.restore_cursor_if_desktop();
             // Return focus to Launcher when it is the app underneath. The toast
             // is AlwaysOnTop, so it stays above a normal-level Launcher without
             // re-raising anything.
@@ -2443,32 +2509,31 @@ impl App {
             {
                 return focus_window(start);
             }
-            Task::none()
+            self.maybe_resume_ps_after_close()
         } else if Some(id) == self.launcher_window {
             self.launcher_window = None;
             self.launcher_visible = false;
             self.launcher_close_armed = false;
             self.launcher_nav_ready = false;
             let rehost_toast = self.rehost_toast_after_composite();
+            let resume_ps = self.ps_resume_pending;
             // Close preserves all visual state (selection, dock, drawer,
             // scrolls, drafts, browser panel): the next open resumes where
             // it left off. Only the cursor-restore backstop and input
             // re-arming run here. Also covers the OS-close path, which
             // bypasses `close_launcher` entirely.
-            // Defensive: an OS-close path bypasses close_launcher's
-            // clear_start_activity, so never leak a Hidden interaction into
-            // a later window (the force_cursor gate above is the backstop).
-            self.set_start_cursor_hidden(false);
+            self.restore_cursor_if_desktop();
             self.pad_nav.reset();
             self.browser.dpad_stepper.reset();
             self.clear_start_nav_diag();
             self.consume_reopen_gesture_chord();
             let sync = rehost_toast.chain(self.sync_toast_zorder());
-            // The auto-open latch survives a close so a pending
-            // open can retry once presence still qualifies.
-            if self.session.auto_open_pending
+            if resume_ps {
+                sync.chain(self.maybe_resume_ps_after_close())
+            } else if self.session.auto_open_pending
                 && self.session.prefs.home_enabled
                 && self.session.prefs.home_auto_open.auto_opens()
+                && !self.browser_visible
                 && crate::session::has_home_presence(
                     &self.session.controllers,
                     self.session.prefs.home_auto_open.includes_usb(),
@@ -2532,6 +2597,7 @@ impl App {
 
     fn on_start_opened(&mut self, id: window::Id) -> Task<Message> {
         if Some(id) == self.launcher_window && self.launcher_visible {
+            self.shell_opening = false;
             self.launcher_nav_ready = true;
             self.nav_not_ready_warned = false;
             let now = Instant::now();
@@ -2714,7 +2780,6 @@ impl App {
         }
         self.sync_launcher_held();
         self.launcher_state.tick_hint_anims(now);
-        self.tick_start_cursor_idle(now);
         if self.tick_start_idle(now) {
             self.pad_nav.prepare_on_open(false);
             crate::controller::hid::diag::diag_info(
@@ -2927,8 +2992,7 @@ impl App {
         // change, and there is no later present). Restore only when the
         // OS reports hidden so a balanced counter is never disturbed.
         #[cfg(windows)]
-        if self.launcher_cursor_hidden && !crate::platform::win32::cursor_visible().unwrap_or(true)
-        {
+        if self.shell_cursor_hidden && !crate::platform::win32::cursor_visible().unwrap_or(true) {
             crate::controller::hid::diag::diag_info("ui-diag: exit cursor restore");
             unsafe { crate::platform::win32::show_cursor(true) };
         }
@@ -3152,6 +3216,7 @@ impl App {
                     .queue_launch_quiet(self.hid_worker.take_launch_serials());
                 let ctx = crate::session::ApplyContext {
                     home_visible: self.home_visible,
+                    managed_app_visible: self.browser_visible || self.launcher_visible,
                     fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
                     now: Instant::now(),
                     lightbar_enabled: self.claims.is_enabled(),
@@ -3194,6 +3259,14 @@ impl App {
                         crate::controller::hid::diag::diag_info(
                             "ui-diag: OpenHome ignored (automated input lock)",
                         );
+                    } else if self.browser_visible || self.launcher_visible {
+                        // Home is a peer screen: a controller connect must not
+                        // interrupt a running managed app.
+                        crate::controller::hid::diag::diag_info(
+                            "ui-diag: OpenHome ignored (managed app visible)",
+                        );
+                        self.session.auto_open_pending = false;
+                        self.toast_machine.clear_after();
                     } else if self.toast_machine.suppresses_reopen_gesture() {
                         // The reopen chord may fire during the connect-toast
                         // latch; the toast's own AfterToast::OpenHome still opens
@@ -3259,6 +3332,7 @@ impl App {
     fn apply_controllers(&mut self, controllers: Vec<ControllerStatus>) -> Task<Message> {
         let ctx = crate::session::ApplyContext {
             home_visible: self.home_visible,
+            managed_app_visible: self.browser_visible || self.launcher_visible,
             fullscreen: launcher_input::foreground_is_exclusive_fullscreen(),
             now: Instant::now(),
             lightbar_enabled: self.claims.is_enabled(),
@@ -3406,8 +3480,14 @@ impl App {
         mut events: Vec<NotifyEvent>,
         mut open_start_after: bool,
     ) -> Task<Message> {
-        let connect_open_start =
+        let mut connect_open_start =
             open_start_after && events.iter().any(|event| event.body == "Connected");
+        if connect_open_start && (self.browser_visible || self.launcher_visible) {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: auto-open suppressed (managed app visible)",
+            );
+            connect_open_start = false;
+        }
         // Auto-open never shows a Connected toast (cold-launch via
         // launch_quiet and hot connects must match). Session already filters,
         // but drop any that slipped through so behaviour is bullet-proof.

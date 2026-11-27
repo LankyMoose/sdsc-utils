@@ -1,8 +1,8 @@
-//! Browser app state: page state, cursor, text keyboard, and dormant tab data.
+//! Browser app state: page state, cursor, text keyboard, tab strip, grid, and
+//! bookmarks.
 //!
-//! v0 has a single header row (Back / URL / Forward). There is no tab strip,
-//! bookmark bar, history selector, or status chrome; tab/session/bookmark
-//! backends stay available for future contract work.
+//! Page mode has one header row (Back / URL / Forward). Share/Create swaps the
+//! page area for the tab grid (`grid.rs`); the header stays.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -112,8 +112,8 @@ pub struct StoredTab {
 #[derive(Debug, Clone)]
 pub struct BrowserPanel {
     /// Live page state: ALWAYS the active tab's. Swapped with `stored`
-    /// entries on switch (see `activate_stored`). v0 is single-tab and has
-    /// no switching UI; the dormant tab data stays for the future contract.
+    /// entries on switch (see `activate_stored`). The Share grid renders the
+    /// strip; background tabs stay dormant until first activation.
     pub page: BrowserTabPage,
     /// Background tabs (page state only; no chrome).
     pub stored: Vec<StoredTab>,
@@ -156,8 +156,8 @@ pub struct BrowserPanel {
     /// Browser debug overlay + shots (Diagnostics toggle / F10, mirrored
     /// from App). Never persisted.
     pub debug_overlay: bool,
-    /// Chrome-style bookmarks (disk-persisted, dormant in v0). Kept as data
-    /// for the future contract; no UI, bindings, or favicon chrome.
+    /// Chrome-style bookmarks (disk-persisted). The Share grid renders the
+    /// star state and the scrollable bookmark row.
     pub bookmarks: Vec<crate::browser::bookmarks::Bookmark>,
     /// Controller hint press state for the header row.
     pub l1_held: bool,
@@ -169,6 +169,8 @@ pub struct BrowserPanel {
     pub url_draft: String,
     /// First typed character replaces the prefilled URL (select-all semantics).
     pub url_replace_on_type: bool,
+    /// Share/Create tab-grid mode and FLIP transition.
+    pub grid: crate::ui::browser::grid::GridState,
 }
 
 impl std::ops::Deref for BrowserPanel {
@@ -223,6 +225,7 @@ impl Default for BrowserPanel {
             url_editing: false,
             url_draft: String::new(),
             url_replace_on_type: false,
+            grid: crate::ui::browser::grid::GridState::default(),
         }
     }
 }
@@ -372,6 +375,178 @@ impl BrowserPanel {
     /// Overwrite `tabs.json` with the current page.
     pub fn save_tabs(&self) {
         crate::browser::tabs::save(&self.snapshot_tabs());
+    }
+
+    /// Resolve any tab id to its page state (live or stored).
+    pub fn tab_page(&self, id: crate::browser::engine::TabId) -> Option<&BrowserTabPage> {
+        if id == self.active_tab {
+            Some(&self.page)
+        } else {
+            self.stored
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| &tab.page)
+        }
+    }
+
+    /// True when the tab has a live engine view (live tab always does).
+    pub fn tab_loaded(&self, id: crate::browser::engine::TabId) -> bool {
+        if id == self.active_tab {
+            true
+        } else {
+            self.stored
+                .iter()
+                .find(|tab| tab.id == id)
+                .is_some_and(|tab| tab.loaded)
+        }
+    }
+
+    /// Activate a stored tab. The old live page lands in the target's stored
+    /// slot under the old id (see [`Self::activate_stored`]).
+    pub fn activate_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
+        self.activate_stored(id)
+    }
+
+    /// Remove a non-live tab after activation swapped the old live page into
+    /// its slot. Also drops the closed id from the creation order.
+    pub fn remove_stored_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
+        let before_stored = self.stored.len();
+        let before_order = self.order.len();
+        self.stored.retain(|tab| tab.id != id);
+        self.order.retain(|tab| *tab != id);
+        self.stored.len() != before_stored || self.order.len() != before_order
+    }
+
+    /// Freeze the tab-grid visual order for a new session (active first).
+    pub fn refresh_grid_visual(&mut self) {
+        self.grid
+            .refresh_visual(self.active_tab, &self.order.clone());
+    }
+
+    /// Keep the frozen visual strip aligned after tab open/close.
+    pub fn sync_grid_visual(&mut self) {
+        if !self.grid.is_grid() {
+            return;
+        }
+        let valid: Vec<crate::browser::engine::TabId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| self.tab_page(*id).is_some())
+            .collect();
+        self.grid.visual.retain(|id| valid.contains(id));
+        for id in valid {
+            if !self.grid.visual.contains(&id) {
+                self.grid.visual.push(id);
+            }
+        }
+        if self.tab_page(self.active_tab).is_some() && !self.grid.visual.contains(&self.active_tab)
+        {
+            self.grid.visual.insert(0, self.active_tab);
+        }
+    }
+
+    /// Restore every persisted tab: the saved active page becomes the live
+    /// boot page (the engine preloaded its URL), the rest become dormant
+    /// stored pages that open their view on first activation. Returns false
+    /// when the saved strip has no usable tab.
+    pub fn restore_saved_strip(&mut self, saved: &crate::browser::tabs::SavedTabs) -> bool {
+        let tabs: Vec<&crate::browser::tabs::SavedTab> = saved
+            .tabs
+            .iter()
+            .filter(|tab| !tab.url.is_empty() && tab.url != crate::browser::BLANK_PAGE_URL)
+            .take(crate::browser::tabs::MAX_SAVED_TABS)
+            .collect();
+        self.stored.clear();
+        self.order.clear();
+        self.active_tab = crate::browser::engine::TabId::BOOT;
+        self.next_tab_id = 2;
+        self.reset_live_page();
+        if tabs.is_empty() {
+            self.order.push(crate::browser::engine::TabId::BOOT);
+            return false;
+        }
+        let active = saved
+            .tabs
+            .get(saved.active)
+            .and_then(|saved_active| tabs.iter().position(|tab| tab.url == saved_active.url))
+            .unwrap_or(0)
+            .min(tabs.len() - 1);
+        for (index, tab) in tabs.iter().enumerate() {
+            let title = (!tab.title.is_empty()).then(|| tab.title.clone());
+            if index == active {
+                self.page.session.begin_load(tab.url.clone());
+                if title.is_some() {
+                    self.page.session.note_title(title);
+                }
+                self.order.push(crate::browser::engine::TabId::BOOT);
+            } else {
+                let id = crate::browser::engine::TabId(self.next_tab_id);
+                self.next_tab_id += 1;
+                let mut page = BrowserTabPage::default();
+                page.session.note_url(tab.url.clone());
+                if title.is_some() {
+                    page.session.note_title(title);
+                }
+                self.stored.push(StoredTab {
+                    id,
+                    page,
+                    loaded: false,
+                });
+                self.order.push(id);
+            }
+        }
+        true
+    }
+
+    /// Create a fresh live tab after stashing the current page. Returns the
+    /// new id and the load generation the engine result must carry.
+    pub fn create_tab(&mut self, url: String) -> (crate::browser::engine::TabId, u64) {
+        self.stash_live();
+        let id = crate::browser::engine::TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        self.active_tab = id;
+        self.order.push(id);
+        self.reset_live_page();
+        self.page.session.open_surface();
+        let generation = self.page.session.begin_load(url);
+        (id, generation)
+    }
+
+    /// True when this URL has a bookmark entry.
+    pub fn is_bookmarked(&self, url: &str) -> bool {
+        self.bookmarks.iter().any(|bookmark| bookmark.url == url)
+    }
+
+    /// Add or remove the bookmark for `url`. Returns the new bookmarked state.
+    pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
+        if let Some(index) = self
+            .bookmarks
+            .iter()
+            .position(|bookmark| bookmark.url == url)
+        {
+            self.bookmarks.remove(index);
+            crate::browser::bookmarks::save(&self.bookmarks);
+            false
+        } else {
+            self.bookmarks.push(crate::browser::bookmarks::Bookmark {
+                url: url.to_string(),
+                title: title.to_string(),
+            });
+            crate::browser::bookmarks::save(&self.bookmarks);
+            true
+        }
+    }
+
+    /// Remove the bookmark at `index` (bookmark-row Triangle). Returns true
+    /// when one was removed.
+    pub fn remove_bookmark(&mut self, index: usize) -> bool {
+        if index >= self.bookmarks.len() {
+            return false;
+        }
+        self.bookmarks.remove(index);
+        crate::browser::bookmarks::save(&self.bookmarks);
+        true
     }
 
     pub fn toggle(&mut self) {
@@ -791,6 +966,73 @@ mod tests {
         assert!(panel.drop_stored(second));
         assert!(panel.stored.is_empty());
         assert!(!panel.drop_stored(crate::browser::engine::TabId::BOOT));
+    }
+
+    #[test]
+    fn restored_strip_keeps_active_live_and_others_dormant() {
+        let saved = crate::browser::tabs::SavedTabs {
+            tabs: vec![
+                crate::browser::tabs::SavedTab {
+                    url: "https://a.test/".into(),
+                    title: "A".into(),
+                },
+                crate::browser::tabs::SavedTab {
+                    url: "https://b.test/".into(),
+                    title: "B".into(),
+                },
+                crate::browser::tabs::SavedTab {
+                    url: "https://c.test/".into(),
+                    title: "C".into(),
+                },
+            ],
+            active: 1,
+        };
+        let mut panel = BrowserPanel::default();
+        assert!(panel.restore_saved_strip(&saved));
+        assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
+        assert_eq!(panel.session.url(), "https://b.test/");
+        assert_eq!(panel.session.title(), Some("B"));
+        assert_eq!(panel.order.len(), 3);
+        assert_eq!(panel.stored.len(), 2);
+        assert!(panel.stored.iter().all(|tab| !tab.loaded));
+        let urls: Vec<&str> = panel
+            .order
+            .iter()
+            .filter_map(|id| panel.tab_page(*id).map(|page| page.session.url()))
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["https://a.test/", "https://b.test/", "https://c.test/"]
+        );
+    }
+
+    #[test]
+    fn create_tab_stashes_live_and_foregrounds_new_page() {
+        let mut panel = BrowserPanel::default();
+        panel.session.begin_load("https://a.test/".to_string());
+        let (id, generation) = panel.create_tab("https://b.test/".to_string());
+        assert_ne!(id, crate::browser::engine::TabId::BOOT);
+        assert_eq!(panel.active_tab, id);
+        assert_eq!(panel.session.url(), "https://b.test/");
+        assert_eq!(panel.session.generation(), generation);
+        assert_eq!(panel.order, vec![crate::browser::engine::TabId::BOOT, id]);
+        assert_eq!(panel.stored.len(), 1);
+        assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
+        assert!(panel.tab_loaded(crate::browser::engine::TabId::BOOT));
+    }
+
+    #[test]
+    fn bookmark_match_is_exact_url() {
+        let panel = BrowserPanel {
+            bookmarks: vec![crate::browser::bookmarks::Bookmark {
+                url: "https://a.test/".into(),
+                title: "A".into(),
+            }],
+            ..BrowserPanel::default()
+        };
+        assert!(panel.is_bookmarked("https://a.test/"));
+        assert!(!panel.is_bookmarked("https://a.test/next"));
+        assert!(!panel.is_bookmarked(""));
     }
 
     #[test]

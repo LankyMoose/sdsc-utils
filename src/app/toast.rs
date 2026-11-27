@@ -305,6 +305,12 @@ impl App {
             );
             return Task::none();
         }
+        if self.browser_visible || self.launcher_visible {
+            crate::controller::hid::diag::diag_info(
+                "ui-diag: home open after toast skipped (managed app visible)",
+            );
+            return Task::none();
+        }
         if crate::session::should_flush_latched_home(
             true,
             self.session.prefs.home_enabled && self.session.prefs.home_auto_open.auto_opens(),

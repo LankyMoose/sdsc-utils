@@ -170,7 +170,7 @@ impl TransitionPhase {
 
 /// Footer Circle label for the main (non-modal) start chrome.
 pub fn cancel_circle_label(editing: bool) -> &'static str {
-    if editing { "Cancel" } else { "Close" }
+    if editing { "Cancel" } else { "Home" }
 }
 
 /// Ease-out cubic progress 0..=1 for elapsed/duration.
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn cancel_label_is_close_unless_editing() {
-        assert_eq!(cancel_circle_label(false), "Close");
+        assert_eq!(cancel_circle_label(false), "Home");
         assert_eq!(cancel_circle_label(true), "Cancel");
     }
 

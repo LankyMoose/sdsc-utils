@@ -110,6 +110,10 @@ Replay a flow in an isolated sandbox:
 sdsc-utils --trace-replay <session-id-or-dir> --flow 42
 ```
 
+A replay process uses a per-process singleton guard, so it can run alongside a
+live tray instance: its data dir is the isolated replay sandbox and its windows
+are forced offscreen. It never terminates the live app.
+
 The replay driver supports browser `navigate`, `history.back`,
 `history.forward`, `history.open`, `history.pick`, and `history.cancel`, plus
 synthetic input steps for automation:
@@ -126,11 +130,21 @@ synthetic input steps for automation:
 - `cursor.dock` — `{"x": 100, "y": 70}` attaches the virtual cursor to the
   page focusable under a point (QA setup for the Cross-opens-OSK path).
 - `pad.tap` — `{"button": "cross"}` injects one source-side pad tap through
-  the live owner (OSK first, then Browser/Launcher manual form).
+  the live owner (OSK first, then Browser/Launcher manual form). `create` /
+  `share` toggles the Browser tab grid from page mode.
 - `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap), or
   fires one complete Browser D-pad cursor nudge (press + release) when the
   Browser owns the pad. While the system OSK is open it queues a synthetic
   D-pad press/release for the pull-model keyboard.
+- `grid.open` / `grid.close` — debug-only direct Share grid enter/exit.
+  `grid.activate {"index": 0}` selects a frozen visual card, `grid.new_tab
+  {"url": ...}` opens a tab (replay-only URL override; production plus uses
+  the default page), `grid.close_tab {"index": 0}`, `grid.bookmark
+  {"index": 0}`, `grid.focus {"dir": "down"}`, and
+  `grid.page_prev` / `grid.page_next` drive the card/page actions.
+- `screen.ps` / `screen.home` — debug-only screen transitions: PS hide/resume
+  and Circle-to-Home. Supported from Browser and Launcher replay steps; replay
+  never auto-opens the Browser for these steps.
 - `osk.open` / `osk.close` — debug-only direct system-OSK open/close for QA.
 - `osk.screenshot` — debug-only one-shot capture of the OSK overlay window to
   `<data>/shots/osk-shot-*.png`; the screenshot keeps window alpha so pixel QA

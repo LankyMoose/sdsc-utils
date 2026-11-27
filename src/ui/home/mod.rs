@@ -919,6 +919,24 @@ impl State {
         self.install_error = None;
     }
 
+    /// PS resume: keep selection, focus, and open settings, but re-arm input
+    /// and refresh the installed/app state Home reads live.
+    pub fn rearm_on_open(&mut self, launcher_enabled: bool, engine_ready: bool) {
+        self.launcher_enabled = launcher_enabled;
+        self.engine_ready = engine_ready;
+        self.nav =
+            crate::domain::pad::NavStepper::with_profile(crate::domain::pad::NavProfile::MENU);
+        self.cross_held = false;
+        self.square_held = false;
+        self.triangle_held = false;
+        self.options_held = false;
+        self.create_held = false;
+        self.powering_off = None;
+        self.identify_flash = None;
+        self.reset_triangle_hold();
+        self.install_error = None;
+    }
+
     pub fn open_settings(&mut self) {
         self.settings_open = true;
         self.settings_focus = 0;
@@ -2790,6 +2808,20 @@ mod tests {
         assert_eq!(state.selected_tile(), HomeTile::Browser);
         state.select(99, now);
         assert_eq!(state.selected_tile(), HomeTile::Browser);
+    }
+
+    #[test]
+    fn rearm_keeps_resumed_home_state() {
+        let mut state = State::default();
+        state.select(1, Instant::now());
+        state.settings_open = true;
+        state.settings_focus = SETTINGS_VOLUME;
+        state.cross_held = true;
+        state.rearm_on_open(true, true);
+        assert_eq!(state.selected_tile(), HomeTile::Browser);
+        assert!(state.settings_open);
+        assert_eq!(state.settings_focus, SETTINGS_VOLUME);
+        assert!(!state.cross_held);
     }
 
     #[test]

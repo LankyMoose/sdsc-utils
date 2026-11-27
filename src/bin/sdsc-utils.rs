@@ -135,23 +135,20 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if replay.is_some() {
-        // Replay is diagnostic: never terminate a live app just to run it.
-        let free = SingleInstance::new(PKG_NAME)
-            .map(|instance| instance.is_single())
-            .unwrap_or(false);
-        if !free {
-            attach_console_for_cli();
-            eprintln!("error: close the running SDSC Utils instance before replay");
-            return ExitCode::FAILURE;
-        }
-    }
+    // Replay is diagnostic: never terminate a live app. A unique guard lets a
+    // sandboxed replay run alongside the user's tray instance; the sandbox
+    // data dir and offscreen windows keep the two isolated.
+    let guard_name = if replay.is_some() {
+        format!("{PKG_NAME}-replay-{}", std::process::id())
+    } else {
+        PKG_NAME.to_string()
+    };
 
     // The guard must be held for the whole process lifetime. A renderer
     // reload (`--replace`) spawns its successor before exiting, so the child
     // waits briefly while the parent exits. A fresh launch instead
     // terminates the predecessor and takes over (see `prev_instance`).
-    let _instance = match acquire_single_instance(replacing) {
+    let _instance = match acquire_single_instance(&guard_name, replacing) {
         Ok(instance) => instance,
         Err(code) => return code,
     };
@@ -174,9 +171,9 @@ fn main() -> ExitCode {
 /// A fresh tray launch takes over: it terminates the running predecessor,
 /// then retries while the OS releases the guard. A `--replace` child is
 /// spawned by its gracefully-exiting parent, so it only waits.
-fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> {
+fn acquire_single_instance(name: &str, replacing: bool) -> Result<SingleInstance, ExitCode> {
     // Fast path: no predecessor holds the guard.
-    match SingleInstance::new(PKG_NAME) {
+    match SingleInstance::new(name) {
         Ok(instance) if instance.is_single() => return Ok(instance),
         Ok(_) => {}
         Err(err) => {
@@ -185,7 +182,7 @@ fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> 
         }
     }
 
-    if !replacing {
+    if !replacing && name == PKG_NAME {
         sdsc_utils::platform::prev_instance::terminate_previous_instances();
     }
 
@@ -194,7 +191,7 @@ fn acquire_single_instance(replacing: bool) -> Result<SingleInstance, ExitCode> 
     let attempts = if replacing { 100 } else { 50 };
     for _ in 0..attempts {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        match SingleInstance::new(PKG_NAME) {
+        match SingleInstance::new(name) {
             Ok(instance) => {
                 if instance.is_single() {
                     return Ok(instance);

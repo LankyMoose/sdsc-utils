@@ -18,6 +18,29 @@ pub enum AppId {
     Browser,
 }
 
+/// Screen the shell can show one at a time. Home is a peer screen, never an
+/// overlay on top of a managed app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellScreen {
+    Home,
+    Launcher,
+    Browser,
+}
+
+/// Which screen currently owns the foreground. Home wins if several flags
+/// briefly overlap during a close; managed apps are mutually exclusive.
+pub fn visible_screen(home: bool, browser: bool, launcher: bool) -> Option<ShellScreen> {
+    if home {
+        Some(ShellScreen::Home)
+    } else if browser {
+        Some(ShellScreen::Browser)
+    } else if launcher {
+        Some(ShellScreen::Launcher)
+    } else {
+        None
+    }
+}
+
 /// Shell work required after a Home transition. Order matters: unfocus/hide
 /// and suspend the outgoing app before showing/focusing/resuming the
 /// incoming one.
@@ -210,19 +233,195 @@ fn home_tap_message(
 }
 
 impl App {
-    /// Toggle the PS Home from anywhere. PS is the only global shell gesture:
-    /// while Home is open it closes; otherwise it opens over whatever is
-    /// running (Launcher, a game, or the desktop).
-    pub(crate) fn toggle_home(&mut self) -> Task<Message> {
-        if self.home_visible {
-            self.close_home()
-        } else {
-            self.open_home()
+    /// PS is a screen hide/resume toggle: dismiss the visible screen to the
+    /// desktop, then restore that exact screen on the next press. Circle is
+    /// the only path back to the Home screen.
+    pub(crate) fn ps_screen_toggle(&mut self) -> Task<Message> {
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: PS toggle home={} browser={} launcher={} windows=({},{},{}) resume={:?} pending={}",
+            self.home_visible,
+            self.browser_visible,
+            self.launcher_visible,
+            self.home_window.is_some(),
+            self.browser_window.is_some(),
+            self.launcher_window.is_some(),
+            self.ps_resume,
+            self.ps_resume_pending,
+        ));
+        match visible_screen(
+            self.home_visible,
+            self.browser_visible,
+            self.launcher_visible,
+        ) {
+            Some(ShellScreen::Home) => {
+                if self.home_closing() {
+                    return Task::none();
+                }
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "screen.dismiss",
+                )
+                .field("screen", "home")
+                .field("source", "ps")
+                .emit();
+                let task = self.close_home();
+                // `close_home` clears resume state (Circle/auto-close
+                // semantics); PS owns the restore target.
+                self.ps_resume = Some(ShellScreen::Home);
+                self.ps_resume_pending = false;
+                self.arm_chord_release_latch();
+                task
+            }
+            Some(ShellScreen::Browser) => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "screen.dismiss",
+                )
+                .field("screen", "browser")
+                .field("source", "ps")
+                .emit();
+                let task = self.close_osk("ps").chain(self.close_browser_window());
+                self.ps_resume = Some(ShellScreen::Browser);
+                self.ps_resume_pending = false;
+                self.arm_chord_release_latch();
+                crate::controller::hid::diag::diag_info("ui-diag: PS dismiss screen=Browser");
+                task
+            }
+            Some(ShellScreen::Launcher) => {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "screen.dismiss",
+                )
+                .field("screen", "launcher")
+                .field("source", "ps")
+                .emit();
+                let task = self.close_osk("ps").chain(self.close_launcher());
+                self.ps_resume = Some(ShellScreen::Launcher);
+                self.ps_resume_pending = false;
+                crate::controller::hid::diag::diag_info("ui-diag: PS dismiss screen=Launcher");
+                task
+            }
+            None => {
+                // A Launcher window can still be closing (its id lives until
+                // WindowClosed), so defer the resume instead of losing the
+                // second press.
+                if self.home_window.is_some()
+                    || self.browser_window.is_some()
+                    || self.launcher_window.is_some()
+                {
+                    self.ps_resume.get_or_insert(ShellScreen::Home);
+                    self.ps_resume_pending = true;
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: PS resume deferred (window closing)",
+                    );
+                    return Task::none();
+                }
+                self.ps_resume_pending = false;
+                let screen = self.ps_resume.take().unwrap_or(ShellScreen::Home);
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Platform,
+                    "screen.resume",
+                )
+                .field("screen", format!("{screen:?}").to_lowercase())
+                .field("source", "ps")
+                .emit();
+                crate::controller::hid::diag::diag_info(format!(
+                    "ui-diag: PS resume screen={screen:?}"
+                ));
+                self.open_shell_screen(screen, true)
+            }
         }
     }
 
-    /// Show the topmost Home overlay. Idempotent when already visible.
+    /// Retry a deferred PS resume after a window finished closing.
+    pub(crate) fn maybe_resume_ps_after_close(&mut self) -> Task<Message> {
+        if !self.ps_resume_pending {
+            return Task::none();
+        }
+        if self.home_window.is_some()
+            || self.browser_window.is_some()
+            || self.launcher_window.is_some()
+        {
+            return Task::none();
+        }
+        self.ps_resume_pending = false;
+        let screen = self.ps_resume.take().unwrap_or(ShellScreen::Home);
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: PS resume deferred->screen={screen:?}"
+        ));
+        self.open_shell_screen(screen, true)
+    }
+
+    fn open_shell_screen(&mut self, screen: ShellScreen, resuming: bool) -> Task<Message> {
+        match screen {
+            ShellScreen::Home => {
+                if resuming {
+                    self.open_home_resumed()
+                } else {
+                    self.open_home()
+                }
+            }
+            ShellScreen::Launcher => {
+                if !self.session.prefs.home_enabled {
+                    return self.open_home();
+                }
+                self.open_launcher()
+            }
+            ShellScreen::Browser => {
+                if self.browser.engine.is_none() {
+                    crate::controller::hid::diag::diag_info(
+                        "ui-diag: PS resume Browser skipped (engine missing)",
+                    );
+                    return self.open_home();
+                }
+                self.open_browser_window()
+            }
+        }
+    }
+
+    /// Circle from a managed app: close/suspend it, then show the Home screen.
+    pub(crate) fn return_to_home_screen(&mut self) -> Task<Message> {
+        self.ps_resume = None;
+        self.ps_resume_pending = false;
+        if self.home_visible {
+            return Task::none();
+        }
+        // Tell the outgoing screen's close path that another shell screen is
+        // taking over, so the native cursor stays hidden across the swap.
+        self.shell_opening = true;
+        let close = if self.browser_visible {
+            let close_osk = self.close_osk("circle_home");
+            self.browser.panel.cancel_url_edit();
+            close_osk.chain(self.close_browser_window())
+        } else if self.launcher_visible {
+            let close_osk = self.close_osk("circle_home");
+            close_osk.chain(self.close_launcher())
+        } else {
+            Task::none()
+        };
+        crate::platform::trace::event(crate::platform::trace::Lane::Platform, "screen.home")
+            .field("source", "circle")
+            .emit();
+        crate::controller::hid::diag::diag_info("ui-diag: circle returns to Home");
+        close.chain(self.open_home())
+    }
+
+    pub(crate) fn clear_ps_resume(&mut self) {
+        self.ps_resume = None;
+        self.ps_resume_pending = false;
+    }
+
     pub(crate) fn open_home(&mut self) -> Task<Message> {
+        self.open_home_inner(true)
+    }
+
+    /// PS resume of a dismissed Home keeps its tile/focus/settings state.
+    fn open_home_resumed(&mut self) -> Task<Message> {
+        self.open_home_inner(false)
+    }
+
+    fn open_home_inner(&mut self, reset: bool) -> Task<Message> {
+        self.clear_ps_resume();
         if self.home_closing() {
             return Task::none();
         }
@@ -236,6 +435,8 @@ impl App {
             crate::controller::hid::diag::diag_info("ui-diag: home open skipped (window closing)");
             return Task::none();
         }
+        self.shell_opening = true;
+        self.reset_shell_cursor_clock();
         let cover = primary_monitor_cover().unwrap_or(MonitorCover {
             x: 0.0,
             y: 0.0,
@@ -259,10 +460,19 @@ impl App {
         self.refresh_engine_status();
         self.sync_home_engine_info();
         self.sync_home_settings();
-        self.home_state.on_open(
-            self.session.prefs.home_enabled,
-            self.browser.engine_status.is_ready(),
-        );
+        if reset {
+            self.home_state.on_open(
+                self.session.prefs.home_enabled,
+                self.browser.engine_status.is_ready(),
+            );
+        } else {
+            // PS resume: keep the tile/focus/settings the user left behind,
+            // but re-arm edge latches so the opening press cannot fire twice.
+            self.home_state.rearm_on_open(
+                self.session.prefs.home_enabled,
+                self.browser.engine_status.is_ready(),
+            );
+        }
         // `on_open` resets transient screens; engine info and settings are
         // persistent shell state, so re-apply them after the reset.
         self.sync_home_engine_info();
@@ -301,6 +511,18 @@ impl App {
     /// exit fade; [`Self::finish_home_close`] tears it down when the shell
     /// animation settles. Returns focus to Launcher when it is the app underneath.
     pub(crate) fn close_home(&mut self) -> Task<Message> {
+        // Circle/auto-close semantics: a later PS starts at Home, not the
+        // screen that was dismissed before this close.
+        self.clear_ps_resume();
+        // Dismissing the last shell screen restores the pointer during the
+        // exit fade (the Home window still presents frames). A swap to another
+        // shell screen keeps it hidden.
+        let last_shell = !self.browser_visible && !self.launcher_visible && !self.shell_opening;
+        if self.shell_cursor_hidden && last_shell {
+            // Keep the 2 Hz cursor clock from re-hiding during the exit fade.
+            self.reset_shell_cursor_clock();
+            self.set_shell_cursor_hidden(false);
+        }
         if self
             .home_shell_anim
             .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
@@ -373,8 +595,8 @@ impl App {
         if self.launcher_last_activity <= paused_at {
             self.launcher_last_activity += pause;
         }
-        if self.launcher_cursor_last_active <= paused_at {
-            self.launcher_cursor_last_active += pause;
+        if self.shell_cursor_last_active <= paused_at {
+            self.shell_cursor_last_active += pause;
         }
     }
 
@@ -385,6 +607,7 @@ impl App {
             return Task::none();
         }
         self.home_visible = true;
+        self.shell_opening = false;
         crate::controller::hid::diag::diag_info(format!("ui-diag: home opened id={id:?}"));
         Task::none()
     }
@@ -815,7 +1038,9 @@ impl App {
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Launcher");
                 // Launcher and Browser are exclusive; `open_launcher` closes
-                // the Browser before showing the Launcher.
+                // the Browser before showing the Launcher. Keep the pointer
+                // hidden across the Home->Launcher swap.
+                self.shell_opening = true;
                 self.close_home().chain(self.open_launcher())
             }
             home_view::HomeTile::Browser => {
@@ -827,6 +1052,7 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Browser");
+                self.shell_opening = true;
                 self.close_home().chain(self.open_browser_window())
             }
         }
@@ -882,8 +1108,8 @@ impl App {
         self.sync_home_controllers();
         self.home_state.tick_identify_flash();
         if self.home_chord_fires(readings) {
-            crate::controller::hid::diag::diag_info("ui-diag: home chord close");
-            return self.close_home();
+            crate::controller::hid::diag::diag_info("ui-diag: home chord dismiss");
+            return self.ps_screen_toggle();
         }
         let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
             return Task::none();
@@ -1029,6 +1255,20 @@ mod tests {
         assert!(apps.is_installed(AppId::Launcher));
         assert!(apps.is_installed(AppId::Browser));
         assert_eq!(apps.active(), None);
+    }
+
+    #[test]
+    fn ps_visibility_prefers_home_then_browser_then_launcher() {
+        assert_eq!(visible_screen(false, false, false), None);
+        assert_eq!(
+            visible_screen(false, false, true),
+            Some(ShellScreen::Launcher)
+        );
+        assert_eq!(
+            visible_screen(false, true, true),
+            Some(ShellScreen::Browser)
+        );
+        assert_eq!(visible_screen(true, true, true), Some(ShellScreen::Home));
     }
 
     #[test]
