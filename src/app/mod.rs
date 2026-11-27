@@ -234,6 +234,9 @@ pub enum Message {
     WindowShowNow(window::Id),
     /// The shared shell HWND finished creating (renderer is up).
     ShellOpened(window::Id),
+    /// Shell is shown offscreen with the entrance pose; present it on the
+    /// monitor after one paint.
+    ShellPresent(window::Id),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
     ShellFadeTick,
     /// PS Home window opened (focus it once the renderer exists).
@@ -404,6 +407,7 @@ impl Message {
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
+            | Message::ShellPresent(_)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
             | Message::LauncherFrame
@@ -548,6 +552,7 @@ impl Message {
             | Message::WindowSized(_, _)
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
+            | Message::ShellPresent(_)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
@@ -2251,6 +2256,7 @@ impl App {
             }
             Message::WindowShowNow(id) => self.on_shell_show_now(id),
             Message::ShellOpened(id) => self.on_shell_opened(id),
+            Message::ShellPresent(id) => self.on_shell_present(id),
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();

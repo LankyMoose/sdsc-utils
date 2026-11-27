@@ -43,23 +43,60 @@ impl App {
         self.shell_pending_show = false;
         self.shell_hidden = false;
         self.shell_opening = false;
+        // Invalidate any hide task still queued from the previous dismiss:
+        // the raw offscreen show below bypasses `shell_visibility_task`, so
+        // this show needs its own epoch to win the ordering race.
+        self.shell_visibility_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mode = self.shell_mode;
-        let level = self.shell_level_task(mode);
         let enter = self.start_shell_enter(mode);
         if mode == ShellScreen::Browser {
             self.sync_browser_viewport();
         }
+        if crate::platform::debug_quiet::enabled() {
+            return enter.chain(self.on_shell_present(id));
+        }
+        // Prime an offscreen frame with the entrance pose, then move the warm
+        // surface onscreen. Showing the hidden HWND directly would present the
+        // previous full-size frame for one beat before the intro.
+        enter
+            .chain(layout::show_shell_offscreen(id))
+            .chain(Task::perform(
+                super::delay(std::time::Duration::from_millis(32)),
+                move |_| Message::ShellPresent(id),
+            ))
+    }
+
+    /// Present the shell on the monitor after the offscreen entrance frame.
+    pub(crate) fn on_shell_present(&mut self, id: window::Id) -> Task<Message> {
+        if self.shell_window != Some(id) || self.shell_hidden {
+            return Task::none();
+        }
+        let mode = self.shell_mode;
+        let level = self.shell_level_task(mode);
         let toast = self.shell_toast_task(mode);
-        let show = self
-            .shell_visibility_task(id, true)
-            .chain(layout::focus_window(id))
-            .chain(self.sync_toast_zorder());
+        let show = if crate::platform::debug_quiet::enabled() {
+            self.shell_visibility_task(id, true)
+                .chain(layout::focus_window(id))
+        } else {
+            let cover = crate::ui::layout::primary_monitor_cover().unwrap_or(
+                crate::ui::layout::MonitorCover {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+            );
+            layout::show_shell_at_cover(id, cover)
+                .chain(layout::focus_window(id))
+                .chain(self.sync_toast_zorder())
+        };
         let launcher = if mode == ShellScreen::Launcher {
             Task::done(Message::LauncherOpened(id))
         } else {
             Task::none()
         };
-        show.chain(level).chain(enter).chain(toast).chain(launcher)
+        level.chain(show).chain(toast).chain(launcher)
     }
 
     /// Point the per-screen aliases at the one shell HWND for `mode`.

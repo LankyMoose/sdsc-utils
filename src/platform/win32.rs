@@ -34,6 +34,7 @@ pub const HWND_NOTOPMOST: isize = -2;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_SHOWWINDOW: u32 = 0x0040;
 /// Disable DWM open/close/minimize transitions for a window.
 pub const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;

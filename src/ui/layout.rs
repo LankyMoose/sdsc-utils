@@ -258,6 +258,76 @@ pub fn set_shell_level<Message: Send + 'static>(id: window::Id, topmost: bool) -
     }
 }
 
+/// Show the warm shell offscreen so the first frame with the new entrance
+/// pose is painted before it appears on the monitor. Showing a hidden HWND
+/// directly presents the previous surface (the stale full-size view).
+pub fn show_shell_offscreen<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            host::move_offscreen(hwnd);
+            // SW_SHOWNOACTIVATE keeps the offscreen prime from taking focus.
+            host::show_window(hwnd);
+            host::invalidate_hwnd(hwnd);
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::set_mode(id, window::Mode::Windowed)
+    }
+}
+
+/// Move the already-shown shell from its offscreen priming spot to the
+/// monitor cover. The surface now holds a fresh entrance frame.
+pub fn show_shell_at_cover<Message: Send + 'static>(
+    id: window::Id,
+    cover: MonitorCover,
+) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            unsafe {
+                crate::platform::win32::SetWindowPos(
+                    hwnd,
+                    0,
+                    cover.x as i32,
+                    cover.y as i32,
+                    cover.width as i32,
+                    cover.height as i32,
+                    crate::platform::win32::SWP_NOZORDER
+                        | crate::platform::win32::SWP_NOACTIVATE
+                        | crate::platform::win32::SWP_SHOWWINDOW,
+                );
+            }
+            host::invalidate_hwnd(hwnd);
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::move_to(id, iced::Point::new(cover.x, cover.y))
+    }
+}
+
 /// Show a hidden UI window (`Mode::Windowed`). Quiet mode: no activation,
 /// secondary monitor.
 pub fn show_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
