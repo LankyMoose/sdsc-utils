@@ -1202,8 +1202,11 @@ impl App {
                 false
             }
             ChordReleaseTick::Cleared => {
-                let _ = self.gesture_detectors.update(&required, readings);
-                false
+                // The release matured between HID samples. Disarm first, then
+                // evaluate this sample: if it still holds the chord, it is a
+                // fresh press and must fire.
+                self.gesture_detectors.disarm(&required);
+                self.gesture_detectors.update(&required, readings)
             }
             ChordReleaseTick::Open => self.gesture_detectors.update(&required, readings),
         }

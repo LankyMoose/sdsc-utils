@@ -21,8 +21,8 @@ use iced::advanced::{Clipboard, Renderer as _, Shell, overlay, renderer};
 use iced::widget::text::Wrapping;
 use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
 use iced::{
-    Alignment, Element, Event, Fill, Length, Padding, Rectangle, Size, Transformation, Vector,
-    mouse, window,
+    Alignment, Background, Element, Event, Fill, Length, Padding, Point, Rectangle, Size,
+    Transformation, Vector, mouse, window,
 };
 
 /// Enter/exit duration. Long enough to read the FLIP, short enough to stay out
@@ -92,6 +92,8 @@ const BOOKMARK_GAP: f32 = 10.0;
 pub const BOOKMARK_CARD_W: f32 = 168.0;
 const BOOKMARK_CARD_H: f32 = 58.0;
 const CARD_TITLE_H: f32 = 34.0;
+/// Header enter/exit slide distance (positive = down from its resting row).
+const HEADER_SLIDE_PX: f32 = 22.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GridMode {
@@ -151,6 +153,18 @@ fn lerp_rect(a: Rectangle, b: Rectangle, t: f32) -> Rectangle {
             a.width + (b.width - a.width) * t,
             a.height + (b.height - a.height) * t,
         ),
+    )
+}
+
+/// Scale + translation that maps `source` exactly onto `target`. Both rects
+/// are in the same (absolute) coordinate space; scaling about the screen origin
+/// would pin the page's y near the top and snap it on the final frame.
+fn flip_transform(source: Rectangle, target: Rectangle) -> (f32, f32, f32) {
+    let scale = target.width / source.width.max(1.0);
+    (
+        scale,
+        target.x - source.x * scale,
+        target.y - source.y * scale,
     )
 }
 
@@ -536,6 +550,14 @@ pub fn page_view<'a>(
             layout.page_rect(),
             Size::new(area_w, area_h),
         ));
+        // The Browser header is part of the same transition: it must not
+        // vanish/appear in a single frame while the page is still moving.
+        layers.push(header_curtain(
+            crate::ui::browser::view::browser_header(panel, area_w),
+            anim,
+            Size::new(area_w, area_h),
+            crate::ui::browser::state::BROWSER_HEADER_TOTAL,
+        ));
     }
     let body: Element<'a, BrowserMessage> = stack(layers)
         .width(Length::Fixed(area_w))
@@ -814,9 +836,18 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for FlipPage<'a> {
             return;
         };
         let rect = self.anim.rect(Instant::now());
-        let scale = rect.width / self.page.width.max(1.0);
-        let tx = rect.x - self.page.x * scale;
-        let ty = rect.y - self.page.y * scale;
+        // `child_layout` and `layout` are absolute screen coordinates, while
+        // `self.anim.rect` is relative to the tabs-view area. Map the child's
+        // absolute page rect to the absolute animated rect; scaling around the
+        // screen origin would leave the page's y pinned near the top and snap
+        // it to the card on the final frame.
+        let source = child_layout.bounds();
+        let origin = layout.bounds().position();
+        let target = Rectangle::new(
+            iced::Point::new(origin.x + rect.x, origin.y + rect.y),
+            rect.size(),
+        );
+        let (scale, tx, ty) = flip_transform(source, target);
         renderer.with_layer(layout.bounds(), |renderer| {
             renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
                 renderer.with_transformation(Transformation::scale(scale), |renderer| {
@@ -861,6 +892,183 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for FlipPage<'a> {
 
 impl<'a> From<FlipPage<'a>> for Element<'a, BrowserMessage> {
     fn from(value: FlipPage<'a>) -> Self {
+        Element::new(value)
+    }
+}
+
+/// Draw-time header enter/exit curtain. The header slides up into place and
+/// fades in while the page grows on a Leaving transition; entering reverses it
+/// (slide down + fade out) on the same clock as the page shrink.
+///
+/// iced has no group-opacity primitive, so the fade is composited as a
+/// card-background quad at `1 - appear` over the header. The header area sits
+/// above every grid card, so the curtain never masks grid content.
+struct HeaderCurtain<'a> {
+    content: Element<'a, BrowserMessage>,
+    anim: GridAnim,
+    area: Size,
+    header_h: f32,
+}
+
+fn header_curtain<'a>(
+    content: Element<'a, BrowserMessage>,
+    anim: GridAnim,
+    area: Size,
+    header_h: f32,
+) -> Element<'a, BrowserMessage> {
+    HeaderCurtain {
+        content,
+        anim,
+        area,
+        header_h,
+    }
+    .into()
+}
+
+impl HeaderCurtain<'_> {
+    fn appear(&self, now: Instant) -> f32 {
+        let progress = self.anim.progress(now);
+        if self.anim.entering {
+            1.0 - progress
+        } else {
+            progress
+        }
+    }
+}
+
+impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'a> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::stateless()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::None
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(
+            Length::Fixed(self.area.width),
+            Length::Fixed(self.area.height),
+        )
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        _limits: &layout::Limits,
+    ) -> layout::Node {
+        let child_limits = layout::Limits::new(
+            Size::new(self.area.width, self.header_h),
+            Size::new(self.area.width, self.header_h),
+        );
+        let child =
+            self.content
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, &child_limits);
+        layout::Node::with_children(self.area, vec![child.move_to(Point::ORIGIN)])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let Some(child_layout) = layout.children().next() else {
+            return;
+        };
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            child_layout,
+            renderer,
+            operation,
+        );
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let Some(child_layout) = layout.children().next() else {
+            return;
+        };
+        let appear = self.appear(Instant::now());
+        if appear <= 0.001 {
+            return;
+        }
+        let bounds = Rectangle::new(
+            layout.bounds().position(),
+            Size::new(self.area.width, self.header_h),
+        );
+        let offset = (1.0 - appear) * HEADER_SLIDE_PX;
+        renderer.with_layer(bounds, |renderer| {
+            renderer.with_translation(Vector::new(0.0, offset), |renderer| {
+                self.content.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    child_layout,
+                    cursor,
+                    viewport,
+                );
+            });
+        });
+        if appear < 0.999 {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    ..renderer::Quad::default()
+                },
+                Background::Color(theme::alpha(
+                    theme::lighten(theme::BASE_BG, 0.04),
+                    1.0 - appear,
+                )),
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        mouse::Interaction::None
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        _tree: &'b mut Tree,
+        _layout: Layout<'b>,
+        _renderer: &iced::Renderer,
+        _viewport: &Rectangle,
+        _translation: Vector,
+    ) -> Option<overlay::Element<'b, BrowserMessage, iced::Theme, iced::Renderer>> {
+        None
+    }
+}
+
+impl<'a> From<HeaderCurtain<'a>> for Element<'a, BrowserMessage> {
+    fn from(value: HeaderCurtain<'a>) -> Self {
         Element::new(value)
     }
 }
@@ -1270,6 +1478,27 @@ impl<'a> From<GridTicker<'a>> for Element<'a, BrowserMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flip_transform_maps_the_absolute_page_onto_the_card() {
+        let source = Rectangle::new(Point::new(93.0, 99.0), Size::new(1734.0, 927.0));
+        let target = Rectangle::new(
+            Point::new(558.0, 131.0),
+            Size::new(395.0, 927.0 * 395.0 / 1734.0),
+        );
+        let (scale, tx, ty) = flip_transform(source, target);
+        assert!((source.x * scale + tx - target.x).abs() < 0.01, "x maps");
+        assert!((source.y * scale + ty - target.y).abs() < 0.01, "y maps");
+        assert!((source.width * scale - target.width).abs() < 0.01, "width");
+        assert!(
+            (source.height * scale - target.height).abs() < 0.01,
+            "height"
+        );
+        // t = 0 identity: same absolute rect in and out.
+        let (scale, tx, ty) = flip_transform(source, source);
+        assert!((scale - 1.0).abs() < f32::EPSILON);
+        assert!(tx.abs() < 0.01 && ty.abs() < 0.01);
+    }
 
     #[test]
     fn cards_keep_the_page_aspect_ratio() {

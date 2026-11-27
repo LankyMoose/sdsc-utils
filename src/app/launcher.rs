@@ -3096,9 +3096,9 @@ impl App {
                 return Task::none();
             }
             ChordReleaseTick::Cleared => {
-                // Absent sample disarms detectors; next held rising edge may fire.
-                let _ = self.gesture_detectors.update(&required, readings);
-                return Task::none();
+                // The release matured between HID samples. Disarm, then let
+                // the normal rising-edge check below evaluate this sample.
+                self.gesture_detectors.disarm(&required);
             }
             ChordReleaseTick::Open => {}
         }
@@ -3150,24 +3150,23 @@ impl App {
                 if chord_held {
                     self.gesture_detectors.consume_pending_match(readings);
                 }
-                None
+                return None;
             }
             ChordReleaseTick::Cleared => {
-                // Absent sample disarms detectors; next held rising edge may fire.
-                let _ = self.gesture_detectors.update(&required, readings);
-                None
+                // The release matured between HID samples. Disarm, then let
+                // the rising-edge check below evaluate this sample.
+                self.gesture_detectors.disarm(&required);
             }
-            ChordReleaseTick::Open => {
-                // Rising-edge guard: the gate reports Open on every tick once
-                // unlatched, even with the chord absent. Only a genuine new
-                // press (detector rising edge) opens Home.
-                if self.gesture_detectors.update(&required, readings) {
-                    crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Launcher");
-                    Some(self.ps_screen_toggle())
-                } else {
-                    None
-                }
-            }
+            ChordReleaseTick::Open => {}
+        }
+        // Rising-edge guard: the gate reports Open on every tick once
+        // unlatched, even with the chord absent. Only a genuine new press
+        // (detector rising edge) opens Home.
+        if self.gesture_detectors.update(&required, readings) {
+            crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Launcher");
+            Some(self.ps_screen_toggle())
+        } else {
+            None
         }
     }
 }

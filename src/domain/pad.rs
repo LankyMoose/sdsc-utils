@@ -2261,6 +2261,15 @@ impl GestureDetectorBank {
         }
     }
 
+    /// Feed an absent sample so the next held edge can fire. Used when the
+    /// release gate matures between HID samples (no absent sample arrived).
+    pub fn disarm(&mut self, required: &[GestureControl]) {
+        let absent = BTreeSet::new();
+        for detector in self.detectors.values_mut() {
+            let _ = detector.update(required, &absent);
+        }
+    }
+
     /// Returns true when any single pad completes the chord this tick.
     pub fn update(&mut self, required: &[GestureControl], readings: &[NavReading]) -> bool {
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
@@ -3451,6 +3460,23 @@ mod tests {
 
         assert!(!bank.update(&required, &[reading("a", PadSample::default())]));
         assert!(bank.update(&required, &[reading("a", sticky)]));
+    }
+
+    #[test]
+    fn disarm_without_absent_sample_allows_rehold() {
+        let mut bank = GestureDetectorBank::default();
+        let required = crate::ui::launcher::gesture::default_gesture();
+        let held = chord_sample(&[GestureControl::Ps]);
+        bank.consume_pending_match(&[reading("a", held.clone())]);
+        assert!(
+            !bank.update(&required, &[reading("a", held.clone())]),
+            "same physical hold must stay consumed"
+        );
+        // The HID edge stream drops resting neutral samples, so the release
+        // gate matures between samples. Disarming explicitly must let the next
+        // held sample fire.
+        bank.disarm(&required);
+        assert!(bank.update(&required, &[reading("a", held)]));
     }
 
     #[test]

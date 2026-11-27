@@ -349,7 +349,7 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
 }
 
 /// One-row Browser header: `‹ L1` · URL well · `R1 ›`.
-fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessage> {
+pub(crate) fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessage> {
     let content_w = (page_w - 2.0 * BROWSER_HEADER_PAD).max(1.0);
     let layout = browser_header_layout(content_w);
     let back_enabled = panel.can_go_back();

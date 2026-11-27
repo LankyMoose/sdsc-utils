@@ -119,8 +119,9 @@ impl GestureDetector {
 pub enum ChordReleaseTick {
     /// Latch still active — do not run the rising-edge detector.
     Blocked,
-    /// Latch just cleared after a continuous absence — feed this (absent) sample
-    /// into the detector so it disarms; the next held sample may fire.
+    /// The release was long enough (even if the only evidence is this held
+    /// sample arriving after the debounce). Callers disarm the detector first;
+    /// if the current sample holds the chord, it is a fresh press.
     Cleared,
     /// No latch — rising-edge detector may run.
     Open,
@@ -129,14 +130,14 @@ pub enum ChordReleaseTick {
 /// After open / close, ignore the sticky chord until it has been
 /// continuously absent for [`CHORD_RELEASE_DEBOUNCE`].
 ///
-/// A one-sample gap (report glitch / bounce) cancels the pending release and
-/// keeps the latch so the same physical press cannot reopen.
+/// The gate is sample-arrival independent: the HID edge stream drops resting
+/// neutral samples, so a release often has no sample at the end of the
+/// debounce. A held sample that arrives after the debounce has elapsed is a
+/// fresh press, not a glitch.
 #[derive(Debug, Clone, Default)]
 pub struct ChordReleaseGate {
     latched: bool,
     absent_since: Option<Instant>,
-    /// Set while a short absence is in progress; consumed on re-hold for diag.
-    saw_short_gap: bool,
 }
 
 impl ChordReleaseGate {
@@ -148,45 +149,51 @@ impl ChordReleaseGate {
     pub fn arm(&mut self) {
         self.latched = true;
         self.absent_since = None;
-        self.saw_short_gap = false;
     }
 
     /// Clear without waiting.
     pub fn clear(&mut self) {
         self.latched = false;
         self.absent_since = None;
-        self.saw_short_gap = false;
     }
 
     /// Feed whether the required chord is held on any pad this sample.
     ///
     /// When `Blocked`, callers must not call [`GestureDetector::update`] (except
     /// optionally `consume_pending_match` / `mark_armed` to keep the hold consumed).
-    /// When `Cleared`, call `update` with the absent sample (disarm), then open.
+    /// When `Cleared`, disarm the detector first; if this sample holds the
+    /// chord, evaluate it as a fresh rising edge.
     ///
-    /// Returns `(tick, glitch_ignored)` — `glitch_ignored` is true once when the
+    /// Returns `(tick, glitch_ignored)` — `glitch_ignored` is true when the
     /// chord returns after a short absence that did not clear the latch.
     pub fn tick(&mut self, chord_held: bool, now: Instant) -> (ChordReleaseTick, bool) {
         if !self.latched {
             return (ChordReleaseTick::Open, false);
         }
         if chord_held {
-            let glitch = self.saw_short_gap;
-            self.saw_short_gap = false;
-            self.absent_since = None;
-            return (ChordReleaseTick::Blocked, glitch);
+            if let Some(since) = self.absent_since {
+                self.absent_since = None;
+                if now.saturating_duration_since(since) >= CHORD_RELEASE_DEBOUNCE {
+                    // No sample arrived while the chord was absent (the HID
+                    // edge stream drops rest), but the release was real and
+                    // long enough: this held sample is a fresh press.
+                    self.latched = false;
+                    return (ChordReleaseTick::Cleared, false);
+                }
+                // Short bounce: still the same physical press.
+                return (ChordReleaseTick::Blocked, true);
+            }
+            return (ChordReleaseTick::Blocked, false);
         }
         match self.absent_since {
             None => {
                 self.absent_since = Some(now);
-                self.saw_short_gap = true;
                 (ChordReleaseTick::Blocked, false)
             }
             Some(since) => {
                 if now.saturating_duration_since(since) >= CHORD_RELEASE_DEBOUNCE {
                     self.latched = false;
                     self.absent_since = None;
-                    self.saw_short_gap = false;
                     (ChordReleaseTick::Cleared, false)
                 } else {
                     (ChordReleaseTick::Blocked, false)
@@ -296,6 +303,35 @@ mod tests {
             "same press must not fire after glitch"
         );
         assert!(gate.is_latched());
+    }
+
+    #[test]
+    fn release_gate_long_gap_then_rehold_is_fresh_press() {
+        let mut gate = ChordReleaseGate::default();
+        let mut detector = GestureDetector::default();
+        let required = default_gesture();
+        let held: BTreeSet<_> = [GestureControl::Ps].into_iter().collect();
+        let empty = BTreeSet::new();
+        let t0 = Instant::now();
+
+        gate.arm();
+        detector.mark_armed();
+        assert_eq!(gate.tick(true, t0).0, ChordReleaseTick::Blocked);
+        // Release seen once, then no samples while the pad rests (the HID edge
+        // stream drops neutral samples). The next held sample arrives after the
+        // debounce window and must count as a new press.
+        assert_eq!(
+            gate.tick(false, t0 + Duration::from_millis(1)).0,
+            ChordReleaseTick::Blocked
+        );
+        let (tick, glitch) =
+            gate.tick(true, t0 + Duration::from_millis(1) + CHORD_RELEASE_DEBOUNCE);
+        assert_eq!(tick, ChordReleaseTick::Cleared);
+        assert!(!glitch);
+        assert!(!gate.is_latched());
+        // Caller pattern: disarm, then evaluate the held sample.
+        assert!(!detector.update(&required, &empty));
+        assert!(detector.update(&required, &held));
     }
 
     #[test]

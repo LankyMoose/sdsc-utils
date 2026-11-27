@@ -38,7 +38,15 @@ bookmark UI, or Browser screen/back behavior.
   expands that tab's last frame to full page, then activates it. The animated
   rect is sampled in `FlipPage::draw` under a renderer transform, not when the
   view is built: the view tree is stable across the transition, so a view-time
-  clock would freeze at 1–3 poses.
+  clock would freeze at 1–3 poses. The transform maps the child's **absolute**
+  page rect to the absolute card rect (not a screen-origin scale), so the
+  page's y offset interpolates for the whole FLIP instead of snapping on the
+  last frame.
+- The Browser header is part of the same transition. `HeaderCurtain` draws the
+  normal header over the tabs view and slides it down/up while compositing a
+  card-background curtain at the inverse alpha; it uses the FLIP clock, so
+  exit (page) slides up + fades in and enter (tabs) reverses it. The header
+  area sits above every grid card, so the curtain never hides card content.
 - Never render the same tab id twice in one frame (`BrowserFramePipeline`
   stores one uniform block per tab id): the animating tab's grid card omits its
   shader until the transition lands.
