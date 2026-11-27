@@ -255,8 +255,12 @@ Surfaces provide list state and state mutations. They do **not** call
 ### 4.2 Tick and transport
 
 - The active surface’s frame/tick calls `dispatcher.tick(surface, snapshot,
-  now)`. The Browser tabs view can use its existing `GridTicker`; Home uses
-  its frame clock; OSK keeps its pull surface.
+  now)`. Home uses its frame clock; OSK keeps its pull surface.
+- The Browser tabs view has **no idle tick** today. `GridTicker`
+  (`src/ui/browser/grid.rs:1619`) only requests frames while `active` (a
+  FLIP/transition is live), so it cannot drive a held stick. Add a grid tick
+  message requested from the grid view while a nav input is non-neutral, and
+  let the app read the snapshot there.
 - Taps/PS still arrive as edges. `PadActionGate` remains the edge-level
   dedupe/latch; the dispatcher asks `try_action` once per accepted tap.
 - `browser_listening` remains a cursor optimization. List surfaces read the
@@ -309,8 +313,8 @@ Surfaces provide list state and state mutations. They do **not** call
 ### NAV-3 — Held analog for tabs/bookmarks
 
 - [ ] Tick `browser.grid_nav` from a surface frame clock with the latest
-      `InputHub` snapshot, not only `PadInput` edges (or make the edge filter
-      pass analog while `grid.is_grid()`).
+      `InputHub` snapshot, not only `PadInput` edges. Do **not** widen the
+      edge filter to compensate (see §7).
 - [ ] Feed the tabs/bookmark right-stick scroll from the same frame tick.
 - [ ] Keep the existing menu profile/repeat cadence.
 - [ ] Tests: a held stick produces First + Repeat steps; a release stops;
