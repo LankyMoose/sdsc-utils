@@ -351,10 +351,12 @@ policy entry points).
       All four movement paths and the app menu use `NavList`; Home's
       `NavStepper` field is replaced by `NavDispatcher`.
 - [x] Migrate Launcher and OSK after parity; remove per-surface
-      `NavStepper`/`NavBank` fields. `App::pad_nav` and `SurfaceState::nav` are
-      `NavDispatcher`s (`tick_full` keeps Launcher's hold/replace/edit flags;
-      the OSK uses the shared menu tick). The Games strip keeps only its linear
-      skip/scroll policy in `view::move_selection`.
+      `NavStepper`/`NavBank` fields. `App::pad_nav`, `SurfaceState::nav`, and
+      Browser `browser.nav` are `NavDispatcher`s (`tick_full` keeps Launcher's
+      hold/replace/edit flags; the OSK uses the shared menu tick). The Games
+      strip keeps only its linear skip/scroll policy in
+      `view::move_selection`; Browser's cursor `dpad_stepper` remains the
+      specialized page-cursor stepper.
 - [x] Keep `PadActionGate` at the input boundary for tap dedupe/latch; the
       dispatcher never re-implements edge dedupe.
 - [x] Remove `cue: bool`-style parameters and direct `play_ui_cue` calls from

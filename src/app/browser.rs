@@ -7,9 +7,7 @@
 
 use crate::browser::engine::{EngineCommand, EngineHandle};
 use crate::domain::navigation::{ActionOutcome, NavCue};
-use crate::domain::pad::{
-    NavAction, NavBank, NavStepper, PadAction, PadButton, PadButtonAction, PadId,
-};
+use crate::domain::pad::{NavAction, NavStepper, PadAction, PadButton, PadButtonAction, PadId};
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
 
@@ -181,9 +179,9 @@ pub struct BrowserAppState {
     /// stickless `dpad_only` mask): the Launcher bank stays parked in engine
     /// mode so stick moves never double-fire into both cursor and nav.
     pub dpad_stepper: NavStepper,
-    /// Browser-window pad bank: face/bumper edges + reader nav. The engine
-    /// cursor uses `dpad_stepper` and raw stick samples instead.
-    pub nav: NavBank,
+    /// Browser-window pad dispatcher: face/bumper edges + reader nav. The
+    /// engine cursor uses `dpad_stepper` and raw stick samples instead.
+    pub nav: crate::domain::navigation::NavDispatcher,
     /// Tabs-view navigation dispatcher: per-pad bank + outcome policy behind
     /// one surface entry point.
     pub grid_nav: crate::domain::navigation::NavDispatcher,
@@ -3146,7 +3144,7 @@ impl super::App {
         // Reader fallback uses the D-pad nav bank; engine mode parks it
         // (cursor jumps run on the dedicated stepper).
         let allow_nav = !engine_mode;
-        let mut tick = self.browser.nav.tick(
+        let mut tick = self.browser.nav.tick_full(
             readings, now, allow_nav, true, false, false, false, false, false,
         );
         // Source-side taps replace the old per-surface face-edge reconstruction.
