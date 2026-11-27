@@ -51,6 +51,35 @@ pub fn hide(hwnd: isize) {
     }
 }
 
+/// Steal the foreground for the shell. The shell is shown with
+/// `SW_SHOWNOACTIVATE`, so winit's `gain_focus` can no-op while raw-hidden.
+/// A short Alt tap grants the foreground-change permission, then the window is
+/// raised/activated. Returns whether the HWND is the foreground afterwards.
+pub fn force_foreground(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        use crate::platform::win32;
+        // SAFETY: opaque HWND from a `window::run` closure on the UI thread;
+        // these calls only reorder/activate an existing window.
+        unsafe {
+            if win32::GetForegroundWindow() == hwnd {
+                return true;
+            }
+            win32::keybd_event(win32::VK_MENU, 0, 0, 0);
+            win32::keybd_event(win32::VK_MENU, 0, win32::KEYEVENTF_KEYUP, 0);
+            let _ = win32::SetForegroundWindow(hwnd);
+            let _ = win32::BringWindowToTop(hwnd);
+            let _ = win32::SetActiveWindow(hwnd);
+            win32::GetForegroundWindow() == hwnd
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
 /// No-activate "focus": raise the window in z-order without stealing input.
 ///
 /// There is no `SetForegroundWindow` here by design; in the no-activate model

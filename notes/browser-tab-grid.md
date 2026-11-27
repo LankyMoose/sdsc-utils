@@ -31,11 +31,13 @@ bookmark UI, or Browser screen/back behavior.
   The page-mode and tabs-mode card rects are interpolated by `CardShell` on the
   same clock as the page FLIP, so entering/leaving the page resizes the frame
   smoothly instead of snapping.
-- **One horizontal row** of page-aspect cards in a hidden-scrollbar
-  `scrollable`. Slot 0 is ALWAYS the plus card; tabs follow in stable creation
-  order. A tab is never promoted to the front by being entered. D-pad focus
+- **One horizontal row** of page-aspect cards in a themed horizontal
+  `scrollable`. Slot 0 is ALWAYS the plus card; tabs follow **newest first**
+  (`order` reversed). A tab is never reordered by being entered. D-pad focus
   calls `reveal_offset` so the focused card scrolls fully into view; the right
-  stick scrolls the row. There is **no pagination and no L1/R1 paging**.
+  stick scrolls the row. A reserved 9px scrollbar lane below the cards holds a
+  6px bar when the strip overflows, so showing/hiding it never reflows the
+  cards or bookmark strip. There is **no pagination and no L1/R1 paging**.
 - Closing a tab **keeps the selected index** (`focus_after_close`): the next
   card slides into the freed slot; closing the last card selects the new last
   card; closing the final remaining tab keeps that tab (it resets to the

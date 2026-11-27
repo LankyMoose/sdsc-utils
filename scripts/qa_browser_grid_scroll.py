@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Browser tabs row QA (scrollable strip, focus scroll, carry-over).
+"""Browser tabs row QA (newest-first strip, scrollbar, carry-over).
 
-Seeds more tabs than fit on screen, opens the tabs view on the active last
-tab, walks the focus to the plus card, then selects a different card and
-returns Home. Checks that the strip scrolls the focused card into view and
-that Circle->Home persists the focused card as the next active tab.
+Seeds more tabs than fit on screen, checks the newest tab opens at the start
+of the strip with a visible horizontal scrollbar, walks the focus to the
+oldest tab at the far end (scrolling it into view), then returns Home and
+checks that the focused tab was carried into tabs.json.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from qa_browser_grid import (
 
 RED = (192, 57, 43)
 BLUE = (31, 95, 191)
-ACCENT = (65, 65, 251)
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exe", type=Path, help="debug sdsc-utils executable")
     parser.add_argument("--keep", action="store_true", help="keep the app running")
     return parser.parse_args()
+
+
+def bright_pixels(colors: dict[tuple[int, int, int], int], threshold: int = 70) -> int:
+    return sum(
+        count
+        for (red, green, _blue), count in colors.items()
+        if red > threshold and green > threshold
+    )
 
 
 def main() -> int:
@@ -65,16 +72,16 @@ def main() -> int:
     for _ in range(7):
         actions += [step("tab.new", url=red), step("wait")]
     actions += [
+        # Newest tab first: blue opens at the start of the strip.
         step("tab.new", url=blue),
         step("wait"),
         step("grid.open"),
         step("wait"),
         step("screenshot"),
-        *([step("grid.focus", dir="left")] * 9),
+        # Walk to the oldest tab at the far end; the strip scrolls after it.
+        *([step("grid.focus", dir="right")] * 8),
         step("wait"),
         step("screenshot"),
-        step("grid.focus", dir="right"),
-        step("wait"),
         step("screen.home"),
         step("wait"),
     ]
@@ -151,45 +158,42 @@ def main() -> int:
         images = [read_png(path) for path in shots]
         width, height = images[0][0], images[0][1]
         cards = grid_card_rects(width, height)
-        pitch = cards[1][0] - cards[0][0]
+        card_w = cards[0][2]
         row_right = cards[3][0] + cards[3][2]
-        open_blue = central_band_colors(
+        lane = (cards[0][0], cards[0][1] + cards[0][3] + 1, row_right - cards[0][0], 7)
+        opening_newest = central_band_colors(
             images[0][2],
             width,
             height,
-            (row_right - cards[3][2] // 2, cards[0][1], cards[3][2] // 2, cards[0][3]),
+            (cards[1][0], cards[1][1], cards[1][2], cards[1][3]),
         )
-        scrolled_plus = region_colors(
-            images[1][2],
+        opening_plus = region_colors(
+            images[0][2],
             width,
             (cards[0][0], cards[0][1], cards[0][2], cards[0][3]),
         )
+        lane_bright = bright_pixels(region_colors(images[0][2], width, lane))
         scrolled_right = central_band_colors(
             images[1][2],
             width,
             height,
-            (row_right - cards[3][2] // 2, cards[0][1], cards[3][2] // 2, cards[0][3]),
+            (row_right - card_w // 2, cards[0][1], card_w // 2, cards[0][3]),
+        )
+        scrolled_left = central_band_colors(
+            images[1][2],
+            width,
+            height,
+            (cards[0][0], cards[0][1], cards[0][2], cards[0][3]),
         )
         checks = [
-            ("opening scrolls to the active last tab", has_color(open_blue, BLUE)),
+            ("newest tab opens first in the strip", has_color(opening_newest, BLUE)),
             (
-                "plus card is off-screen at the end of the strip",
-                not has_color(
-                    region_colors(
-                        images[0][2],
-                        width,
-                        (cards[0][0], cards[0][1], cards[0][2], cards[0][3]),
-                    ),
-                    ACCENT,
-                    45,
-                    1,
-                ),
+                "the plus card stays at the start",
+                has_color(opening_plus, (65, 65, 251), 55, 1),
             ),
-            ("walking left reveals the plus card", has_color(scrolled_plus, ACCENT, 45, 1)),
-            (
-                "the active last tab left the viewport",
-                not has_color(scrolled_right, BLUE),
-            ),
+            ("overflow shows the horizontal scrollbar", lane_bright > 20),
+            ("the oldest tab scrolls into view at the end", has_color(scrolled_right, RED)),
+            ("the newest tab left the viewport", not has_color(scrolled_left, BLUE)),
         ]
         for label, ok in checks:
             print(f"check {label}: {'ok' if ok else 'FAIL'}")
@@ -203,6 +207,7 @@ def main() -> int:
             return 1
         saved = json.loads(tabs_path.read_text(encoding="utf-8"))
         active = saved.get("active", 0)
+        # The focused oldest tab is the boot tab at order index 0.
         print(f"check carried active tab: {active} ({'ok' if active == 0 else 'FAIL'})")
         if active != 0:
             print("error: Circle->Home did not persist the focused tab", file=sys.stderr)

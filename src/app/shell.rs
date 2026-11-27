@@ -43,6 +43,7 @@ impl App {
         self.shell_pending_show = false;
         self.shell_hidden = false;
         self.shell_opening = false;
+        self.shell_presented = false;
         // Invalidate any hide task still queued from the previous dismiss:
         // the raw offscreen show below bypasses `shell_visibility_task`, so
         // this show needs its own epoch to win the ordering race.
@@ -65,6 +66,35 @@ impl App {
                 super::delay(std::time::Duration::from_millis(32)),
                 move |_| Message::ShellPresent(id),
             ))
+            .chain(Task::perform(
+                super::delay(std::time::Duration::from_millis(300)),
+                move |_| Message::ShellFocusFallback(id),
+            ))
+    }
+
+    /// The safety-net pass: if the first present was lost, run the full
+    /// present; otherwise re-assert the cover rect and foreground. This keeps
+    /// a missed 32ms timer from leaving the warm window offscreen.
+    pub(crate) fn on_shell_focus_fallback(&mut self, id: window::Id) -> Task<Message> {
+        if self.shell_window != Some(id)
+            || self.shell_hidden
+            || crate::platform::debug_quiet::enabled()
+        {
+            return Task::none();
+        }
+        if !self.shell_presented {
+            return self.on_shell_present(id);
+        }
+        let cover =
+            crate::ui::layout::primary_monitor_cover().unwrap_or(crate::ui::layout::MonitorCover {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+        layout::set_shell_level(id, true)
+            .chain(layout::show_shell_at_cover(id, cover))
+            .chain(layout::force_shell_foreground(id))
     }
 
     /// Present the shell on the monitor after the offscreen entrance frame.
@@ -73,6 +103,7 @@ impl App {
             return Task::none();
         }
         let mode = self.shell_mode;
+        self.shell_presented = true;
         let level = self.shell_level_task(mode);
         let toast = self.shell_toast_task(mode);
         let show = if crate::platform::debug_quiet::enabled() {
@@ -88,7 +119,7 @@ impl App {
                 },
             );
             layout::show_shell_at_cover(id, cover)
-                .chain(layout::focus_window(id))
+                .chain(layout::force_shell_foreground(id))
                 .chain(self.sync_toast_zorder())
         };
         let launcher = if mode == ShellScreen::Launcher {
@@ -268,11 +299,13 @@ impl App {
         }
     }
 
-    fn shell_level_task(&self, mode: ShellScreen) -> Task<Message> {
+    fn shell_level_task(&self, _mode: ShellScreen) -> Task<Message> {
         let Some(id) = self.shell_window else {
             return Task::none();
         };
-        layout::set_shell_level(id, mode == ShellScreen::Home)
+        // The whole shell is a console cover: keep it in the topmost band so
+        // a running borderless game can never cover the Launcher/Browser.
+        layout::set_shell_level(id, true)
     }
 
     pub(crate) fn start_shell_enter(&mut self, mode: ShellScreen) -> Task<Message> {
@@ -312,6 +345,7 @@ impl App {
             return self.maybe_resume_ps_after_close();
         }
         self.shell_hidden = true;
+        self.shell_presented = false;
         self.shell_pending_show = false;
         self.pending_shell_mode = None;
         self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;

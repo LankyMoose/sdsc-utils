@@ -139,6 +139,35 @@ pub fn focus_window<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     window::gain_focus(id)
 }
 
+/// Force the one shell HWND to the foreground. Quiet/automated runs never
+/// steal focus.
+pub fn force_shell_foreground<Message: Send + 'static>(id: window::Id) -> Task<Message> {
+    if crate::platform::debug_quiet::enabled() {
+        return Task::none();
+    }
+    #[cfg(windows)]
+    {
+        window::run(id, |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            let ok = host::force_foreground(hwnd);
+            crate::controller::hid::diag::diag_info(format!("ui-diag: shell foreground ok={ok}"));
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::gain_focus(id)
+    }
+}
+
 /// Show or hide the one shell HWND through the same raw Win32 path.
 ///
 /// iced's [`window::set_mode`] effect and the raw quiet-mode show path can

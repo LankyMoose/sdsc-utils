@@ -35,6 +35,8 @@ pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
+pub const VK_MENU: u8 = 0x12;
+pub const KEYEVENTF_KEYUP: u32 = 0x0002;
 /// Disable DWM open/close/minimize transitions for a window.
 pub const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
@@ -184,6 +186,10 @@ unsafe extern "system" {
     pub fn MonitorFromPoint(point: Point, flags: u32) -> isize;
     pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     pub fn GetForegroundWindow() -> isize;
+    pub fn SetForegroundWindow(hwnd: isize) -> i32;
+    pub fn SetActiveWindow(hwnd: isize) -> isize;
+    pub fn BringWindowToTop(hwnd: isize) -> i32;
+    pub fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
     pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
     pub fn ShowCursor(show: i32) -> i32;
     pub fn GetCursorInfo(info: *mut CursorInfo) -> i32;

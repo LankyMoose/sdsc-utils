@@ -163,8 +163,9 @@ meters still use the legacy per-surface bank.
   only. PS dismisses to desktop; Circle again from the tabs view returns Home.
 - **Share/Create toggles the tabs view.** It has no Browser header. The tabs
   card is ~30% narrower than the page card and its height is driven by the
-  content: one horizontally scrollable row of page-aspect cards (plus first),
-  a bookmark strip, and the footer island. D-pad and the left stick move card
+  content: one horizontally scrollable, newest-first row of page-aspect cards (plus
+  first), a bookmark strip, and the footer island. A reserved scrollbar lane
+  appears below the row when tabs overflow. D-pad and the left stick move card
   focus through the shared per-pad `NavBank` (MENU deadzone/repeat/neutral
   grace/arming) and scroll the focused card into view; Cross expands the
   focused card (or the plus card/new tab/bookmark), Square closes the focused

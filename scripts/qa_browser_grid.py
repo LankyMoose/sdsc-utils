@@ -142,13 +142,23 @@ def grid_card_rects(
     bookmark_h = 88.0
     island_gap = 10.0
     island_h = 44.0
+    scrollbar_lane = 9.0
     page_aspect = pw / ph
     card_total_w = round((pw + 2 * pad) * 0.70)
     area_w = card_total_w - 2 * pad
     row_w = area_w - 2 * grid_pad
     card_w = max((row_w - 3 * gap) / 4, 150.0)
     card_h = card_w / page_aspect
-    area_h = grid_pad + card_h + gap + bookmark_h + island_gap + island_h + grid_pad
+    area_h = (
+        grid_pad
+        + card_h
+        + scrollbar_lane
+        + gap
+        + bookmark_h
+        + island_gap
+        + island_h
+        + grid_pad
+    )
     card_x = (width - card_total_w) / 2
     card_y = (height - (area_h + 2 * pad)) / 2
     row_x = card_x + pad + grid_pad
@@ -235,7 +245,7 @@ def main() -> int:
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
-        {"app": "browser", "action": "grid.activate", "params": {"index": 0}},
+        {"app": "browser", "action": "grid.activate", "params": {"index": 1}},
         {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
@@ -367,11 +377,11 @@ def main() -> int:
             ("grid active card content", has_color(grid_colors, red) or has_color(grid_colors, cream)),
             ("bookmark star filled", has_color(star_colors, gold, 42, 1)),
             ("page B band", has_color(page_b_colors, blue)),
-            ("two-card grid first tab", has_color(two_grid, red)),
-            ("two-card grid second tab", has_color(two_grid_second, blue)),
+            ("two-card grid first tab", has_color(two_grid, blue)),
+            ("two-card grid second tab", has_color(two_grid_second, red)),
             ("switched page A band", has_color(page_a_again, red)),
-            ("closing active tab activates the neighbour", has_color(closed_active, blue)),
-            ("PS resume restored the grid", has_color(resumed_grid, blue) or has_color(resumed_grid, cream)),
+            ("closing a stored tab keeps the active page", has_color(closed_active, red)),
+            ("PS resume restored the grid", has_color(resumed_grid, red) or has_color(resumed_grid, cream)),
         ]
         for label, ok in checks:
             print(f"check {label}: {'ok' if ok else 'FAIL'}")

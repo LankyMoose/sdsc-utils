@@ -436,9 +436,11 @@ impl BrowserPanel {
             .filter(|id| self.tab_page(*id).is_some())
             .collect();
         self.grid.visual.retain(|id| valid.contains(id));
+        // Newest first: prepend newly-created tabs. Iterating creation order
+        // means the newest insert lands at index 0.
         for id in valid {
             if !self.grid.visual.contains(&id) {
-                self.grid.visual.push(id);
+                self.grid.visual.insert(0, id);
             }
         }
     }

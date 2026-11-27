@@ -848,6 +848,9 @@ impl PadInterpreterBank {
 pub struct PadActionGate {
     last_seq: u64,
     armed: HashSet<PadId>,
+    /// Taps accepted since the pad last showed that button pressed. A
+    /// duplicate release edge cannot emit the same tap twice.
+    tap_latched: HashSet<(PadId, PadButton)>,
 }
 
 impl PadActionGate {
@@ -866,14 +869,32 @@ impl PadActionGate {
         self.last_seq = seq;
         if reset_arming {
             self.armed.clear();
+            self.tap_latched.clear();
         }
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
         self.armed.retain(|id| live.contains(id));
-        let accepted = actions
-            .iter()
-            .filter(|action| self.armed.contains(&action.pad))
-            .cloned()
-            .collect();
+        self.tap_latched.retain(|(pad, _)| live.contains(pad));
+        // A fresh press re-arms that button's tap latch.
+        for reading in readings {
+            for button in PadButton::ALL {
+                if button.raw(&reading.sample) {
+                    self.tap_latched.remove(&(reading.id.clone(), button));
+                }
+            }
+        }
+        let mut accepted = Vec::new();
+        for action in actions {
+            if !self.armed.contains(&action.pad) {
+                continue;
+            }
+            if action.action == PadButtonAction::Tap {
+                let key = (action.pad.clone(), action.button);
+                if !self.tap_latched.insert(key) {
+                    continue;
+                }
+            }
+            accepted.push(action.clone());
+        }
         for reading in readings {
             if sample_nav_resting(&reading.sample) {
                 self.armed.insert(reading.id.clone());
@@ -2908,6 +2929,45 @@ mod tests {
                 .expect("post-rest edge")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn action_gate_drops_a_duplicate_release_tap() {
+        let pad = PadId("hid:a".into());
+        let tap = PadAction {
+            pad: pad.clone(),
+            button: PadButton::Square,
+            action: PadButtonAction::Tap,
+        };
+        let resting = [reading("hid:a", PadSample::default())];
+        let press = [reading(
+            "hid:a",
+            PadSample {
+                square: true,
+                held: [GestureControl::Square].into_iter().collect(),
+                ..Default::default()
+            },
+        )];
+        let mut gate = PadActionGate::default();
+        assert!(gate.begin(1, false, &resting, &[]).expect("arm").is_empty());
+        assert_eq!(
+            gate.begin(2, false, &resting, std::slice::from_ref(&tap))
+                .expect("first tap"),
+            vec![tap.clone()]
+        );
+        // The same release delivered again before a new press is a duplicate.
+        assert!(
+            gate.begin(3, false, &resting, std::slice::from_ref(&tap))
+                .expect("duplicate")
+                .is_empty()
+        );
+        // A real press clears the latch; the next release taps again.
+        assert!(gate.begin(4, false, &press, &[]).expect("press").is_empty());
+        assert_eq!(
+            gate.begin(5, false, &resting, std::slice::from_ref(&tap))
+                .expect("second tap"),
+            vec![tap]
         );
     }
 

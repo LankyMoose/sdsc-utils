@@ -86,6 +86,10 @@ pub const TABS_VISIBLE: usize = 4;
 const TABS_MIN_CARD_W: f32 = 150.0;
 const TABS_ISLAND_H: f32 = 44.0;
 const TABS_ISLAND_GAP: f32 = 10.0;
+/// Reserved horizontal-scrollbar lane below the card row. Always present so
+/// showing/hiding the scrollbar never reflows the cards or bookmark strip.
+const TABS_SCROLLBAR_LANE: f32 = 9.0;
+const TABS_SCROLLBAR_THICKNESS: f32 = 6.0;
 pub const BOOKMARK_ROW_H: f32 = 88.0;
 const BOOKMARK_GAP: f32 = 10.0;
 pub const BOOKMARK_CARD_W: f32 = 168.0;
@@ -235,11 +239,12 @@ impl GridState {
         self.anim_generation
     }
 
-    /// Rebuild the frozen strip in stable tab order. Entering a tab must not
-    /// move it; the active tab only sets focus.
+    /// Rebuild the frozen strip newest-first. Entering a tab must not move
+    /// it; the active tab only sets focus.
     pub fn refresh_visual(&mut self, active: TabId, order: &[TabId]) {
         self.visual.clear();
-        for id in order {
+        // Newest first: the strip opens on the tab the user just created.
+        for id in order.iter().rev() {
             if !self.visual.contains(id) {
                 self.visual.push(*id);
             }
@@ -440,14 +445,20 @@ pub fn tabs_layout(area_w: f32, page_aspect: f32) -> TabsLayout {
     let card_w = fit_w.max(TABS_MIN_CARD_W);
     let aspect = page_aspect.max(0.1);
     let card_h = (card_w / aspect).max(1.0);
-    let area_h =
-        GRID_PAD + card_h + GRID_GAP + BOOKMARK_ROW_H + TABS_ISLAND_GAP + TABS_ISLAND_H + GRID_PAD;
+    let area_h = GRID_PAD
+        + card_h
+        + TABS_SCROLLBAR_LANE
+        + GRID_GAP
+        + BOOKMARK_ROW_H
+        + TABS_ISLAND_GAP
+        + TABS_ISLAND_H
+        + GRID_PAD;
     let row = Rectangle::new(
         iced::Point::new(GRID_PAD, GRID_PAD),
-        Size::new(row_w, card_h),
+        Size::new(row_w, card_h + TABS_SCROLLBAR_LANE),
     );
     let bookmarks = Rectangle::new(
-        iced::Point::new(GRID_PAD, GRID_PAD + card_h + GRID_GAP),
+        iced::Point::new(GRID_PAD, GRID_PAD + card_h + TABS_SCROLLBAR_LANE + GRID_GAP),
         Size::new(row_w, BOOKMARK_ROW_H),
     );
     let island = Rectangle::new(
@@ -566,6 +577,38 @@ pub fn page_view<'a>(
     ticker(body, state.anim.is_some())
 }
 
+fn tabs_scroll_style(theme: &iced::Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut style = scrollable::default(theme, status);
+    let hovered = matches!(
+        status,
+        scrollable::Status::Hovered {
+            is_horizontal_scrollbar_hovered: true,
+            ..
+        } | scrollable::Status::Dragged {
+            is_horizontal_scrollbar_dragged: true,
+            ..
+        }
+    );
+    style.horizontal_rail = scrollable::Rail {
+        background: Some(iced::Background::Color(theme::alpha(theme::BASE_BG, 0.55))),
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..iced::Border::default()
+        },
+        scroller: scrollable::Scroller {
+            background: iced::Background::Color(theme::alpha(
+                if hovered { theme::INK } else { theme::MUTED },
+                0.72,
+            )),
+            border: iced::Border {
+                radius: 3.0.into(),
+                ..iced::Border::default()
+            },
+        },
+    };
+    style
+}
+
 fn tab_strip<'a>(
     tabs: &[GridTab],
     layout: &TabsLayout,
@@ -603,8 +646,12 @@ fn tab_strip<'a>(
     scrollable(content)
         .id(tabs_scroll_id())
         .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::hidden(),
+            scrollable::Scrollbar::new()
+                .width(TABS_SCROLLBAR_THICKNESS)
+                .scroller_width(TABS_SCROLLBAR_THICKNESS)
+                .margin(1.0),
         ))
+        .style(tabs_scroll_style)
         .on_scroll(|viewport| BrowserMessage::TabsScrolled(viewport.absolute_offset().x))
         .width(Length::Fixed(layout.row.width))
         .height(Length::Fixed(layout.row.height))
@@ -1747,6 +1794,7 @@ mod tests {
             (layout.area_h
                 - (GRID_PAD
                     + layout.card_h
+                    + TABS_SCROLLBAR_LANE
                     + GRID_GAP
                     + BOOKMARK_ROW_H
                     + TABS_ISLAND_GAP
@@ -1861,13 +1909,13 @@ mod tests {
         panel.session.begin_load("https://a.test/".to_string());
         let (new_tab, _) = panel.create_tab("https://b.test/".to_string());
         panel.refresh_grid_visual();
-        assert_eq!(panel.grid.visual, vec![TabId::BOOT, new_tab]);
+        assert_eq!(panel.grid.visual, vec![new_tab, TabId::BOOT]);
         assert_eq!(panel.grid.focus, GridFocus::Tab(new_tab));
         assert_eq!(grid_tabs(&panel, &panel.grid.visual).len(), 2);
 
         panel.activate_tab(TabId::BOOT);
         panel.sync_grid_visual();
         // Entering a tab never moves it to the front of the grid.
-        assert_eq!(panel.grid.visual, vec![TabId::BOOT, new_tab]);
+        assert_eq!(panel.grid.visual, vec![new_tab, TabId::BOOT]);
     }
 }

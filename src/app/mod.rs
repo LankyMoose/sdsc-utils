@@ -237,6 +237,8 @@ pub enum Message {
     /// Shell is shown offscreen with the entrance pose; present it on the
     /// monitor after one paint.
     ShellPresent(window::Id),
+    /// Safety net: re-present/re-focus the shell if the first present was lost.
+    ShellFocusFallback(window::Id),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
     ShellFadeTick,
     /// PS Home window opened (focus it once the renderer exists).
@@ -408,6 +410,7 @@ impl Message {
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
+            | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
             | Message::LauncherFrame
@@ -553,6 +556,7 @@ impl Message {
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
+            | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
             #[cfg(feature = "cef-engine")]
@@ -828,6 +832,8 @@ pub struct App {
     /// A shell screen is opening (Home/Browser/Launcher). Keeps the cursor
     /// hidden across a swap before the replacement window exists.
     shell_opening: bool,
+    /// The current show sequence already ran its present/focus pass.
+    shell_presented: bool,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
     launcher_file_dialog_open: bool,
     /// PS fires on release only; a reset consumes the current hold.
@@ -1256,6 +1262,7 @@ impl App {
             launcher_home_pause: None,
             shell_cursor_hidden: false,
             shell_opening: false,
+            shell_presented: false,
             launcher_file_dialog_open: false,
             ps_release: ChordReleaseDetector::default(),
             home_face_latch_until: None,
@@ -2255,6 +2262,7 @@ impl App {
             Message::WindowShowNow(id) => self.on_shell_show_now(id),
             Message::ShellOpened(id) => self.on_shell_opened(id),
             Message::ShellPresent(id) => self.on_shell_present(id),
+            Message::ShellFocusFallback(id) => self.on_shell_focus_fallback(id),
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();
