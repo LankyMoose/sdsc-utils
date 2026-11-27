@@ -161,22 +161,27 @@ meters still use the legacy per-surface bank.
   L3 toggles magnet; R3 dumps an issue bundle. Circle from the page opens the
   tabs view (if editing, it cancels the edit first); Escape cancels the edit
   only. PS dismisses to desktop; Circle again from the tabs view returns Home.
-- **Share/Create toggles the tabs view.** It has no Browser header. D-pad and
-  the left stick move card focus through the shared per-pad `NavBank` (MENU
-  deadzone/repeat/neutral grace/arming); Cross expands the focused
-  card (or the plus card/new tab/bookmark), Square closes the focused tab
-  (the last tab resets to the default page instead of leaving zero tabs),
-  Triangle toggles its bookmark, Down from the last card row enters the
-  bookmark strip, Share/Create leaves back to the active page, and Circle
-  returns Home. L1/R1 swap pages (chevron buttons do the same); right stick
-  scrolls the bookmark strip.
+- **Share/Create toggles the tabs view.** It has no Browser header. The tabs
+  card is ~30% narrower than the page card and its height is driven by the
+  content: one horizontally scrollable row of page-aspect cards (plus first),
+  a bookmark strip, and the footer island. D-pad and the left stick move card
+  focus through the shared per-pad `NavBank` (MENU deadzone/repeat/neutral
+  grace/arming) and scroll the focused card into view; Cross expands the
+  focused card (or the plus card/new tab/bookmark), Square closes the focused
+  tab (the last tab resets to the default page instead of leaving zero tabs),
+  Triangle toggles its bookmark, Down enters the bookmark strip (Up returns to
+  the row), Share/Create leaves back to the active page, and Circle returns
+  Home while persisting the focused card. There is no L1/R1 paging. Right
+  stick scrolls the row (or the bookmark strip while it owns focus).
   Mouse click/wheel work. L1/R1/Options page-history actions are disabled while
-  tabs view owns the surface. Slot 0 is always the plus card; 11 tabs per page;
-  card and plus aspect matches the live page aspect. The FLIP overlay reuses
-  the tab's `FrameSlot`; the engine is not resized, so page pixels/aspect are
-  exact. Background tabs show their last painted frame; restored unopened tabs
-  show a card placeholder. Each card has a bottom title footer with ellipsis,
-  and a Launcher-style glass island shows the action hints.
+  tabs view owns the surface. Slot 0 is always the plus card; card and plus
+  aspect matches the live page aspect. The card shell resizes between the page
+  and tabs cards on the same draw-time clock as the FLIP; the FLIP overlay
+  reuses the tab's `FrameSlot`, and the engine is not resized, so page
+  pixels/aspect are exact. The header scales with the card rather than being
+  clipped by it. Background tabs show their last painted frame; restored
+  unopened tabs show a card placeholder. Each card has a bottom title footer
+  with ellipsis, and a Launcher-style glass island shows the action hints.
 - Real keyboard input goes to the page as `RAWKEYDOWN` + `CHAR` + `KEYUP`
   (text needs the separate `CHAR` leg). `Ctrl+R` and `Alt+Left`/`Alt+Right`
   stay app shortcuts; while the URL well is editing, printable keys/backspace/

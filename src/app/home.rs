@@ -183,7 +183,6 @@ impl HomeApps {
 use super::{App, Message};
 use crate::browser::keys::RawKey;
 use crate::ui::home as home_view;
-use crate::ui::launcher::gesture::ChordReleaseTick;
 use crate::ui::launcher::input as launcher_input;
 use crate::ui::layout::{MonitorCover, focus_window, primary_monitor_cover};
 use iced::{Task, window};
@@ -267,7 +266,7 @@ impl App {
                 // semantics); PS owns the restore target.
                 self.ps_resume = Some(ShellScreen::Home);
                 self.ps_resume_pending = false;
-                self.arm_chord_release_latch();
+                self.consume_ps_release();
                 task
             }
             Some(ShellScreen::Browser) => {
@@ -281,7 +280,7 @@ impl App {
                 let task = self.close_osk("ps").chain(self.close_browser_window());
                 self.ps_resume = Some(ShellScreen::Browser);
                 self.ps_resume_pending = false;
-                self.arm_chord_release_latch();
+                self.consume_ps_release();
                 crate::controller::hid::diag::diag_info("ui-diag: PS dismiss screen=Browser");
                 task
             }
@@ -394,7 +393,10 @@ impl App {
         let close = if self.browser_visible {
             let close_osk = self.close_osk("circle_home");
             self.browser.panel.cancel_url_edit();
-            close_osk.chain(self.close_browser_window())
+            // Circle from the tabs view selects the focused card for the next
+            // open, even when the user never entered it.
+            let persist = self.persist_grid_selection();
+            close_osk.chain(persist).chain(self.close_browser_window())
         } else if self.launcher_visible {
             let close_osk = self.close_osk("circle_home");
             close_osk.chain(self.retire_launcher_for_home())
@@ -501,7 +503,7 @@ impl App {
         self.sync_home_settings();
         self.sync_home_controllers();
         // The opening PS press must not toggle Home straight back closed.
-        self.arm_chord_release_latch();
+        self.consume_ps_release();
         self.session.auto_open_pending = false;
         crate::controller::hid::diag::diag_info("ui-diag: home open");
         self.activate_shell_mode(ShellScreen::Home, cover)
@@ -1058,7 +1060,7 @@ impl App {
         }
         self.sync_home_controllers();
         self.home_state.tick_identify_flash();
-        if self.home_chord_fires(readings) {
+        if self.ps_released(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: home chord dismiss");
             return self.ps_screen_toggle();
         }
@@ -1134,33 +1136,11 @@ impl App {
         }
     }
 
-    /// Shared PS chord detector for Home. Mirrors the Launcher-era toggle:
-    /// a rising chord fires once, and the release gate swallows the sticky
-    /// hold that opened Home.
-    pub(crate) fn home_chord_fires(&mut self, readings: &[launcher_input::NavReading]) -> bool {
+    /// Shared PS detector for Home/Browser/OSK. PS actions fire on the
+    /// release edge only: a held sample can never toggle a screen.
+    pub(crate) fn ps_released(&mut self, readings: &[launcher_input::NavReading]) -> bool {
         let required = crate::ui::launcher::gesture::default_gesture();
-        let chord_held = super::chord_held_on_any_pad(&required, readings);
-        let now = Instant::now();
-        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
-        if glitch {
-            crate::controller::hid::diag::diag_info("ui-diag: home chord glitch ignored");
-        }
-        match tick {
-            ChordReleaseTick::Blocked => {
-                if chord_held {
-                    self.gesture_detectors.consume_pending_match(readings);
-                }
-                false
-            }
-            ChordReleaseTick::Cleared => {
-                // The release matured between HID samples. Disarm first, then
-                // evaluate this sample: if it still holds the chord, it is a
-                // fresh press and must fire.
-                self.gesture_detectors.disarm(&required);
-                self.gesture_detectors.update(&required, readings)
-            }
-            ChordReleaseTick::Open => self.gesture_detectors.update(&required, readings),
-        }
+        self.ps_release.update(&required, readings)
     }
 }
 

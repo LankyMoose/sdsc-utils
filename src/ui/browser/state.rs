@@ -441,8 +441,6 @@ impl BrowserPanel {
                 self.grid.visual.push(id);
             }
         }
-        self.grid
-            .animate_layout_for_visual(std::time::Instant::now());
     }
 
     /// Restore every persisted tab: the saved active page becomes the live

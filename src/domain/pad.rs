@@ -5,7 +5,7 @@
 //! short input reads on the same handle so nav stays live during flashes.
 
 use crate::controller::hid::policy::Policy;
-use crate::domain::gesture::{GestureControl, GestureDetector};
+use crate::domain::gesture::GestureControl;
 use hidapi::HidDevice;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -2237,51 +2237,46 @@ impl NavBank {
     }
 }
 
-/// Per-pad reopen-gesture detectors (chord must complete on a single pad).
+/// Fires once when the required chord is *released* by the last pad holding
+/// it. Press edges never fire.
+///
+/// The HID edge stream drops resting neutrals, so a press-triggered action can
+/// double-fire when a later held sample arrives after a gap. Release-triggered
+/// actions are immune: a held sample can never toggle a screen.
 #[derive(Debug, Clone, Default)]
-pub struct GestureDetectorBank {
-    detectors: HashMap<PadId, GestureDetector>,
+pub struct ChordReleaseDetector {
+    holders: HashSet<PadId>,
 }
 
-impl GestureDetectorBank {
+impl ChordReleaseDetector {
     pub fn reset(&mut self) {
-        self.detectors.clear();
+        self.holders.clear();
     }
 
-    /// Mark every live pad as already armed so the current/sticky hold cannot
-    /// reopen the launcher (e.g. after open / close).
-    pub fn consume_pending_match(&mut self, readings: &[NavReading]) {
-        let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
-        self.detectors.retain(|id, _| live.contains(id));
-        for reading in readings {
-            self.detectors
-                .entry(reading.id.clone())
-                .or_default()
-                .mark_armed();
-        }
-    }
-
-    /// Feed an absent sample so the next held edge can fire. Used when the
-    /// release gate matures between HID samples (no absent sample arrived).
-    pub fn disarm(&mut self, required: &[GestureControl]) {
-        let absent = BTreeSet::new();
-        for detector in self.detectors.values_mut() {
-            let _ = detector.update(required, &absent);
-        }
-    }
-
-    /// Returns true when any single pad completes the chord this tick.
+    /// Feed the current readings. Returns true once on the sample where the
+    /// chord is no longer held and no other present pad still holds it.
     pub fn update(&mut self, required: &[GestureControl], readings: &[NavReading]) -> bool {
+        if required.is_empty() {
+            self.holders.clear();
+            return false;
+        }
         let live: HashSet<PadId> = readings.iter().map(|r| r.id.clone()).collect();
-        self.detectors.retain(|id, _| live.contains(id));
-
-        let mut fired = false;
+        let mut now_holders = HashSet::new();
         for reading in readings {
-            let detector = self.detectors.entry(reading.id.clone()).or_default();
-            if detector.update(required, &reading.sample.held) {
-                fired = true;
+            if required
+                .iter()
+                .all(|control| reading.sample.held.contains(control))
+            {
+                now_holders.insert(reading.id.clone());
             }
         }
+        // A pad that vanished while holding (disconnect) is not a release.
+        let released = self
+            .holders
+            .iter()
+            .any(|id| live.contains(id) && !now_holders.contains(id));
+        let fired = released && now_holders.is_empty() && !readings.is_empty();
+        self.holders = now_holders;
         fired
     }
 }
@@ -3430,56 +3425,6 @@ mod tests {
     }
 
     #[test]
-    fn reopen_gesture_requires_full_chord_on_one_pad() {
-        let mut bank = GestureDetectorBank::default();
-        let required = crate::ui::launcher::gesture::default_gesture();
-
-        let a = chord_sample(&[GestureControl::L2]);
-        let b = chord_sample(&[GestureControl::R2]);
-        assert!(!bank.update(&required, &[reading("a", a), reading("b", b)]));
-
-        let full = chord_sample(&[GestureControl::Ps]);
-        assert!(bank.update(
-            &required,
-            &[reading("a", full), reading("b", PadSample::default())]
-        ));
-    }
-
-    #[test]
-    fn consume_pending_match_suppresses_sticky_reopen() {
-        let mut bank = GestureDetectorBank::default();
-        let required = crate::ui::launcher::gesture::default_gesture();
-        let empty = [reading("a", PadSample::default())];
-        bank.consume_pending_match(&empty);
-
-        let sticky = chord_sample(&[GestureControl::Ps]);
-        assert!(
-            !bank.update(&required, &[reading("a", sticky.clone())]),
-            "sticky rematch after record must not fire"
-        );
-
-        assert!(!bank.update(&required, &[reading("a", PadSample::default())]));
-        assert!(bank.update(&required, &[reading("a", sticky)]));
-    }
-
-    #[test]
-    fn disarm_without_absent_sample_allows_rehold() {
-        let mut bank = GestureDetectorBank::default();
-        let required = crate::ui::launcher::gesture::default_gesture();
-        let held = chord_sample(&[GestureControl::Ps]);
-        bank.consume_pending_match(&[reading("a", held.clone())]);
-        assert!(
-            !bank.update(&required, &[reading("a", held.clone())]),
-            "same physical hold must stay consumed"
-        );
-        // The HID edge stream drops resting neutral samples, so the release
-        // gate matures between samples. Disarming explicitly must let the next
-        // held sample fire.
-        bank.disarm(&required);
-        assert!(bank.update(&required, &[reading("a", held)]));
-    }
-
-    #[test]
     fn new_pad_holding_cross_does_not_confirm() {
         let mut bank = PadNavBank::default();
         bank.prepare_on_open(false);
@@ -4619,5 +4564,91 @@ mod tests {
             unlocked.update(&tie, t0 + Duration::from_millis(100), true, true),
             None
         );
+    }
+    #[test]
+    fn ps_release_detector_fires_on_release_only() {
+        use crate::domain::gesture::default_gesture;
+        use crate::domain::pad::{NavReading, PadId, PadSample};
+        let required = default_gesture();
+        let held = PadSample {
+            held: [crate::domain::gesture::GestureControl::Ps]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let reading = |sample: PadSample| NavReading {
+            id: PadId("hid:a".into()),
+            sample,
+            source: "hid",
+        };
+        let mut detector = ChordReleaseDetector::default();
+        assert!(!detector.update(&required, &[]));
+        assert!(!detector.update(&required, &[reading(held.clone())]));
+        assert!(!detector.update(&required, &[reading(held.clone())]));
+        assert!(detector.update(&required, &[reading(PadSample::default())]));
+        assert!(!detector.update(&required, &[reading(PadSample::default())]));
+        assert!(!detector.update(&required, &[reading(held.clone())]));
+        assert!(detector.update(&required, &[reading(PadSample::default())]));
+    }
+
+    #[test]
+    fn ps_release_detector_waits_for_the_last_holder() {
+        use crate::domain::gesture::default_gesture;
+        use crate::domain::pad::{NavReading, PadId, PadSample};
+        let required = default_gesture();
+        let held = PadSample {
+            held: [crate::domain::gesture::GestureControl::Ps]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let reading = |id: &str, sample: PadSample| NavReading {
+            id: PadId(id.into()),
+            sample,
+            source: "hid",
+        };
+        let mut detector = ChordReleaseDetector::default();
+        assert!(!detector.update(&required, &[reading("a", held.clone())]));
+        assert!(!detector.update(
+            &required,
+            &[reading("a", held.clone()), reading("b", held.clone())]
+        ));
+        assert!(!detector.update(
+            &required,
+            &[
+                reading("a", PadSample::default()),
+                reading("b", held.clone())
+            ]
+        ));
+        assert!(detector.update(
+            &required,
+            &[
+                reading("a", PadSample::default()),
+                reading("b", PadSample::default())
+            ]
+        ));
+    }
+
+    #[test]
+    fn ps_release_detector_ignores_disconnects() {
+        use crate::domain::gesture::default_gesture;
+        use crate::domain::pad::{NavReading, PadId, PadSample};
+        let required = default_gesture();
+        let held = PadSample {
+            held: [crate::domain::gesture::GestureControl::Ps]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let reading = |sample: PadSample| NavReading {
+            id: PadId("hid:a".into()),
+            sample,
+            source: "hid",
+        };
+        let mut detector = ChordReleaseDetector::default();
+        assert!(!detector.update(&required, &[reading(held)]));
+        // A vanished pad is not a release, and a later neutral sample is quiet.
+        assert!(!detector.update(&required, &[]));
+        assert!(!detector.update(&required, &[reading(PadSample::default())]));
     }
 }

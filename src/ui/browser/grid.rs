@@ -19,7 +19,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Renderer as _, Shell, overlay, renderer};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
+use iced::widget::{container, mouse_area, row, scrollable, space, stack, svg, text};
 use iced::{
     Alignment, Background, Element, Event, Fill, Length, Padding, Point, Rectangle, Size,
     Transformation, Vector, mouse, window,
@@ -78,18 +78,14 @@ pub(crate) fn reset_grid_anim_frames() {
 
 const GRID_PAD: f32 = 18.0;
 const GRID_GAP: f32 = 14.0;
-pub const TABS_COLS: usize = 4;
-pub const TABS_ROWS: usize = 3;
-pub const TABS_SLOTS: usize = TABS_COLS * TABS_ROWS;
-/// One slot is always the leading plus card.
-pub const TABS_PER_PAGE: usize = TABS_SLOTS - 1;
-const LAYOUT_ANIM_MS: u64 = 240;
-pub const PAGE_SLIDE_MS: u64 = 220;
-const TABS_SIDE_W: f32 = 64.0;
+/// Compact tabs card width as a fraction of the page-mode card width.
+pub const TABS_CARD_SCALE: f32 = 0.70;
+/// Cards visible across the strip at the default width.
+pub const TABS_VISIBLE: usize = 4;
+/// Keep cards touchable on narrow stages; the strip scrolls instead.
+const TABS_MIN_CARD_W: f32 = 150.0;
 const TABS_ISLAND_H: f32 = 44.0;
 const TABS_ISLAND_GAP: f32 = 10.0;
-const PAGE_PILL_W: f32 = 58.0;
-const PAGE_PILL_H: f32 = 30.0;
 pub const BOOKMARK_ROW_H: f32 = 88.0;
 const BOOKMARK_GAP: f32 = 10.0;
 pub const BOOKMARK_CARD_W: f32 = 168.0;
@@ -120,11 +116,11 @@ pub enum GridFocus {
 pub struct GridAnim {
     pub generation: u64,
     pub started: Instant,
-    pub source: Rectangle,
-    pub target: Rectangle,
     /// Tab whose page texture rides the FLIP.
     pub tab: TabId,
     pub entering: bool,
+    /// Card the page morphs to (entering) or from (leaving).
+    pub card: GridFocus,
 }
 
 impl GridAnim {
@@ -139,17 +135,12 @@ impl GridAnim {
         }
     }
 
-    pub fn rect(&self, now: Instant) -> Rectangle {
-        let t = self.progress(now);
-        lerp_rect(self.source, self.target, t)
-    }
-
     pub fn done(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.started) >= GRID_ANIM
     }
 }
 
-fn lerp_rect(a: Rectangle, b: Rectangle, t: f32) -> Rectangle {
+pub fn lerp_rect(a: Rectangle, b: Rectangle, t: f32) -> Rectangle {
     Rectangle::new(
         iced::Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t),
         Size::new(
@@ -157,6 +148,27 @@ fn lerp_rect(a: Rectangle, b: Rectangle, t: f32) -> Rectangle {
             a.height + (b.height - a.height) * t,
         ),
     )
+}
+
+/// Card shell rect at `now`: full page card in page mode, compact in tabs,
+/// and a synchronized lerp during either FLIP.
+pub fn card_rect_at(
+    mode: GridMode,
+    anim: Option<GridAnim>,
+    page: Rectangle,
+    tabs: Rectangle,
+    now: Instant,
+) -> Rectangle {
+    match mode {
+        GridMode::Page => page,
+        GridMode::Grid => tabs,
+        GridMode::Entering => anim
+            .map(|anim| lerp_rect(page, tabs, anim.progress(now)))
+            .unwrap_or(tabs),
+        GridMode::Leaving => anim
+            .map(|anim| lerp_rect(tabs, page, anim.progress(now)))
+            .unwrap_or(page),
+    }
 }
 
 /// Scale + translation that maps `source` exactly onto `target`. Both rects
@@ -171,73 +183,20 @@ fn flip_transform(source: Rectangle, target: Rectangle) -> (f32, f32, f32) {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PageAnim {
-    pub generation: u64,
-    pub started: Instant,
-    /// +1 = next page enters from the right; -1 = previous from the left.
-    pub direction: i8,
-    pub from_page: usize,
-    /// Focus ring on the outgoing page (the live focus already moved to the
-    /// incoming page).
-    pub from_focus: GridFocus,
-}
-
-impl PageAnim {
-    fn progress(&self, now: Instant) -> f32 {
-        let t = (now.saturating_duration_since(self.started).as_secs_f32()
-            / (PAGE_SLIDE_MS as f32 / 1000.0))
-            .clamp(0.0, 1.0);
-        crate::ui::motion::ease_in_out_cubic(t)
-    }
-
-    fn done(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.started).as_millis() as u64 >= PAGE_SLIDE_MS
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LayoutAnim {
-    pub started: Instant,
-    pub from: f32,
-    pub to: f32,
-}
-
-impl LayoutAnim {
-    fn progress(&self, now: Instant) -> f32 {
-        let t = (now.saturating_duration_since(self.started).as_secs_f32()
-            / (LAYOUT_ANIM_MS as f32 / 1000.0))
-            .clamp(0.0, 1.0);
-        crate::ui::motion::ease_in_out_cubic(t)
-    }
-
-    fn done(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.started).as_millis() as u64 >= LAYOUT_ANIM_MS
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct GridState {
     pub mode: GridMode,
     pub focus: GridFocus,
-    /// Visual strip order frozen for this grid session. Keeps FLIP source
-    /// rects stable while tab activation changes the live page.
+    /// Frozen strip order for this grid session. Entering a tab never
+    /// reorders it.
     pub visual: Vec<TabId>,
-    /// Slots page (0-based); each page starts with the plus card.
-    pub page: usize,
+    /// Tracked horizontal strip offset (scrollable reports it).
+    pub tab_scroll_x: f32,
     pub bookmark_scroll_x: f32,
+    /// Row card to restore when leaving the bookmark strip (Up).
+    pub row_focus: GridFocus,
     pub anim: Option<GridAnim>,
     pub anim_generation: u64,
-    /// Explicit FLIP source (plus-card exits) instead of deriving it from the
-    /// selected tab's card.
-    pub source_override: Option<Rectangle>,
-    /// Current side-gutter factor (0 = single page, full-width cards;
-    /// 1 = room for the L1/R1 pills). Animated when page count crosses one.
-    pub layout_side: f32,
-    pub layout_anim: Option<LayoutAnim>,
-    /// Page-change slide (L1/R1): outgoing and incoming pages slide as a
-    /// carousel with no reflow of the cards.
-    pub page_anim: Option<PageAnim>,
 }
 
 impl Default for GridState {
@@ -246,14 +205,11 @@ impl Default for GridState {
             mode: GridMode::Page,
             focus: GridFocus::Plus,
             visual: Vec::new(),
-            page: 0,
+            tab_scroll_x: 0.0,
             bookmark_scroll_x: 0.0,
+            row_focus: GridFocus::Plus,
             anim: None,
             anim_generation: 0,
-            source_override: None,
-            layout_side: 0.0,
-            layout_anim: None,
-            page_anim: None,
         }
     }
 }
@@ -279,9 +235,8 @@ impl GridState {
         self.anim_generation
     }
 
-    /// Rebuild the frozen visual strip in stable tab order. Entering a tab
-    /// must not move it to the front; the selected card is located by its
-    /// actual slot for the FLIP.
+    /// Rebuild the frozen strip in stable tab order. Entering a tab must not
+    /// move it; the active tab only sets focus.
     pub fn refresh_visual(&mut self, active: TabId, order: &[TabId]) {
         self.visual.clear();
         for id in order {
@@ -289,88 +244,47 @@ impl GridState {
                 self.visual.push(*id);
             }
         }
-        let active_index = self.visual.iter().position(|id| *id == active);
-        self.focus = if active_index.is_some() {
+        self.focus = if self.visual.contains(&active) {
             GridFocus::Tab(active)
         } else {
             GridFocus::Plus
         };
-        self.page = active_index.map(|index| index / TABS_PER_PAGE).unwrap_or(0);
+        self.tab_scroll_x = 0.0;
         self.bookmark_scroll_x = 0.0;
-        self.source_override = None;
-        self.layout_side = if page_count(self.visual.len()) > 1 {
-            1.0
+        self.row_focus = self.focus;
+        self.anim = None;
+    }
+}
+
+/// Grid focus after `closed` leaves the strip. Keeping the same index means
+/// the next tab slides into the freed slot; closing the last card selects the
+/// new last card. A different focused tab is untouched.
+pub fn focus_after_close(visual: &[TabId], focus: GridFocus, closed: TabId) -> GridFocus {
+    // The final tab is reset to the default page, not removed: keep its focus.
+    if visual.iter().all(|id| *id == closed) {
+        return focus;
+    }
+    let closed_index = visual.iter().position(|id| *id == closed);
+    let remaining: Vec<TabId> = visual.iter().copied().filter(|id| *id != closed).collect();
+    if focus == GridFocus::Tab(closed) {
+        if remaining.is_empty() {
+            GridFocus::Plus
         } else {
-            0.0
-        };
-        self.layout_anim = None;
-        self.page_anim = None;
-    }
-
-    pub fn page_animating(&self, now: Instant) -> bool {
-        self.page_anim.is_some_and(|anim| !anim.done(now))
-    }
-
-    pub fn layout_side(&self, now: Instant) -> f32 {
-        match self.layout_anim {
-            Some(anim) => anim.from + (anim.to - anim.from) * anim.progress(now),
-            None => self.layout_side,
+            let slot = closed_index.unwrap_or(0).min(remaining.len() - 1);
+            GridFocus::Tab(remaining[slot])
         }
-    }
-
-    pub fn layout_animating(&self, now: Instant) -> bool {
-        self.layout_anim.is_some_and(|anim| !anim.done(now))
-    }
-
-    /// Animate the side gutters/card widths when the page count crosses one.
-    pub fn animate_layout_for_visual(&mut self, now: Instant) {
-        let target = if page_count(self.visual.len()) > 1 {
-            1.0
+    } else if let GridFocus::Tab(id) = focus {
+        if remaining.contains(&id) {
+            focus
         } else {
-            0.0
-        };
-        if let Some(anim) = self.layout_anim
-            && (anim.to - target).abs() < 0.001
-        {
-            return;
+            remaining
+                .first()
+                .copied()
+                .map(GridFocus::Tab)
+                .unwrap_or(GridFocus::Plus)
         }
-        let from = self.layout_side(now);
-        if (target - from).abs() < 0.001 {
-            self.layout_side = target;
-            self.layout_anim = None;
-            return;
-        }
-        self.layout_anim = Some(LayoutAnim {
-            started: now,
-            from,
-            to: target,
-        });
-    }
-
-    pub fn clear_finished_layout(&mut self, now: Instant) {
-        if self.layout_anim.is_some_and(|anim| anim.done(now))
-            && let Some(anim) = self.layout_anim.take()
-        {
-            self.layout_side = anim.to;
-        }
-    }
-
-    pub fn page_count(&self) -> usize {
-        page_count(self.visual.len())
-    }
-
-    pub fn clamp_page(&mut self) {
-        let count = self.page_count();
-        self.page = self.page.min(count.saturating_sub(1));
-    }
-
-    pub fn page_prev(&mut self) {
-        self.page = self.page.saturating_sub(1);
-    }
-
-    pub fn page_next(&mut self) {
-        let count = self.page_count();
-        self.page = (self.page + 1).min(count.saturating_sub(1));
+    } else {
+        focus
     }
 }
 
@@ -431,128 +345,168 @@ pub fn visual_index(tabs: &[GridTab], id: TabId) -> Option<usize> {
     tabs.iter().position(|tab| tab.id == id)
 }
 
+/// Horizontal-strip geometry, relative to the compact card interior.
 #[derive(Debug, Clone, Copy)]
-pub struct GridLayout {
+pub struct TabsLayout {
     pub area_w: f32,
     pub area_h: f32,
-    pub grid: Rectangle,
+    pub row: Rectangle,
     pub bookmarks: Rectangle,
     pub island: Rectangle,
-    pub prev: Rectangle,
-    pub next: Rectangle,
-    pub cols: usize,
-    pub gap: f32,
     pub card_w: f32,
     pub card_h: f32,
+    pub gap: f32,
 }
 
-impl GridLayout {
-    /// Slot rect inside one tabs page. Slot 0 is the plus card.
-    pub fn card_rect(&self, slot: usize) -> Rectangle {
-        let cols = self.cols.max(1);
-        let col = slot % cols;
-        let row = slot / cols;
+impl TabsLayout {
+    /// Slot rect in content coordinates. Slot 0 is the plus card.
+    pub fn card_rect(&self, slot: usize, scroll_x: f32) -> Rectangle {
         Rectangle::new(
             iced::Point::new(
-                self.grid.x + col as f32 * (self.card_w + self.gap),
-                self.grid.y + row as f32 * (self.card_h + self.gap),
+                self.row.x - scroll_x + slot as f32 * (self.card_w + self.gap),
+                self.row.y,
             ),
             Size::new(self.card_w, self.card_h),
         )
     }
 
-    /// Where the page surface sits in page mode, relative to the full Browser
-    /// card interior (below the header row).
-    pub fn page_rect(&self) -> Rectangle {
-        Rectangle::new(
-            iced::Point::new(0.0, crate::ui::browser::state::BROWSER_HEADER_TOTAL),
-            Size::new(
-                self.area_w,
-                (self.area_h - crate::ui::browser::state::BROWSER_HEADER_TOTAL).max(1.0),
-            ),
-        )
+    pub fn content_width(&self, count: usize) -> f32 {
+        if count == 0 {
+            0.0
+        } else {
+            count as f32 * (self.card_w + self.gap) - self.gap
+        }
     }
 }
 
-pub fn page_count(tab_count: usize) -> usize {
-    (tab_count.max(1)).div_ceil(TABS_PER_PAGE).max(1)
+/// Compact tabs card and its content area in stage coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct TabsCardGeometry {
+    pub card: Rectangle,
+    pub inner: Rectangle,
+    pub layout: TabsLayout,
 }
 
-/// Start/end indices into the frozen visual strip for one page.
-pub fn page_range(tab_count: usize, page: usize) -> (usize, usize) {
-    let start = page.saturating_mul(TABS_PER_PAGE).min(tab_count);
-    let end = (start + TABS_PER_PAGE).min(tab_count);
-    (start, end)
-}
-
-#[cfg(test)]
-fn slots_on_page(tab_count: usize, page: usize) -> usize {
-    let (start, end) = page_range(tab_count, page);
-    1 + end.saturating_sub(start)
-}
-
-/// Tabs-view geometry: fixed 4x3 slots, plus card first, bookmark strip above
-/// the footer island, and side gutters for page chevrons.
-pub fn grid_layout(area_w: f32, area_h: f32) -> GridLayout {
-    grid_layout_side(area_w, area_h, 1.0)
-}
-
-pub fn grid_layout_side(area_w: f32, area_h: f32, side: f32) -> GridLayout {
-    let area_w = area_w.max(1.0);
-    let area_h = area_h.max(1.0);
-    let header = crate::ui::browser::state::BROWSER_HEADER_TOTAL;
-    let page_h = (area_h - header).max(1.0);
-    let aspect = area_w / page_h;
-    let inner_w = (area_w - 2.0 * GRID_PAD).max(1.0);
-    let island = Rectangle::new(
-        iced::Point::new(GRID_PAD, (area_h - GRID_PAD - TABS_ISLAND_H).max(0.0)),
-        Size::new(inner_w, TABS_ISLAND_H),
-    );
-    let side_w = TABS_SIDE_W * side.clamp(0.0, 1.0);
-    let grid_x = GRID_PAD + side_w;
-    let grid_w = (area_w - 2.0 * (GRID_PAD + side_w)).max(1.0);
-    let bottom = (island.y - TABS_ISLAND_GAP).max(0.0);
-    let max_grid_h = (bottom - GRID_PAD - GRID_GAP - BOOKMARK_ROW_H).max(1.0);
-    let width_w = (grid_w - (TABS_COLS.saturating_sub(1)) as f32 * GRID_GAP) / TABS_COLS as f32;
-    let height_w = ((max_grid_h - (TABS_ROWS.saturating_sub(1)) as f32 * GRID_GAP)
-        / TABS_ROWS as f32)
-        * aspect;
-    let card_w = width_w.min(height_w).max(1.0);
-    let card_h = (card_w / aspect).max(1.0);
-    let grid_h = TABS_ROWS as f32 * card_h + (TABS_ROWS.saturating_sub(1)) as f32 * GRID_GAP;
-    let group_h = grid_h + GRID_GAP + BOOKMARK_ROW_H;
-    let slack = (bottom - GRID_PAD - group_h).max(0.0);
-    let grid_y = GRID_PAD + slack * 0.5;
-    let bookmarks = Rectangle::new(
-        iced::Point::new(GRID_PAD, grid_y + grid_h + GRID_GAP),
-        Size::new(inner_w, BOOKMARK_ROW_H),
-    );
-    let grid = Rectangle::new(iced::Point::new(grid_x, grid_y), Size::new(grid_w, grid_h));
-    let center_y = grid.y + grid.height * 0.5 - PAGE_PILL_H * 0.5;
-    let prev = Rectangle::new(
+fn centered_rect(stage_w: f32, stage_h: f32, w: f32, h: f32) -> Rectangle {
+    Rectangle::new(
         iced::Point::new(
-            GRID_PAD,
-            center_y.clamp(GRID_PAD, area_h - GRID_PAD - PAGE_PILL_H),
+            ((stage_w - w) * 0.5).max(0.0),
+            ((stage_h - h) * 0.5).max(0.0),
         ),
-        Size::new(PAGE_PILL_W, PAGE_PILL_H),
+        Size::new(w, h),
+    )
+}
+
+/// Page-mode card rect (16:9, centered).
+pub fn page_card_rect(stage_w: f32, stage_h: f32) -> Rectangle {
+    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    centered_rect(stage_w, stage_h, layout.card_w, layout.card_h)
+}
+
+/// Page-mode card interior (header + page), centered.
+pub fn page_inner_rect(stage_w: f32, stage_h: f32) -> Rectangle {
+    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    let card = page_card_rect(stage_w, stage_h);
+    Rectangle::new(
+        iced::Point::new(
+            card.x + crate::ui::browser::state::BROWSER_CARD_PAD,
+            card.y + crate::ui::browser::state::BROWSER_CARD_PAD,
+        ),
+        Size::new(
+            layout.page_w,
+            layout.page_h + crate::ui::browser::state::BROWSER_HEADER_TOTAL,
+        ),
+    )
+}
+
+/// Page body rect (below the header) in stage coordinates.
+pub fn page_body_rect(stage_w: f32, stage_h: f32) -> Rectangle {
+    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    let inner = page_inner_rect(stage_w, stage_h);
+    Rectangle::new(
+        iced::Point::new(
+            inner.x,
+            inner.y + crate::ui::browser::state::BROWSER_HEADER_TOTAL,
+        ),
+        Size::new(layout.page_w, layout.page_h),
+    )
+}
+
+/// Single horizontal row of cards, bookmarks, and the footer island.
+pub fn tabs_layout(area_w: f32, page_aspect: f32) -> TabsLayout {
+    let area_w = area_w.max(1.0);
+    let row_w = (area_w - 2.0 * GRID_PAD).max(1.0);
+    let fit_w = (row_w - (TABS_VISIBLE.saturating_sub(1)) as f32 * GRID_GAP) / TABS_VISIBLE as f32;
+    let card_w = fit_w.max(TABS_MIN_CARD_W);
+    let aspect = page_aspect.max(0.1);
+    let card_h = (card_w / aspect).max(1.0);
+    let area_h =
+        GRID_PAD + card_h + GRID_GAP + BOOKMARK_ROW_H + TABS_ISLAND_GAP + TABS_ISLAND_H + GRID_PAD;
+    let row = Rectangle::new(
+        iced::Point::new(GRID_PAD, GRID_PAD),
+        Size::new(row_w, card_h),
     );
-    let next = Rectangle::new(
-        iced::Point::new(area_w - GRID_PAD - PAGE_PILL_W, prev.y),
-        Size::new(PAGE_PILL_W, PAGE_PILL_H),
+    let bookmarks = Rectangle::new(
+        iced::Point::new(GRID_PAD, GRID_PAD + card_h + GRID_GAP),
+        Size::new(row_w, BOOKMARK_ROW_H),
     );
-    GridLayout {
+    let island = Rectangle::new(
+        iced::Point::new(GRID_PAD, area_h - GRID_PAD - TABS_ISLAND_H),
+        Size::new(row_w, TABS_ISLAND_H),
+    );
+    TabsLayout {
         area_w,
         area_h,
-        grid,
+        row,
         bookmarks,
         island,
-        prev,
-        next,
-        cols: TABS_COLS,
-        gap: GRID_GAP,
         card_w,
         card_h,
+        gap: GRID_GAP,
     }
+}
+
+/// Compact tabs card geometry: 30% narrower than the page card, with the
+/// content driving the height. The top inset equals the side inset.
+pub fn tabs_card_geometry(stage_w: f32, stage_h: f32) -> TabsCardGeometry {
+    let page = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    let page_aspect = page.page_w / page.page_h.max(1.0);
+    let card_w = (page.card_w * TABS_CARD_SCALE).max(1.0);
+    let area_w = (card_w - 2.0 * crate::ui::browser::state::BROWSER_CARD_PAD).max(1.0);
+    let layout = tabs_layout(area_w, page_aspect);
+    let card_h = layout.area_h + 2.0 * crate::ui::browser::state::BROWSER_CARD_PAD;
+    let card = centered_rect(stage_w, stage_h, card_w, card_h);
+    let inner = Rectangle::new(
+        iced::Point::new(
+            card.x + crate::ui::browser::state::BROWSER_CARD_PAD,
+            card.y + crate::ui::browser::state::BROWSER_CARD_PAD,
+        ),
+        Size::new(area_w, layout.area_h),
+    );
+    TabsCardGeometry {
+        card,
+        inner,
+        layout,
+    }
+}
+
+/// Scroll offset that keeps `slot` fully inside the row viewport.
+pub fn reveal_offset(layout: &TabsLayout, slot: usize, count: usize, current: f32) -> f32 {
+    let max = (layout.content_width(count) - layout.row.width).max(0.0);
+    let current = current.clamp(0.0, max);
+    let x = slot as f32 * (layout.card_w + layout.gap);
+    if x < current {
+        x
+    } else if x + layout.card_w > current + layout.row.width {
+        x + layout.card_w - layout.row.width
+    } else {
+        current
+    }
+    .clamp(0.0, max)
+}
+
+pub fn tabs_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("browser-tabs-scroll")
 }
 
 pub fn bookmark_scroll_id() -> iced::widget::Id {
@@ -573,161 +527,62 @@ pub fn bookmark_content_width(count: usize) -> f32 {
     }
 }
 
-/// Tabs-view root: page card grid, bookmark strip, footer hint island, page
-/// chevrons, and the optional FLIP overlay.
+/// Tabs-view root: one horizontal card strip, bookmark strip, and footer
+/// island. The compact card height is exactly the strip + bookmarks + island
+/// plus the same inset on every side.
 pub fn page_view<'a>(
     panel: &'a BrowserPanel,
     engine_available: bool,
     area_w: f32,
-    area_h: f32,
+    page_aspect: f32,
     fade: f32,
 ) -> Element<'a, BrowserMessage> {
     let fade = fade.clamp(0.0, 1.0);
-    let now = Instant::now();
     let state = &panel.grid;
-    let side = state.layout_side(now);
-    let layout = grid_layout_side(area_w, area_h, side);
-    let layout_animating = state.layout_animating(now);
-    let tabs = grid_tabs(panel, &panel.grid.visual);
-    let anim = state.anim;
-    let anim_tab = anim.map(|anim| anim.tab);
-    let pages = page_count(tabs.len());
-    let grid_layer = cards_layer(
+    let layout = tabs_layout(area_w, page_aspect);
+    let anim_tab = state.anim.map(|anim| anim.tab);
+    let tabs = grid_tabs(panel, &state.visual);
+    let strip = tab_strip(
         &tabs,
         &layout,
-        state.page,
         state.focus,
         engine_available,
         fade,
         anim_tab,
-        area_w,
-        area_h,
     );
-
-    let page_slide = state.page_anim.filter(|anim| !anim.done(now)).map(|anim| {
-        let under = cards_layer(
-            &tabs,
-            &layout,
-            anim.from_page,
-            anim.from_focus,
-            engine_available,
-            fade,
-            anim_tab,
-            area_w,
-            area_h,
-        );
-        let over = cards_layer(
-            &tabs,
-            &layout,
-            state.page,
-            state.focus,
-            engine_available,
-            fade,
-            anim_tab,
-            area_w,
-            area_h,
-        );
-        page_slide(under, over, anim, Size::new(area_w, area_h))
-    });
+    let row_layer = positioned(strip, layout.row, area_w, layout.area_h);
     let bookmarks = positioned(
         bookmark_strip(panel, state, layout.bookmarks.width, fade),
         layout.bookmarks,
         area_w,
-        area_h,
+        layout.area_h,
     );
-    let island = positioned(island(fade), layout.island, area_w, area_h);
-
-    let mut layers: Vec<Element<'a, BrowserMessage>> = Vec::new();
-    // Pills sit under the card layer: while the gutters tween open (or shut)
-    // the cards cover them, so they are revealed/hidden by the card edges
-    // instead of floating over a still-wide card.
-    if pages > 1 {
-        layers.push(positioned(
-            page_button(
-                svg_icon::CHEVRON_LEFT_SVG,
-                "L1",
-                state.page > 0,
-                BrowserMessage::GridPagePrev,
-                fade,
-            ),
-            layout.prev,
-            area_w,
-            area_h,
-        ));
-        layers.push(positioned(
-            page_button(
-                svg_icon::CHEVRON_RIGHT_SVG,
-                "R1",
-                state.page + 1 < pages,
-                BrowserMessage::GridPageNext,
-                fade,
-            ),
-            layout.next,
-            area_w,
-            area_h,
-        ));
-    }
-    match page_slide {
-        Some(slide) => layers.push(slide),
-        None => layers.push(grid_layer),
-    }
-    layers.push(bookmarks);
-    layers.push(island);
-    if let Some(anim) = anim {
-        // The FLIP owns its own draw-time clock: the widget tree is built once
-        // per view rebuild, so a rect sampled here would freeze at whatever
-        // progress the last message landed on (the old 1–3 frame judder).
-        layers.push(flip_page(
-            transition_page(panel, engine_available, anim.tab, layout.page_rect(), fade),
-            anim,
-            layout.page_rect(),
-            Size::new(area_w, area_h),
-        ));
-        // The Browser header is part of the same transition: it must not
-        // vanish/appear in a single frame while the page is still moving.
-        layers.push(header_curtain(
-            crate::ui::browser::view::browser_header(panel, area_w, fade),
-            anim,
-            Size::new(area_w, area_h),
-            crate::ui::browser::state::BROWSER_HEADER_TOTAL,
-            fade,
-        ));
-    }
-    let body: Element<'a, BrowserMessage> = stack(layers)
+    let island = positioned(island(fade), layout.island, area_w, layout.area_h);
+    let body: Element<'a, BrowserMessage> = stack(vec![row_layer, bookmarks, island])
         .width(Length::Fixed(area_w))
-        .height(Length::Fixed(area_h))
+        .height(Length::Fixed(layout.area_h))
         .clip(true)
         .into();
-    ticker(
-        body,
-        state.animating() || layout_animating || state.page_anim.is_some(),
-        layout_animating,
-    )
+    ticker(body, state.anim.is_some())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cards_layer<'a>(
+fn tab_strip<'a>(
     tabs: &[GridTab],
-    layout: &GridLayout,
-    page: usize,
+    layout: &TabsLayout,
     focus: GridFocus,
     engine_available: bool,
     fade: f32,
     anim_tab: Option<TabId>,
-    area_w: f32,
-    area_h: f32,
 ) -> Element<'a, BrowserMessage> {
-    let (start, end) = page_range(tabs.len(), page);
-    let page_tabs = tabs.get(start..end).unwrap_or(&[]);
     // Slot 0 is ALWAYS the plus card; tabs follow in the frozen visual order.
-    let mut cards: Vec<Element<'a, BrowserMessage>> = Vec::with_capacity(page_tabs.len() + 1);
+    let mut cards: Vec<Element<'a, BrowserMessage>> = Vec::with_capacity(tabs.len() + 1);
     cards.push(plus_card(
         layout.card_w,
         layout.card_h,
         focus == GridFocus::Plus,
         fade,
     ));
-    for tab in page_tabs {
+    for tab in tabs {
         let focused = focus == GridFocus::Tab(tab.id);
         // The FLIP overlay owns this tab's texture; omit the card instance to
         // avoid two primitives sharing one tab's per-id uniform block.
@@ -742,186 +597,22 @@ fn cards_layer<'a>(
             fade,
         ));
     }
-    let mut card_rows: Vec<Element<'a, BrowserMessage>> = Vec::new();
-    while !cards.is_empty() {
-        let take = layout.cols.min(cards.len());
-        let line_items: Vec<Element<'a, BrowserMessage>> = cards.drain(..take).collect();
-        let mut line = row![].spacing(layout.gap);
-        for card in line_items {
-            line = line.push(card);
-        }
-        card_rows.push(line.into());
-    }
-    positioned(
-        column(card_rows).spacing(layout.gap),
-        layout.grid,
-        area_w,
-        area_h,
-    )
-}
-
-/// Draw-time page slide: the outgoing page is the underlay and the incoming
-/// page is the overlay. Both translate like a carousel, clipped to the tabs
-/// area, so cards never reflow.
-struct PageSlide<'a> {
-    under: Element<'a, BrowserMessage>,
-    over: Element<'a, BrowserMessage>,
-    anim: PageAnim,
-    area: Size,
-}
-
-fn page_slide<'a>(
-    under: Element<'a, BrowserMessage>,
-    over: Element<'a, BrowserMessage>,
-    anim: PageAnim,
-    area: Size,
-) -> Element<'a, BrowserMessage> {
-    PageSlide {
-        under,
-        over,
-        anim,
-        area,
-    }
-    .into()
-}
-
-impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for PageSlide<'a> {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::stateless()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::None
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.under), Tree::new(&self.over)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(&[&self.under, &self.over]);
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(
-            Length::Fixed(self.area.width),
-            Length::Fixed(self.area.height),
-        )
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        _limits: &layout::Limits,
-    ) -> layout::Node {
-        let child_limits = layout::Limits::new(self.area, self.area);
-        let under =
-            self.under
-                .as_widget_mut()
-                .layout(&mut tree.children[0], renderer, &child_limits);
-        let over = self
-            .over
-            .as_widget_mut()
-            .layout(&mut tree.children[1], renderer, &child_limits);
-        layout::Node::with_children(self.area, vec![under, over])
-    }
-
-    fn update(
-        &mut self,
-        _tree: &mut Tree,
-        _event: &Event,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        _renderer: &iced::Renderer,
-        _clipboard: &mut dyn Clipboard,
-        _shell: &mut Shell<'_, BrowserMessage>,
-        _viewport: &Rectangle,
-    ) {
-        // Input is parked for the slide; cards re-enable when it lands.
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &iced::Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        let mut children = layout.children();
-        let (Some(under), Some(over)) = (children.next(), children.next()) else {
-            return;
-        };
-        let progress = self.anim.progress(Instant::now());
-        let width = self.area.width;
-        let dir = self.anim.direction as f32;
-        // Carousel: the outgoing page slides out the far side while the
-        // incoming page slides in. Both layers are clipped to the tabs area.
-        renderer.with_layer(layout.bounds(), |renderer| {
-            renderer.with_translation(Vector::new(-dir * progress * width, 0.0), |renderer| {
-                self.under.as_widget().draw(
-                    &tree.children[0],
-                    renderer,
-                    theme,
-                    style,
-                    under,
-                    cursor,
-                    viewport,
-                );
-            });
-        });
-        renderer.with_layer(layout.bounds(), |renderer| {
-            renderer.with_translation(
-                Vector::new(dir * (1.0 - progress) * width, 0.0),
-                |renderer| {
-                    self.over.as_widget().draw(
-                        &tree.children[1],
-                        renderer,
-                        theme,
-                        style,
-                        over,
-                        cursor,
-                        viewport,
-                    );
-                },
-            );
-        });
-    }
-
-    fn mouse_interaction(
-        &self,
-        _tree: &Tree,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        _viewport: &Rectangle,
-        _renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        mouse::Interaction::None
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        _tree: &'b mut Tree,
-        _layout: Layout<'b>,
-        _renderer: &iced::Renderer,
-        _viewport: &Rectangle,
-        _translation: Vector,
-    ) -> Option<overlay::Element<'b, BrowserMessage, iced::Theme, iced::Renderer>> {
-        None
-    }
-}
-
-impl<'a> From<PageSlide<'a>> for Element<'a, BrowserMessage> {
-    fn from(value: PageSlide<'a>) -> Self {
-        Element::new(value)
-    }
+    let content = row(cards)
+        .spacing(layout.gap)
+        .height(Length::Fixed(layout.card_h));
+    scrollable(content)
+        .id(tabs_scroll_id())
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::hidden(),
+        ))
+        .on_scroll(|viewport| BrowserMessage::TabsScrolled(viewport.absolute_offset().x))
+        .width(Length::Fixed(layout.row.width))
+        .height(Length::Fixed(layout.row.height))
+        .into()
 }
 
 /// Place `content` at an absolute rect inside the tabs-view area.
-fn positioned<'a>(
+pub fn positioned<'a>(
     content: impl Into<Element<'a, BrowserMessage>>,
     rect: Rectangle,
     area_w: f32,
@@ -977,67 +668,7 @@ fn island<'a>(fade: f32) -> Element<'a, BrowserMessage> {
         .into()
 }
 
-fn page_button<'a>(
-    icon: &'static str,
-    key: &'static str,
-    enabled: bool,
-    message: BrowserMessage,
-    fade: f32,
-) -> Element<'a, BrowserMessage> {
-    let fade = fade.clamp(0.0, 1.0);
-    let color = if enabled { theme::ACCENT } else { theme::DIM };
-    let glyph: Element<'a, BrowserMessage> = svg(svg::Handle::from_memory(icon.as_bytes()))
-        .width(Length::Fixed(14.0))
-        .height(Length::Fixed(14.0))
-        .opacity(if enabled { fade } else { 0.4 * fade })
-        .style(move |_theme, _status| svg::Style { color: Some(color) })
-        .into();
-    let label = text(key)
-        .size(10.0)
-        .font(iced::Font::MONOSPACE)
-        .color(theme::scale_alpha(
-            if enabled { theme::ACCENT } else { theme::DIM },
-            fade,
-        ));
-    let content = row![glyph, label].spacing(4).align_y(Alignment::Center);
-    let button = container(content)
-        .width(Length::Fixed(PAGE_PILL_W))
-        .height(Length::Fixed(PAGE_PILL_H))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(move |_theme| container::Style {
-            background: Some(iced::Background::Color(theme::scale_alpha(
-                theme::GLASS_FILL,
-                fade,
-            ))),
-            border: iced::Border {
-                color: theme::scale_alpha(
-                    if enabled {
-                        theme::GLASS_HAIRLINE
-                    } else {
-                        theme::alpha(theme::LINE, 0.2)
-                    },
-                    fade,
-                ),
-                width: 1.0,
-                radius: theme::radius::PILL.into(),
-            },
-            ..container::Style::default()
-        });
-    if enabled {
-        mouse_area(button)
-            .on_press(message)
-            .interaction(mouse::Interaction::Pointer)
-            .into()
-    } else {
-        button.into()
-    }
-}
-
-/// Full-size page texture used only for the FLIP. The widget is laid out at the
-/// page rect; [`FlipPage`] scales/translates it between page and card at draw
-/// time so the transition advances every presented frame.
-fn transition_page<'a>(
+pub fn transition_page<'a>(
     panel: &BrowserPanel,
     engine_available: bool,
     tab: TabId,
@@ -1092,20 +723,40 @@ fn transition_page<'a>(
 struct FlipPage<'a> {
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
+    /// Where the page content is laid out (stage coordinates).
     page: Rectangle,
+    /// FLIP endpoints in stage coordinates; the shell around them resizes on
+    /// the same clock.
+    source: Rectangle,
+    target: Rectangle,
+    /// Shell endpoints for the draw-time clip around the moving page.
+    mode: GridMode,
+    page_card: Rectangle,
+    tabs_card: Rectangle,
     area: Size,
 }
 
-fn flip_page<'a>(
+#[allow(clippy::too_many_arguments)]
+pub fn flip_page<'a>(
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
     page: Rectangle,
+    source: Rectangle,
+    target: Rectangle,
+    mode: GridMode,
+    page_card: Rectangle,
+    tabs_card: Rectangle,
     area: Size,
 ) -> Element<'a, BrowserMessage> {
     FlipPage {
         content,
         anim,
         page,
+        source,
+        target,
+        mode,
+        page_card,
+        tabs_card,
         area,
     }
     .into()
@@ -1206,20 +857,20 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for FlipPage<'a> {
         let Some(child_layout) = layout.children().next() else {
             return;
         };
-        let rect = self.anim.rect(Instant::now());
-        // `child_layout` and `layout` are absolute screen coordinates, while
-        // `self.anim.rect` is relative to the tabs-view area. Map the child's
-        // absolute page rect to the absolute animated rect; scaling around the
-        // screen origin would leave the page's y pinned near the top and snap
-        // it to the card on the final frame.
-        let source = child_layout.bounds();
-        let origin = layout.bounds().position();
-        let target = Rectangle::new(
-            iced::Point::new(origin.x + rect.x, origin.y + rect.y),
-            rect.size(),
+        let now = Instant::now();
+        let t = self.anim.progress(now);
+        let current = lerp_rect(self.source, self.target, t);
+        let clip = card_rect_at(
+            self.mode,
+            Some(self.anim),
+            self.page_card,
+            self.tabs_card,
+            now,
         );
-        let (scale, tx, ty) = flip_transform(source, target);
-        renderer.with_layer(layout.bounds(), |renderer| {
+        // Map the child's laid-out page rect onto the current animated rect.
+        // Both are stage-local, so the y offset interpolates with the card.
+        let (scale, tx, ty) = flip_transform(child_layout.bounds(), current);
+        renderer.with_layer(clip, |renderer| {
             renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
                 renderer.with_transformation(Transformation::scale(scale), |renderer| {
                     self.content.as_widget().draw(
@@ -1280,14 +931,21 @@ struct HeaderCurtain<'a> {
     area: Size,
     header_h: f32,
     fade: f32,
+    mode: GridMode,
+    page_card: Rectangle,
+    tabs_card: Rectangle,
 }
 
-fn header_curtain<'a>(
+#[allow(clippy::too_many_arguments)]
+pub fn header_curtain<'a>(
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
     area: Size,
     header_h: f32,
     fade: f32,
+    mode: GridMode,
+    page_card: Rectangle,
+    tabs_card: Rectangle,
 ) -> Element<'a, BrowserMessage> {
     HeaderCurtain {
         content,
@@ -1295,6 +953,9 @@ fn header_curtain<'a>(
         area,
         header_h,
         fade: fade.clamp(0.0, 1.0),
+        mode,
+        page_card,
+        tabs_card,
     }
     .into()
 }
@@ -1388,19 +1049,33 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         let Some(child_layout) = layout.children().next() else {
             return;
         };
-        let appear = self.appear(Instant::now());
+        let now = Instant::now();
+        let appear = self.appear(now);
         if appear <= 0.001 || self.fade <= 0.001 {
             return;
         }
-        let bounds = Rectangle::new(
-            layout.bounds().position(),
-            Size::new(self.area.width, self.header_h),
+        let card = card_rect_at(
+            self.mode,
+            Some(self.anim),
+            self.page_card,
+            self.tabs_card,
+            now,
         );
-        // Negative = slide up. Entering the tabs view lifts the header out of
-        // its row as it fades; leaving drops it back in from above.
-        let offset = header_offset(appear);
-        renderer.with_layer(bounds, |renderer| {
-            renderer.with_translation(Vector::new(0.0, offset), |renderer| {
+        let pad = crate::ui::browser::state::BROWSER_CARD_PAD;
+        let target_w = (card.width - 2.0 * pad).max(1.0);
+        let target = Rectangle::new(
+            iced::Point::new(card.x + pad, card.y + pad + header_offset(appear)),
+            Size::new(
+                target_w,
+                self.header_h * target_w / self.area.width.max(1.0),
+            ),
+        );
+        let source = child_layout.bounds();
+        let (scale, tx, ty) = flip_transform(source, target);
+        // Scale the whole header with the card instead of clipping it: nested
+        // widget layers would ignore a parent clip.
+        renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
+            renderer.with_transformation(Transformation::scale(scale), |renderer| {
                 self.content.as_widget().draw(
                     &tree.children[0],
                     renderer,
@@ -1410,22 +1085,20 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
                     cursor,
                     viewport,
                 );
-                // The curtain travels with the header, so no uncovered strip
-                // keeps fully-opaque content visible at the end of the slide.
-                if appear < 0.999 {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds,
-                            ..renderer::Quad::default()
-                        },
-                        Background::Color(theme::alpha(
-                            theme::lighten(theme::BASE_BG, 0.04),
-                            (1.0 - appear * appear) * self.fade,
-                        )),
-                    );
-                }
             });
         });
+        if appear < 0.999 {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: target,
+                    ..renderer::Quad::default()
+                },
+                Background::Color(theme::alpha(
+                    theme::lighten(theme::BASE_BG, 0.04),
+                    (1.0 - appear * appear) * self.fade,
+                )),
+            );
+        }
     }
 
     fn mouse_interaction(
@@ -1757,26 +1430,148 @@ fn bookmark_strip<'a>(
         .into()
 }
 
+/// Draw-time card shell: the panel background/border/shadow follows the same
+/// clock as the FLIP, without rebuilding the view each frame.
+struct CardShell {
+    mode: GridMode,
+    anim: Option<GridAnim>,
+    page: Rectangle,
+    tabs: Rectangle,
+    fade: f32,
+    area: Size,
+}
+
+pub fn card_shell(
+    mode: GridMode,
+    anim: Option<GridAnim>,
+    page: Rectangle,
+    tabs: Rectangle,
+    fade: f32,
+    area: Size,
+) -> Element<'static, BrowserMessage> {
+    CardShell {
+        mode,
+        anim,
+        page,
+        tabs,
+        fade,
+        area,
+    }
+    .into()
+}
+
+impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for CardShell {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::stateless()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::None
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        Vec::new()
+    }
+
+    fn diff(&self, _tree: &mut Tree) {}
+
+    fn size(&self) -> Size<Length> {
+        Size::new(
+            Length::Fixed(self.area.width),
+            Length::Fixed(self.area.height),
+        )
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &iced::Renderer,
+        _limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::Node::new(self.area)
+    }
+
+    fn update(
+        &mut self,
+        _tree: &mut Tree,
+        _event: &Event,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+        _clipboard: &mut dyn Clipboard,
+        _shell: &mut Shell<'_, BrowserMessage>,
+        _viewport: &Rectangle,
+    ) {
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        _style: &renderer::Style,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let rect = card_rect_at(self.mode, self.anim, self.page, self.tabs, Instant::now());
+        if rect.width < 1.0 || rect.height < 1.0 {
+            return;
+        }
+        let style = theme::menu_panel_fade(self.fade)(theme);
+        let Some(background) = style.background else {
+            return;
+        };
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: rect,
+                border: style.border,
+                shadow: style.shadow,
+                snap: true,
+            },
+            background,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        mouse::Interaction::None
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        _tree: &'b mut Tree,
+        _layout: Layout<'b>,
+        _renderer: &iced::Renderer,
+        _viewport: &Rectangle,
+        _translation: Vector,
+    ) -> Option<overlay::Element<'b, BrowserMessage, iced::Theme, iced::Renderer>> {
+        None
+    }
+}
+
+impl From<CardShell> for Element<'static, BrowserMessage> {
+    fn from(value: CardShell) -> Self {
+        Element::new(value)
+    }
+}
+
 /// App-level ticker wrapper: while a transition is live, ask for the next
 /// display frame after each present. No global subscription, no other windows
 /// rebuilt.
-fn ticker<'a>(
-    content: Element<'a, BrowserMessage>,
-    active: bool,
-    layout_tick: bool,
-) -> Element<'a, BrowserMessage> {
-    GridTicker {
-        content,
-        active,
-        layout_tick,
-    }
-    .into()
+fn ticker<'a>(content: Element<'a, BrowserMessage>, active: bool) -> Element<'a, BrowserMessage> {
+    GridTicker { content, active }.into()
 }
 
 struct GridTicker<'a> {
     content: Element<'a, BrowserMessage>,
     active: bool,
-    layout_tick: bool,
 }
 
 impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for GridTicker<'_> {
@@ -1827,9 +1622,6 @@ impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for GridTicker<'_> {
             {
                 GRID_TICK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 note_grid_frame(Instant::now());
-            }
-            if self.layout_tick {
-                shell.publish(BrowserMessage::GridLayoutFrame);
             }
             // Present immediately on the next vsync. A fixed +16ms request
             // lands just past the refresh often enough to alternate 16/32ms
@@ -1939,85 +1731,128 @@ mod tests {
     }
 
     #[test]
-    fn cards_keep_the_page_aspect_ratio() {
-        for (w, page_h) in [(1734.0, 931.0), (1094.0, 571.0), (700.0, 400.0)] {
-            let layout = grid_layout(w, page_h + crate::ui::browser::state::BROWSER_HEADER_TOTAL);
-            let aspect = w / page_h;
-            assert!(
-                (layout.card_w / layout.card_h - aspect).abs() < 0.01,
-                "card aspect must match page aspect"
-            );
-            assert!(layout.card_w > 0.0);
-            assert!(layout.bookmarks.y > layout.grid.y + layout.grid.height);
-            assert!(layout.island.y > layout.bookmarks.y);
-            assert_eq!(layout.cols, 4);
-        }
-    }
-
-    #[test]
-    fn grid_is_four_by_three_with_plus_first() {
-        let layout = grid_layout(
-            1734.0,
-            931.0 + crate::ui::browser::state::BROWSER_HEADER_TOTAL,
+    fn tabs_strip_is_one_row_with_plus_first() {
+        let layout = tabs_layout(1206.0, 1734.0 / 931.0);
+        let plus = layout.card_rect(0, 0.0);
+        let first = layout.card_rect(1, 0.0);
+        assert_eq!(plus.y, first.y, "single horizontal row");
+        assert!(plus.x < first.x, "plus card is first");
+        assert!(
+            (layout.card_w / layout.card_h - 1734.0 / 931.0).abs() < 0.01,
+            "cards keep the page aspect"
         );
-        let plus = layout.card_rect(0);
-        let first_tab = layout.card_rect(1);
-        assert_eq!(plus.y, first_tab.y);
-        assert!(plus.x < first_tab.x);
-        // Fourth slot ends the row; fifth starts row two.
-        assert_eq!(layout.card_rect(3).y, layout.card_rect(0).y);
-        assert!(layout.card_rect(4).y > layout.card_rect(0).y);
-        // Exactly 12 slots.
-        assert_eq!(TABS_SLOTS, 12);
+        assert!(layout.bookmarks.y > layout.row.y + layout.row.height);
+        assert!(layout.island.y > layout.bookmarks.y);
+        assert!(
+            (layout.area_h
+                - (GRID_PAD
+                    + layout.card_h
+                    + GRID_GAP
+                    + BOOKMARK_ROW_H
+                    + TABS_ISLAND_GAP
+                    + TABS_ISLAND_H
+                    + GRID_PAD))
+                .abs()
+                < 0.01,
+            "content drives the card height"
+        );
     }
 
     #[test]
-    fn pages_hold_eleven_tabs_after_the_plus_card() {
-        assert_eq!(page_count(0), 1);
-        assert_eq!(page_count(11), 1);
-        assert_eq!(page_count(12), 2);
-        assert_eq!(page_count(23), 3);
-        assert_eq!(page_range(12, 0), (0, 11));
-        assert_eq!(page_range(12, 1), (11, 12));
-        assert_eq!(slots_on_page(12, 0), 12);
-        assert_eq!(slots_on_page(12, 1), 2);
+    fn compact_card_matches_the_page_inset_on_every_side() {
+        let page = page_card_rect(1920.0, 1080.0);
+        let geometry = tabs_card_geometry(1920.0, 1080.0);
+        assert!(
+            (geometry.card.width / page.width - TABS_CARD_SCALE).abs() < 0.01,
+            "tabs card is 30% narrower"
+        );
+        assert!(geometry.card.height < page.height);
+        assert!(
+            (geometry.inner.x - geometry.card.x - crate::ui::browser::state::BROWSER_CARD_PAD)
+                .abs()
+                < 0.01
+        );
+        assert!(
+            (geometry.layout.row.x - GRID_PAD).abs() < 0.01,
+            "left inset"
+        );
+        assert!(
+            (geometry.layout.row.y - GRID_PAD).abs() < 0.01,
+            "top inset equals the sides"
+        );
     }
 
     #[test]
-    fn grid_page_state_clamps_and_pages() {
-        let mut state = GridState {
-            visual: (0..25).map(|i| TabId(i + 1)).collect(),
-            ..GridState::default()
-        };
-        assert_eq!(state.page_count(), 3);
-        state.page_next();
-        state.page_next();
-        state.page_next();
-        assert_eq!(state.page, 2);
-        state.page_prev();
-        assert_eq!(state.page, 1);
-        state.visual.truncate(11);
-        state.clamp_page();
-        assert_eq!(state.page, 0);
+    fn reveal_offset_keeps_the_card_fully_visible() {
+        let layout = tabs_layout(1206.0, 1734.0 / 931.0);
+        let count = 25;
+        assert_eq!(reveal_offset(&layout, 0, count, 0.0), 0.0);
+        let far = reveal_offset(&layout, 20, count, 0.0);
+        let right = 20.0 * (layout.card_w + layout.gap) + layout.card_w;
+        assert!((far - (right - layout.row.width)).abs() < 0.01);
+        let max = layout.content_width(count) - layout.row.width;
+        assert!(far <= max);
+        // Scrolling back to the first card returns to zero, not a negative x.
+        assert_eq!(reveal_offset(&layout, 0, count, far), 0.0);
     }
 
     #[test]
-    fn transition_rect_lerps_between_page_and_card() {
-        let started = Instant::now();
+    fn card_shell_lerps_between_page_and_tabs() {
+        let page = Rectangle::new(iced::Point::new(50.0, 50.0), Size::new(1800.0, 1000.0));
+        let tabs = Rectangle::new(iced::Point::new(400.0, 300.0), Size::new(1200.0, 340.0));
+        let now = Instant::now();
         let anim = GridAnim {
             generation: 1,
-            started,
-            source: Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(1000.0, 500.0)),
-            target: Rectangle::new(iced::Point::new(100.0, 100.0), Size::new(200.0, 100.0)),
+            started: now,
             tab: TabId::BOOT,
             entering: true,
+            card: GridFocus::Tab(TabId::BOOT),
         };
-        let start = anim.rect(started);
-        assert_eq!((start.x, start.y, start.width), (0.0, 0.0, 1000.0));
-        let end = anim.rect(started + GRID_ANIM);
-        assert!((end.x - 100.0).abs() < 0.01);
-        assert!((end.width - 200.0).abs() < 0.01);
-        assert!(anim.done(started + GRID_ANIM));
+        assert_eq!(
+            card_rect_at(GridMode::Page, Some(anim), page, tabs, now).width,
+            page.width
+        );
+        let mid = card_rect_at(
+            GridMode::Entering,
+            Some(anim),
+            page,
+            tabs,
+            now + GRID_ANIM / 2,
+        );
+        assert!(mid.width < page.width && mid.width > tabs.width);
+        assert_eq!(
+            card_rect_at(GridMode::Grid, Some(anim), page, tabs, now).width,
+            tabs.width
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_keeps_the_selected_index() {
+        let ids = [TabId(1), TabId(2), TabId(3), TabId(4)];
+        assert_eq!(
+            focus_after_close(&ids, GridFocus::Tab(TabId(2)), TabId(2)),
+            GridFocus::Tab(TabId(3)),
+            "next tab keeps the slot"
+        );
+        assert_eq!(
+            focus_after_close(&ids, GridFocus::Tab(TabId(4)), TabId(4)),
+            GridFocus::Tab(TabId(3)),
+            "closing the last card selects the new last card"
+        );
+        assert_eq!(
+            focus_after_close(&ids, GridFocus::Tab(TabId(1)), TabId(4)),
+            GridFocus::Tab(TabId(1)),
+            "closing another tab leaves focus alone"
+        );
+        assert_eq!(
+            focus_after_close(&[TabId(1)], GridFocus::Tab(TabId(1)), TabId(1)),
+            GridFocus::Tab(TabId(1)),
+            "the last-tab reset keeps the tab"
+        );
+        assert_eq!(
+            focus_after_close(&ids, GridFocus::Plus, TabId(2)),
+            GridFocus::Plus
+        );
     }
 
     #[test]

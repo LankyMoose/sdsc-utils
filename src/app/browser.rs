@@ -197,6 +197,9 @@ pub struct BrowserAppState {
     /// Direction pressed during the tabs-view entrance FLIP; applied once the
     /// grid is armed so the first navigation is not swallowed.
     pub pending_grid_move: Option<(crate::browser::cursor::JumpDir, PadId)>,
+    /// Initial strip offset to apply on the first post-open frame (the
+    /// scrollable does not exist until the grid view is mounted).
+    pub grid_scroll_pending: Option<f32>,
 }
 
 use iced::Task;
@@ -517,7 +520,7 @@ impl super::App {
                 wait.frame_mark = frame_before;
             }
             "grid.open" | "grid.close" | "grid.activate" | "grid.new_tab" | "grid.close_tab"
-            | "grid.bookmark" | "grid.focus" | "grid.page_prev" | "grid.page_next" => {
+            | "grid.bookmark" | "grid.focus" => {
                 wait.needs_redraw = true;
                 wait.needs_grid_idle = true;
             }
@@ -873,7 +876,11 @@ impl super::App {
                     let open = self.open_browser_tab(Some(url.to_string()));
                     let id = self.browser.panel.active_tab;
                     // Opening the tab already cues; the close FLIP is silent.
-                    open.chain(self.close_browser_grid_with(Some(id), false))
+                    open.chain(self.close_browser_grid_with(
+                        Some(id),
+                        false,
+                        Some(crate::ui::browser::grid::GridFocus::Tab(id)),
+                    ))
                 } else {
                     self.browser_grid_open_plus()
                 }
@@ -909,10 +916,6 @@ impl super::App {
                 };
                 self.browser_grid_toggle_bookmark(tab.id)
             }
-            #[cfg(debug_assertions)]
-            "grid.page_prev" => self.browser_grid_page(-1),
-            #[cfg(debug_assertions)]
-            "grid.page_next" => self.browser_grid_page(1),
             #[cfg(debug_assertions)]
             "grid.focus" => {
                 let dir = match step.params.get("dir").and_then(serde_json::Value::as_str) {
@@ -1787,6 +1790,8 @@ impl super::App {
     }
 
     pub(crate) fn open_browser_grid(&mut self) -> Task<Message> {
+        use crate::ui::browser::grid::{GridFocus, GridMode};
+
         if self.browser.panel.grid.is_grid() {
             return Task::none();
         }
@@ -1798,20 +1803,19 @@ impl super::App {
         self.browser.panel.cancel_url_edit();
         self.browser.panel.refresh_grid_visual();
         let tabs_count = self.browser.panel.grid.visual.len();
+        let active = self.browser.panel.active_tab;
+        let offset = self.reveal_grid_focus(GridFocus::Tab(active));
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
         if reduced {
-            {
-                let panel = &mut self.browser.panel;
-                panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
-                panel.grid.anim = None;
-                panel.grid.page = 0;
-                panel.grid.bookmark_scroll_x = 0.0;
-                panel.grid.source_override = None;
-            }
+            let panel = &mut self.browser.panel;
+            panel.grid.mode = GridMode::Grid;
+            panel.grid.anim = None;
+            panel.grid.bookmark_scroll_x = 0.0;
             self.browser.dpad_stepper.reset();
             self.browser.grid_nav.prepare_on_open(true);
             self.browser.pending_grid_move = None;
+            self.browser.grid_scroll_pending = Some(offset);
             self.note_launcher_activity();
             self.play_ui_cue(UiSoundKind::Action);
             crate::platform::trace::event(
@@ -1821,42 +1825,25 @@ impl super::App {
             .field("tabs", tabs_count)
             .field("reduced_motion", true)
             .emit();
-            return close_osk.chain(self.invalidate_browser_window());
+            return close_osk
+                .chain(self.invalidate_browser_window())
+                .chain(self.pending_grid_scroll_later())
+                .chain(self.apply_pending_grid_scroll());
         }
-        let side = self
-            .browser
-            .panel
-            .grid
-            .layout_side(std::time::Instant::now());
-        let panel = &mut self.browser.panel;
-        let area_w = panel.viewport.0;
-        let area_h = panel.viewport.1 + crate::ui::browser::state::BROWSER_HEADER_TOTAL;
-        let layout = crate::ui::browser::grid::grid_layout_side(area_w, area_h, side);
         #[cfg(debug_assertions)]
         crate::ui::browser::grid::reset_grid_anim_frames();
-        let active = panel.active_tab;
-        let active_index = panel.grid.visual.iter().position(|id| *id == active);
-        let active_page = active_index
-            .map(|index| index / crate::ui::browser::grid::TABS_PER_PAGE)
-            .unwrap_or(0);
-        let target = layout.card_rect(
-            active_index
-                .map(|index| 1 + index % crate::ui::browser::grid::TABS_PER_PAGE)
-                .unwrap_or(0),
-        );
+        let panel = &mut self.browser.panel;
         let generation = panel.grid.next_generation();
-        panel.grid.mode = crate::ui::browser::grid::GridMode::Entering;
-        panel.grid.page = active_page;
+        panel.grid.mode = GridMode::Entering;
         panel.grid.bookmark_scroll_x = 0.0;
-        panel.grid.source_override = None;
         self.browser.pending_grid_move = None;
+        self.browser.grid_scroll_pending = Some(offset);
         panel.grid.anim = Some(crate::ui::browser::grid::GridAnim {
             generation,
             started: Instant::now(),
-            source: layout.page_rect(),
-            target,
             tab: active,
             entering: true,
+            card: GridFocus::Tab(active),
         });
         self.browser.dpad_stepper.reset();
         self.browser.grid_nav.prepare_on_open(false);
@@ -1873,6 +1860,7 @@ impl super::App {
         );
         close_osk
             .chain(self.invalidate_browser_window())
+            .chain(self.pending_grid_scroll_later())
             .chain(done)
     }
 
@@ -1880,7 +1868,7 @@ impl super::App {
         &mut self,
         select: Option<crate::browser::engine::TabId>,
     ) -> Task<Message> {
-        self.close_browser_grid_with(select, true)
+        self.close_browser_grid_with(select, true, None)
     }
 
     /// Close the tabs view. `cue` is false when the initiating action already
@@ -1890,7 +1878,10 @@ impl super::App {
         &mut self,
         select: Option<crate::browser::engine::TabId>,
         cue: bool,
+        source: Option<crate::ui::browser::grid::GridFocus>,
     ) -> Task<Message> {
+        use crate::ui::browser::grid::{GridFocus, GridMode};
+
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
@@ -1901,9 +1892,8 @@ impl super::App {
             let pending;
             {
                 let panel = &mut self.browser.panel;
-                panel.grid.mode = crate::ui::browser::grid::GridMode::Page;
+                panel.grid.mode = GridMode::Page;
                 panel.grid.anim = None;
-                panel.grid.source_override = None;
                 pending = select.filter(|id| *id != panel.active_tab);
             }
             crate::platform::trace::event(
@@ -1922,39 +1912,14 @@ impl super::App {
             self.sync_live_mouse();
             return self.invalidate_browser_window();
         }
-        let (source, tab, target, selected) = {
-            let panel = &self.browser.panel;
-            let visual = &panel.grid.visual;
-            let area_w = panel.viewport.0;
-            let area_h = panel.viewport.1 + crate::ui::browser::state::BROWSER_HEADER_TOTAL;
-            let layout = crate::ui::browser::grid::grid_layout_side(
-                area_w,
-                area_h,
-                self.browser
-                    .panel
-                    .grid
-                    .layout_side(std::time::Instant::now()),
-            );
-            let tab = select.unwrap_or(panel.active_tab);
-            let tab_index = visual.iter().position(|id| *id == tab);
-            // Explicit plus exits win; otherwise use the selected card when it
-            // is on the visible page, falling back to this page's plus card.
-            let source = panel
-                .grid
-                .source_override
-                .or_else(|| {
-                    let index = tab_index?;
-                    let page = index / crate::ui::browser::grid::TABS_PER_PAGE;
-                    if page != panel.grid.page {
-                        return None;
-                    }
-                    let slot = 1 + index % crate::ui::browser::grid::TABS_PER_PAGE;
-                    Some(layout.card_rect(slot))
-                })
-                .unwrap_or_else(|| layout.card_rect(0));
-            let selected = select.filter(|id| *id != panel.active_tab);
-            (source, tab, layout.page_rect(), selected)
-        };
+        let tab = select.unwrap_or(self.browser.panel.active_tab);
+        let source_focus = source
+            .or_else(|| select.map(GridFocus::Tab))
+            .unwrap_or(GridFocus::Tab(tab));
+        // Start the FLIP from a visible card even when the debug action
+        // selected an off-screen index.
+        let offset = self.reveal_grid_focus(source_focus);
+        let selected = select.filter(|id| *id != self.browser.panel.active_tab);
         // Activate the selected tab as the leaving FLIP starts, not when it
         // lands: the header curtain is already sliding in during the FLIP and
         // must show the selected tab's URL immediately.
@@ -1963,18 +1928,17 @@ impl super::App {
             None => Task::none(),
         };
         let panel = &mut self.browser.panel;
-        panel.grid.source_override = None;
         #[cfg(debug_assertions)]
         crate::ui::browser::grid::reset_grid_anim_frames();
         let generation = panel.grid.next_generation();
-        panel.grid.mode = crate::ui::browser::grid::GridMode::Leaving;
+        panel.grid.mode = GridMode::Leaving;
+        self.browser.grid_scroll_pending = Some(offset);
         panel.grid.anim = Some(crate::ui::browser::grid::GridAnim {
             generation,
             started: Instant::now(),
-            source,
-            target,
             tab,
             entering: false,
+            card: source_focus,
         });
         if cue {
             self.play_ui_cue(UiSoundKind::Nav);
@@ -1991,10 +1955,13 @@ impl super::App {
         );
         activation
             .chain(self.invalidate_browser_window())
+            .chain(self.pending_grid_scroll_later())
             .chain(done)
     }
 
     pub(crate) fn finish_browser_grid_transition(&mut self, generation: u64) -> Task<Message> {
+        use crate::ui::browser::grid::GridMode;
+
         if self.browser.panel.grid.anim_generation != generation {
             return Task::none();
         }
@@ -2011,26 +1978,28 @@ impl super::App {
             ));
         }
         match mode {
-            crate::ui::browser::grid::GridMode::Entering => {
-                self.browser.panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
+            GridMode::Entering => {
+                self.browser.panel.grid.mode = GridMode::Grid;
                 self.browser.panel.sync_grid_visual();
                 // Arm immediately: the grid is visible now, and waiting for a
                 // neutral sample swallowed the first D-pad/stick move.
                 self.browser.grid_nav.prepare_on_open(true);
                 crate::controller::hid::diag::diag_info("ui-diag: browser grid entered");
+                let scroll = self.apply_pending_grid_scroll();
                 if let Some((dir, pad)) = self.browser.pending_grid_move.take() {
                     self.set_haptic_pad_from_id(Some(&pad));
                     self.play_ui_cue(UiSoundKind::Nav);
                     self.haptic_pad_serial = None;
-                    return self.browser_grid_move_focus(dir);
+                    return scroll.chain(self.browser_grid_move_focus(dir));
                 }
-                self.invalidate_browser_window()
+                scroll.chain(self.invalidate_browser_window())
             }
-            crate::ui::browser::grid::GridMode::Leaving => {
-                self.browser.panel.grid.mode = crate::ui::browser::grid::GridMode::Page;
+            GridMode::Leaving => {
+                self.browser.panel.grid.mode = GridMode::Page;
                 self.browser.dpad_stepper.reset();
                 self.browser.grid_nav.reset();
                 self.browser.pending_grid_move = None;
+                self.browser.grid_scroll_pending = None;
                 self.sync_live_mouse();
                 self.invalidate_browser_window()
             }
@@ -2043,11 +2012,10 @@ impl super::App {
     pub(crate) fn settle_browser_grid_for_close(&mut self) {
         let panel = &mut self.browser.panel;
         panel.grid.anim = None;
-        panel.grid.source_override = None;
         self.browser.dpad_stepper.reset();
         self.browser.grid_nav.reset();
         self.browser.pending_grid_move = None;
-        panel.grid.page_anim = None;
+        self.browser.grid_scroll_pending = None;
         match panel.grid.mode {
             crate::ui::browser::grid::GridMode::Entering => {
                 panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
@@ -2063,78 +2031,139 @@ impl super::App {
         &mut self,
         id: crate::browser::engine::TabId,
     ) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
-        self.close_browser_grid(Some(id))
+        if self.browser.panel.tab_page(id).is_none() {
+            return Task::none();
+        }
+        self.browser.panel.grid.focus = GridFocus::Tab(id);
+        self.close_browser_grid_with(Some(id), true, Some(GridFocus::Tab(id)))
     }
 
     pub(crate) fn browser_grid_open_plus(&mut self) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
         if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
             return Task::none();
         }
-        let area_w = self.browser.panel.viewport.0;
-        let area_h =
-            self.browser.panel.viewport.1 + crate::ui::browser::state::BROWSER_HEADER_TOTAL;
-        let layout = crate::ui::browser::grid::grid_layout_side(
-            area_w,
-            area_h,
-            self.browser
-                .panel
-                .grid
-                .layout_side(std::time::Instant::now()),
-        );
-        self.browser.panel.grid.source_override = Some(layout.card_rect(0));
         let open = self.open_browser_tab(None);
         let id = self.browser.panel.active_tab;
         // `open_browser_tab` already plays the tab-open cue.
-        open.chain(self.close_browser_grid_with(Some(id), false))
+        open.chain(self.close_browser_grid_with(Some(id), false, Some(GridFocus::Plus)))
     }
 
     pub(crate) fn browser_grid_close_tab(
         &mut self,
         id: crate::browser::engine::TabId,
     ) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
+        if self.browser.panel.tab_page(id).is_none() {
+            return Task::none();
+        }
+        let focus = self.browser.panel.grid.focus;
+        let next_focus =
+            crate::ui::browser::grid::focus_after_close(&self.browser.panel.grid.visual, focus, id);
+        // The final tab resets to the default page, which already plays the
+        // navigation cue; every real close owns exactly one action cue.
+        let final_tab = self.browser.panel.order.len() <= 1;
+        if !final_tab {
+            self.play_ui_cue(UiSoundKind::Action);
+        }
         let task = self.close_browser_tab(id);
-        self.browser.panel.sync_grid_visual();
-        self.browser.panel.grid.clamp_page();
-        self.ensure_grid_focus_on_page();
-        task.chain(self.invalidate_browser_window())
+        let panel = &mut self.browser.panel;
+        panel.sync_grid_visual();
+        panel.grid.focus = next_focus;
+        if !matches!(next_focus, GridFocus::Bookmark(_)) {
+            panel.grid.row_focus = next_focus;
+        }
+        let scroll = match next_focus {
+            GridFocus::Bookmark(_) => Task::none(),
+            _ => self.scroll_grid_focus_into_view(),
+        };
+        scroll.chain(task).chain(self.invalidate_browser_window())
     }
 
-    /// Keep the focus ring on the visible page after tab close/reorder.
-    fn ensure_grid_focus_on_page(&mut self) {
-        use crate::ui::browser::grid::{self, GridFocus};
-        let (page, visual_len, focus) = {
-            let panel = &self.browser.panel;
-            (panel.grid.page, panel.grid.visual.len(), panel.grid.focus)
-        };
-        let on_page = match focus {
-            GridFocus::Plus | GridFocus::Bookmark(_) => true,
-            GridFocus::Tab(id) => {
-                let (start, end) = grid::page_range(visual_len, page);
-                self.browser.panel.grid.visual[start..end].contains(&id)
-            }
-        };
-        if on_page {
-            return;
+    /// Persist the focused tabs-view card as the active tab when the screen
+    /// closes (Circle -> Home). Selecting a card is a grid focus change until
+    /// the user enters it; leaving must keep that choice.
+    pub(crate) fn persist_grid_selection(&mut self) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
+        if !self.browser.panel.grid.is_grid() {
+            return Task::none();
         }
-        let start = page.saturating_mul(crate::ui::browser::grid::TABS_PER_PAGE);
-        self.browser.panel.grid.focus = self
-            .browser
-            .panel
-            .grid
-            .visual
-            .get(start)
-            .copied()
-            .map(GridFocus::Tab)
-            .unwrap_or(GridFocus::Plus);
+        let focus = self.browser.panel.grid.focus;
+        let task = match focus {
+            GridFocus::Tab(id) => self.activate_browser_tab(id),
+            _ => Task::none(),
+        };
+        self.save_page();
+        task
+    }
+
+    /// Stage size the Browser card is laid out in. The cover is set before the
+    /// first frame; the size event only confirms it.
+    fn browser_stage(&self) -> (f32, f32) {
+        self.browser_window_size
+            .or_else(|| {
+                self.browser_monitor_cover
+                    .map(|cover| (cover.width, cover.height))
+            })
+            .unwrap_or((1920.0, 1080.0))
+    }
+
+    fn browser_tabs_geometry(&self) -> crate::ui::browser::grid::TabsCardGeometry {
+        let (stage_w, stage_h) = self.browser_stage();
+        crate::ui::browser::grid::tabs_card_geometry(stage_w, stage_h)
+    }
+
+    fn browser_grid_focus_count(&self) -> usize {
+        self.browser.panel.grid.visual.len() + 1
+    }
+
+    /// Reveal `focus` in the horizontal strip and return the new offset.
+    fn reveal_grid_focus(&mut self, focus: crate::ui::browser::grid::GridFocus) -> f32 {
+        use crate::ui::browser::grid::GridFocus;
+        let geometry = self.browser_tabs_geometry();
+        let slot = match focus {
+            GridFocus::Plus | GridFocus::Bookmark(_) => 0,
+            GridFocus::Tab(id) => self
+                .browser
+                .panel
+                .grid
+                .visual
+                .iter()
+                .position(|tab| *tab == id)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+        };
+        let offset = crate::ui::browser::grid::reveal_offset(
+            &geometry.layout,
+            slot,
+            self.browser_grid_focus_count(),
+            self.browser.panel.grid.tab_scroll_x,
+        );
+        self.browser.panel.grid.tab_scroll_x = offset;
+        offset
+    }
+
+    /// Keep the focused tab card inside the horizontal strip viewport.
+    fn scroll_grid_focus_into_view(&mut self) -> Task<Message> {
+        let focus = self.browser.panel.grid.focus;
+        let offset = self.reveal_grid_focus(focus);
+        iced::widget::operation::scroll_to(
+            crate::ui::browser::grid::tabs_scroll_id(),
+            iced::widget::operation::AbsoluteOffset {
+                x: Some(offset),
+                y: None,
+            },
+        )
     }
 
     pub(crate) fn browser_grid_toggle_bookmark(
@@ -2166,6 +2195,7 @@ impl super::App {
     }
 
     pub(crate) fn browser_grid_open_bookmark(&mut self, index: usize) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
@@ -2175,73 +2205,11 @@ impl super::App {
         if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
             return Task::none();
         }
-        // Bookmarks open in a new tab (active), then the FLIP lands on its page.
+        // Bookmarks open in a new tab (active); the page expands from that
+        // tab's card, which close_browser_grid_with scrolls into view.
         let open = self.open_browser_tab(Some(bookmark.url));
         let id = self.browser.panel.active_tab;
-        open.chain(self.close_browser_grid_with(Some(id), false))
-    }
-
-    pub(crate) fn browser_grid_page(&mut self, delta: i32) -> Task<Message> {
-        use crate::ui::browser::grid::{GridFocus, TABS_PER_PAGE};
-        let now = Instant::now();
-        if delta == 0
-            || self.browser.panel.grid.animating()
-            || self.browser.panel.grid.page_animating(now)
-            || !self.browser.panel.grid.is_grid()
-        {
-            return Task::none();
-        }
-        let before = self.browser.panel.grid.page;
-        let from_focus = self.browser.panel.grid.focus;
-        if delta < 0 {
-            self.browser.panel.grid.page_prev();
-        } else {
-            self.browser.panel.grid.page_next();
-        }
-        if self.browser.panel.grid.page == before {
-            return Task::none();
-        }
-        let start = self.browser.panel.grid.page.saturating_mul(TABS_PER_PAGE);
-        self.browser.panel.grid.focus = self
-            .browser
-            .panel
-            .grid
-            .visual
-            .get(start)
-            .copied()
-            .map(GridFocus::Tab)
-            .unwrap_or(GridFocus::Plus);
-        self.browser.grid_nav.prepare_on_open(true);
-        let generation = self.browser.panel.grid.next_generation();
-        self.browser.panel.grid.page_anim = Some(crate::ui::browser::grid::PageAnim {
-            generation,
-            started: now,
-            direction: if delta < 0 { -1 } else { 1 },
-            from_page: before,
-            from_focus,
-        });
-        self.play_ui_cue(UiSoundKind::Nav);
-        crate::platform::trace::event(
-            crate::platform::trace::Lane::Browser,
-            if delta < 0 {
-                "browser.grid.page_prev"
-            } else {
-                "browser.grid.page_next"
-            },
-        )
-        .field("page", self.browser.panel.grid.page)
-        .emit();
-        let done = Task::perform(
-            super::delay(std::time::Duration::from_millis(
-                crate::ui::browser::grid::PAGE_SLIDE_MS,
-            )),
-            move |_| {
-                Message::Browser(crate::ui::browser::BrowserMessage::GridPageAnimDone(
-                    generation,
-                ))
-            },
-        );
-        self.invalidate_browser_window().chain(done)
+        open.chain(self.close_browser_grid_with(Some(id), false, Some(GridFocus::Tab(id))))
     }
 
     pub(crate) fn browser_grid_move_focus(
@@ -2250,123 +2218,86 @@ impl super::App {
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
         use crate::ui::browser::grid::{self, GridFocus};
+
         if !self.browser.panel.grid.is_grid() || self.browser.panel.grid.animating() {
             return Task::none();
         }
-        let (visual, viewport, focus, bookmark_count, page) = {
-            let panel = &self.browser.panel;
-            (
-                panel.grid.visual.clone(),
-                panel.viewport,
-                panel.grid.focus,
-                panel.bookmarks.len(),
-                panel.grid.page,
-            )
-        };
-        let tabs = {
-            let panel = &self.browser.panel;
-            grid::grid_tabs(panel, &visual)
-        };
-        let area_h = viewport.1 + crate::ui::browser::state::BROWSER_HEADER_TOTAL;
-        let layout = grid::grid_layout_side(
-            viewport.0,
-            area_h,
-            self.browser
-                .panel
-                .grid
-                .layout_side(std::time::Instant::now()),
-        );
-        if let GridFocus::Bookmark(current) = focus {
-            if bookmark_count == 0 {
-                return Task::none();
-            }
-            let next = match dir {
-                JumpDir::Left => current.saturating_sub(1),
-                JumpDir::Right => (current + 1).min(bookmark_count - 1),
-                JumpDir::Up => {
-                    self.browser.panel.grid.focus = GridFocus::Plus;
-                    return self.invalidate_browser_window();
-                }
-                JumpDir::Down => current,
-            };
-            if next == current {
-                return Task::none();
-            }
-            self.browser.panel.grid.focus = GridFocus::Bookmark(next);
-            return self
-                .invalidate_browser_window()
-                .chain(self.grid_scroll_to_bookmark(&layout, next));
-        }
-
-        let (start, end) = grid::page_range(tabs.len(), page);
-        let page_tabs = tabs.get(start..end).unwrap_or(&[]);
-        let count = page_tabs.len() + 1;
-        let current = match focus {
-            GridFocus::Plus => 0,
-            GridFocus::Tab(id) => page_tabs
+        let panel = &self.browser.panel;
+        let focus = panel.grid.focus;
+        let bookmark_count = panel.bookmarks.len();
+        let visual = panel.grid.visual.clone();
+        let tabs = grid::grid_tabs(panel, &visual);
+        let count = tabs.len() + 1;
+        let slot = match focus {
+            GridFocus::Plus | GridFocus::Bookmark(_) => 0,
+            GridFocus::Tab(id) => tabs
                 .iter()
                 .position(|tab| tab.id == id)
                 .map(|index| index + 1)
                 .unwrap_or(0),
-            GridFocus::Bookmark(_) => 0,
         };
-        let cols = layout.cols.max(1);
-        let col = current % cols;
-        let next = match dir {
-            JumpDir::Left => {
-                if col > 0 {
-                    current - 1
-                } else {
-                    current
+        let mut next = focus;
+        match focus {
+            GridFocus::Bookmark(current) => match dir {
+                JumpDir::Left if current > 0 => {
+                    next = GridFocus::Bookmark(current - 1);
                 }
-            }
-            JumpDir::Right => {
-                if col + 1 < cols && current + 1 < count {
-                    current + 1
-                } else {
-                    current
+                JumpDir::Right if current + 1 < bookmark_count => {
+                    next = GridFocus::Bookmark(current + 1);
                 }
-            }
-            JumpDir::Up => {
-                if current >= cols {
-                    current - cols
-                } else {
-                    current
+                JumpDir::Up => {
+                    next = match panel.grid.row_focus {
+                        GridFocus::Tab(id) if visual.contains(&id) => GridFocus::Tab(id),
+                        GridFocus::Plus => GridFocus::Plus,
+                        _ => visual
+                            .first()
+                            .copied()
+                            .map(GridFocus::Tab)
+                            .unwrap_or(GridFocus::Plus),
+                    };
                 }
-            }
-            JumpDir::Down => {
-                if current + cols < count {
-                    current + cols
-                } else if bookmark_count > 0 {
-                    self.browser.panel.grid.focus = GridFocus::Bookmark(0);
-                    return self
-                        .invalidate_browser_window()
-                        .chain(self.grid_scroll_to_bookmark(&layout, 0));
-                } else {
-                    current
+                _ => {}
+            },
+            GridFocus::Plus | GridFocus::Tab(_) => match dir {
+                JumpDir::Left if slot > 0 => {
+                    next = if slot == 1 {
+                        GridFocus::Plus
+                    } else {
+                        GridFocus::Tab(tabs[slot - 2].id)
+                    };
                 }
-            }
-        };
-        if next == current {
+                JumpDir::Right if slot + 1 < count => {
+                    next = GridFocus::Tab(tabs[slot].id);
+                }
+                JumpDir::Down if bookmark_count > 0 => {
+                    next = GridFocus::Bookmark(0);
+                }
+                _ => {}
+            },
+        }
+        if next == focus {
             return Task::none();
         }
-        self.browser.panel.grid.focus = if next == 0 {
-            GridFocus::Plus
-        } else {
-            GridFocus::Tab(page_tabs[next - 1].id)
-        };
+        let entering_bookmarks =
+            matches!(next, GridFocus::Bookmark(_)) && !matches!(focus, GridFocus::Bookmark(_));
+        self.browser.panel.grid.focus = next;
+        if entering_bookmarks {
+            self.browser.panel.grid.row_focus = focus;
+        } else if !matches!(next, GridFocus::Bookmark(_)) {
+            self.browser.panel.grid.row_focus = next;
+        }
         // The pad path owns the cue (`on_browser_grid_pad`); keeping one here
         // too made every D-pad focus move play sound/haptics twice.
-        self.invalidate_browser_window()
+        let scroll = match next {
+            GridFocus::Bookmark(index) => self.grid_scroll_to_bookmark(index),
+            _ => self.scroll_grid_focus_into_view(),
+        };
+        scroll.chain(self.invalidate_browser_window())
     }
 
-    fn grid_scroll_to_bookmark(
-        &mut self,
-        layout: &crate::ui::browser::grid::GridLayout,
-        index: usize,
-    ) -> Task<Message> {
+    fn grid_scroll_to_bookmark(&mut self, index: usize) -> Task<Message> {
+        let view_w = self.browser_tabs_geometry().layout.bookmarks.width;
         let x = crate::ui::browser::grid::bookmark_x(index);
-        let view_w = layout.bookmarks.width;
         let max =
             (crate::ui::browser::grid::bookmark_content_width(self.browser.panel.bookmarks.len())
                 - view_w)
@@ -2394,20 +2325,28 @@ impl super::App {
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
     ) -> Task<Message> {
+        if !self.browser.panel.grid.is_grid() || self.browser.panel.grid.animating() {
+            return Task::none();
+        }
         let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
             return Task::none();
         };
-        let mut tasks = Vec::new();
-        if reading.sample.rstick_x.abs() > 0.2 {
-            tasks.push(iced::widget::operation::scroll_by(
-                crate::ui::browser::grid::bookmark_scroll_id(),
-                iced::widget::operation::AbsoluteOffset {
-                    x: reading.sample.rstick_x * 42.0,
-                    y: 0.0,
-                },
-            ));
+        if reading.sample.rstick_x.abs() <= 0.2 {
+            return Task::none();
         }
-        Task::batch(tasks)
+        let target = match self.browser.panel.grid.focus {
+            crate::ui::browser::grid::GridFocus::Bookmark(_) => {
+                crate::ui::browser::grid::bookmark_scroll_id()
+            }
+            _ => crate::ui::browser::grid::tabs_scroll_id(),
+        };
+        iced::widget::operation::scroll_by(
+            target,
+            iced::widget::operation::AbsoluteOffset {
+                x: reading.sample.rstick_x * 42.0,
+                y: 0.0,
+            },
+        )
     }
 
     /// Browser-window message router. Phase 2 is moving the reducer here; the
@@ -2439,23 +2378,13 @@ impl super::App {
             BrowserMessage::GridAnimDone(generation) => {
                 self.finish_browser_grid_transition(generation)
             }
-            BrowserMessage::GridLayoutFrame => {
-                self.browser
-                    .panel
-                    .grid
-                    .clear_finished_layout(std::time::Instant::now());
-                self.invalidate_browser_window()
+            BrowserMessage::GridLayoutFrame => self
+                .apply_pending_grid_scroll()
+                .chain(self.invalidate_browser_window()),
+            BrowserMessage::TabsScrolled(x) => {
+                self.browser.panel.grid.tab_scroll_x = x.max(0.0);
+                Task::none()
             }
-            BrowserMessage::GridPageAnimDone(generation) => {
-                if self.browser.panel.grid.page_anim.map(|a| a.generation) == Some(generation) {
-                    self.browser.panel.grid.page_anim = None;
-                    self.invalidate_browser_window()
-                } else {
-                    Task::none()
-                }
-            }
-            BrowserMessage::GridPagePrev => self.browser_grid_page(-1),
-            BrowserMessage::GridPageNext => self.browser_grid_page(1),
             BrowserMessage::BookmarksScrolled(x) => {
                 self.browser.panel.grid.bookmark_scroll_x = x.max(0.0);
                 Task::none()
@@ -2804,7 +2733,7 @@ impl super::App {
         self.browser.panel.cursor.reset_for_page();
         let start_in_grid = std::mem::take(&mut self.browser.start_in_grid);
         let was_open = self.browser.panel.session.is_open();
-        self.arm_chord_release_latch();
+        self.consume_ps_release();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
         let activation = self.activate_shell_mode(crate::app::home::ShellScreen::Browser, cover);
         let session = if was_open {
@@ -2817,7 +2746,8 @@ impl super::App {
             activation.chain(self.open_browser_session())
         };
         if start_in_grid {
-            self.prepare_browser_grid_on_open();
+            let prepare = self.prepare_browser_grid_on_open();
+            return session.chain(prepare);
         }
         session
     }
@@ -2825,18 +2755,48 @@ impl super::App {
     /// Home tile opens the Browser directly on its tabs view. The page is
     /// still live behind it; selecting a card runs the normal FLIP into page
     /// mode.
-    fn prepare_browser_grid_on_open(&mut self) {
+    fn prepare_browser_grid_on_open(&mut self) -> Task<Message> {
+        use crate::ui::browser::grid::GridFocus;
         let panel = &mut self.browser.panel;
         panel.cancel_url_edit();
         panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
         panel.grid.anim = None;
-        panel.grid.source_override = None;
-        panel.grid.page = 0;
         panel.grid.bookmark_scroll_x = 0.0;
         panel.refresh_grid_visual();
         self.browser.grid_nav.prepare_on_open(true);
         self.browser.pending_grid_move = None;
         self.browser.dpad_stepper.reset();
+        let active = self.browser.panel.active_tab;
+        let offset = self.reveal_grid_focus(GridFocus::Tab(active));
+        self.browser.grid_scroll_pending = Some(offset);
+        self.pending_grid_scroll_later()
+    }
+
+    /// The strip scrollable only exists after the first frame; apply the
+    /// pending offset on the next tick instead of dropping the operation.
+    fn pending_grid_scroll_later(&self) -> Task<Message> {
+        if self.browser.grid_scroll_pending.is_none() {
+            return Task::none();
+        }
+        Task::perform(super::delay(std::time::Duration::from_millis(16)), |_| {
+            Message::Browser(crate::ui::browser::BrowserMessage::GridLayoutFrame)
+        })
+    }
+
+    /// Apply the strip offset saved when the grid opened, now that the
+    /// scrollable is in the widget tree.
+    fn apply_pending_grid_scroll(&mut self) -> Task<Message> {
+        let Some(offset) = self.browser.grid_scroll_pending.take() else {
+            return Task::none();
+        };
+        self.browser.panel.grid.tab_scroll_x = offset;
+        iced::widget::operation::scroll_to(
+            crate::ui::browser::grid::tabs_scroll_id(),
+            iced::widget::operation::AbsoluteOffset {
+                x: Some(offset),
+                y: None,
+            },
+        )
     }
 
     /// True while the Browser card is animating out.
@@ -2953,7 +2913,7 @@ impl super::App {
         }
         // PS is global: while Browser owns the pad it dismisses the screen
         // (the next PS restores this same Browser).
-        if self.home_chord_fires(readings) {
+        if self.ps_released(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Browser");
             return self.ps_screen_toggle();
         }
@@ -3080,13 +3040,7 @@ impl super::App {
         tap_actions: &[PadAction],
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
-        if self.browser.panel.grid.animating()
-            || self
-                .browser
-                .panel
-                .grid
-                .page_animating(std::time::Instant::now())
-        {
+        if self.browser.panel.grid.animating() {
             if self.browser.panel.grid.mode == crate::ui::browser::grid::GridMode::Entering
                 && let Some(mv) = grid_direction(readings)
             {
@@ -3138,8 +3092,6 @@ impl super::App {
                 PadButton::Cross => self.browser_grid_activate_focus(),
                 PadButton::Square => self.browser_grid_close_focused_tab(),
                 PadButton::Triangle => self.browser_grid_toggle_focused_bookmark(),
-                PadButton::L1 => self.browser_grid_page(-1),
-                PadButton::R1 => self.browser_grid_page(1),
                 _ => Task::none(),
             };
             task = task.chain(action);
@@ -4091,7 +4043,6 @@ pub(crate) fn trace_browser_state(
             "grid_mode": format!("{:?}", panel.grid.mode),
             "grid_focus": format!("{:?}", panel.grid.focus),
             "grid_cards": panel.grid.visual.len(),
-            "grid_page": panel.grid.page,
             "bookmarks": panel.bookmarks.len(),
             "nav": nav_window(session.nav_entries(), session.nav_current()),
         },

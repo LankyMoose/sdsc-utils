@@ -60,15 +60,12 @@ pub enum BrowserMessage {
     GridOpenBookmark(usize),
     /// Grid transition finished (generation-guarded).
     GridAnimDone(u64),
-    /// One frame of the side-gutter/card-width tween.
+    /// One frame of the cards-view FLIP; also applies a pending strip offset.
     GridLayoutFrame,
-    /// Page-change slide finished (generation-guarded).
-    GridPageAnimDone(u64),
+    /// Horizontal tab-strip offset changed.
+    TabsScrolled(f32),
     /// Track the bookmark strip offset for focus chasing.
     BookmarksScrolled(f32),
-    /// Page chevrons / L1/R1 in tabs view.
-    GridPagePrev,
-    GridPageNext,
     #[cfg(debug_assertions)]
     Shot(iced::window::Screenshot),
     /// Debug replay: capture after the scheduled settle delay.
@@ -93,10 +90,8 @@ impl BrowserMessage {
             Self::Scrolled(_)
             | Self::GridAnimDone(_)
             | Self::GridLayoutFrame
-            | Self::GridPageAnimDone(_)
+            | Self::TabsScrolled(_)
             | Self::BookmarksScrolled(_) => None,
-            Self::GridPagePrev => Some("browser.grid.page_prev"),
-            Self::GridPageNext => Some("browser.grid.page_next"),
             Self::ToggleGrid => Some("browser.grid.toggle"),
             Self::GridActivate(_) => Some("browser.tab.switch"),
             Self::GridOpenPlus => Some("browser.tab.open"),
@@ -522,8 +517,9 @@ pub fn fullscreen_layout(stage_w: f32, stage_h: f32) -> (f32, f32) {
     (layout.page_w, layout.page_h)
 }
 
-/// Standalone Browser window root. Fills the window with the page surface
-/// (opaque background; no Launcher stage behind it).
+/// Standalone Browser window root. The card shell resizes between the page
+/// card and the compact tabs card; the page/grid content stays at its final
+/// position and the FLIP morphs the page into the selected tab card.
 pub fn root_view(
     panel: &BrowserPanel,
     engine_available: bool,
@@ -533,32 +529,92 @@ pub fn root_view(
     cursor: CursorSurfaceSpec,
     cursor_hidden: bool,
 ) -> Element<'_, BrowserMessage> {
+    use crate::ui::browser::grid::{self, GridFocus, GridMode};
+
     let panel_visual = shell.panel;
     let backdrop_alpha = shell.backdrop_alpha;
     let fade = panel_visual.alpha.clamp(0.0, 1.0);
-    let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
-    let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
-    let in_grid = panel.grid.mode != crate::ui::browser::grid::GridMode::Page;
-    let page_surface: Element<'_, BrowserMessage> = if in_grid {
-        // Tabs view has no header; it uses the full card interior.
-        crate::ui::browser::grid::page_view(
+    let page_layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
+    let page_card = grid::page_card_rect(stage_w, stage_h);
+    let page_inner = grid::page_inner_rect(stage_w, stage_h);
+    let page_body = grid::page_body_rect(stage_w, stage_h);
+    let page_aspect = page_layout.page_w / page_layout.page_h.max(1.0);
+    let tabs = grid::tabs_card_geometry(stage_w, stage_h);
+    let grid_mode = panel.grid.mode;
+    let anim = panel.grid.anim;
+    let in_grid = grid_mode != GridMode::Page;
+    let stage = iced::Size::new(stage_w, stage_h);
+    let content_rect = if in_grid { tabs.inner } else { page_inner };
+    let content: Element<'_, BrowserMessage> = if in_grid {
+        grid::page_view(panel, engine_available, tabs.inner.width, page_aspect, fade)
+    } else {
+        browser_view(
             panel,
             engine_available,
-            page_w,
-            page_h + BROWSER_HEADER_TOTAL,
+            page_layout.page_w,
+            page_layout.page_h,
             fade,
+            cursor,
         )
-    } else {
-        browser_view(panel, engine_available, page_w, page_h, fade, cursor)
     };
-    let card = container(page_surface)
-        .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
-        .style(theme::menu_panel_fade(fade))
-        .width(Length::Fixed(layout.card_w))
-        .height(Length::Fixed(layout.card_h));
+
+    let mut layers: Vec<Element<'_, BrowserMessage>> = Vec::new();
+    layers.push(grid::card_shell(
+        grid_mode, anim, page_card, tabs.card, fade, stage,
+    ));
+    layers.push(grid::positioned(content, content_rect, stage_w, stage_h));
+    if let Some(anim) = anim {
+        let slot = match anim.card {
+            GridFocus::Tab(id) => panel
+                .grid
+                .visual
+                .iter()
+                .position(|tab| *tab == id)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+            GridFocus::Plus | GridFocus::Bookmark(_) => 0,
+        };
+        let local = tabs.layout.card_rect(slot, panel.grid.tab_scroll_x);
+        let card_rect = iced::Rectangle::new(
+            iced::Point::new(tabs.inner.x + local.x, tabs.inner.y + local.y),
+            local.size(),
+        );
+        let (source, target) = if anim.entering {
+            (page_body, card_rect)
+        } else {
+            (card_rect, page_body)
+        };
+        let page = grid::transition_page(panel, engine_available, anim.tab, page_body, fade);
+        layers.push(grid::flip_page(
+            page, anim, page_body, source, target, grid_mode, page_card, tabs.card, stage,
+        ));
+        let header_rect = iced::Rectangle::new(
+            iced::Point::new(page_inner.x, page_inner.y),
+            iced::Size::new(page_layout.page_w, BROWSER_HEADER_TOTAL),
+        );
+        layers.push(grid::positioned(
+            grid::header_curtain(
+                browser_header(panel, page_layout.page_w, fade),
+                anim,
+                header_rect.size(),
+                BROWSER_HEADER_TOTAL,
+                fade,
+                grid_mode,
+                page_card,
+                tabs.card,
+            ),
+            header_rect,
+            stage_w,
+            stage_h,
+        ));
+    }
+    let stage_stack = stack(layers)
+        .width(Length::Fixed(stage_w))
+        .height(Length::Fixed(stage_h));
     // Same entrance/exit language as Home: center-anchored scale + bottom
     // travel; opacity is threaded through the card content.
-    let card = Scale::new(card, panel_visual.scale).offset(Vector::new(0.0, panel_visual.offset_y));
+    let card =
+        Scale::new(stage_stack, panel_visual.scale).offset(Vector::new(0.0, panel_visual.offset_y));
     let transparent = crate::ui::chrome::transparent_windows();
     let root: Element<'_, BrowserMessage> = container(card)
         .width(Fill)
@@ -585,13 +641,14 @@ pub fn root_view(
         cursor_hidden && !crate::platform::debug_quiet::input_dropped(),
     )
     .into();
-    let card_x = (stage_w - layout.card_w) * 0.5;
-    let card_y = (stage_h - layout.card_h) * 0.5;
     let (mouse_x, mouse_y) = panel.page_mouse;
     let cursor = iced::Rectangle::new(
         iced::Point::new(
-            card_x + crate::ui::browser::state::BROWSER_CARD_PAD + mouse_x,
-            card_y + crate::ui::browser::state::BROWSER_CARD_PAD + BROWSER_HEADER_TOTAL + mouse_y,
+            page_card.x + crate::ui::browser::state::BROWSER_CARD_PAD + mouse_x,
+            page_card.y
+                + crate::ui::browser::state::BROWSER_CARD_PAD
+                + BROWSER_HEADER_TOTAL
+                + mouse_y,
         ),
         iced::Size::new(1.0, 1.0),
     );

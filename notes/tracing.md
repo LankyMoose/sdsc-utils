@@ -138,10 +138,11 @@ synthetic input steps for automation:
   D-pad press/release for the pull-model keyboard.
 - `grid.open` / `grid.close` — debug-only direct Share grid enter/exit.
   `grid.activate {"index": 0}` selects a frozen visual card, `grid.new_tab
-  {"url": ...}` opens a tab (replay-only URL override; production plus uses
-  the default page), `grid.close_tab {"index": 0}`, `grid.bookmark
-  {"index": 0}`, `grid.focus {"dir": "down"}`, and
-  `grid.page_prev` / `grid.page_next` drive the card/page actions.
+  {"url": ...}` opens a tab and closes the grid (replay-only URL override;
+  production plus uses the default page), `tab.new {"url": ...}` adds a tab
+  without leaving the grid, `grid.close_tab {"index": 0}`, `grid.bookmark
+  {"index": 0}`, and `grid.focus {"dir": "down"}` drive card/bookmark focus.
+  The tabs strip has no page actions.
 - `screen.ps` / `screen.home` — debug-only screen transitions: PS hide/resume
   and Circle-to-Home. Supported from Browser and Launcher replay steps; replay
   never auto-opens the Browser for these steps.

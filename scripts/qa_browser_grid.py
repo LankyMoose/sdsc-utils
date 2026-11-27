@@ -131,41 +131,34 @@ def browser_rects(width: int, height: int) -> tuple[tuple[int, int, int, int], t
 
 
 def grid_card_rects(
-    width: int, height: int, side: float = 0.0
+    width: int, height: int
 ) -> list[tuple[int, int, int, int]]:
-    page, tabs = browser_rects(width, height)
-    tx, ty, tw, th = tabs
+    """Compact tabs card: one horizontal row of four page-aspect cards."""
+    page, _ = browser_rects(width, height)
     px, py, pw, ph = page
-    pad = 18.0
+    pad = 4.0
+    grid_pad = 18.0
     gap = 14.0
-    island_h = 44.0
-    island_gap = 10.0
     bookmark_h = 88.0
-    cols = 4
-    rows = 3
-    inner_w = tw - 2 * pad
-    island_y = th - pad - island_h
-    bottom = island_y - island_gap
-    max_grid_h = max(1.0, bottom - pad - gap - bookmark_h)
-    grid_x = tx + pad + side
-    grid_w = max(1.0, tw - 2 * (pad + side))
-    width_w = (grid_w - (cols - 1) * gap) / cols
-    aspect = pw / ph
-    height_w = ((max_grid_h - (rows - 1) * gap) / rows) * aspect
-    card_w = max(1.0, min(width_w, height_w))
-    card_h = max(1.0, card_w / aspect)
-    grid_h = rows * card_h + (rows - 1) * gap
-    group_h = grid_h + gap + bookmark_h
-    slack = max(0.0, bottom - pad - group_h)
-    grid_y = ty + pad + slack * 0.5
+    island_gap = 10.0
+    island_h = 44.0
+    page_aspect = pw / ph
+    card_total_w = round((pw + 2 * pad) * 0.70)
+    area_w = card_total_w - 2 * pad
+    row_w = area_w - 2 * grid_pad
+    card_w = max((row_w - 3 * gap) / 4, 150.0)
+    card_h = card_w / page_aspect
+    area_h = grid_pad + card_h + gap + bookmark_h + island_gap + island_h + grid_pad
+    card_x = (width - card_total_w) / 2
+    card_y = (height - (area_h + 2 * pad)) / 2
+    row_x = card_x + pad + grid_pad
+    row_y = card_y + pad + grid_pad
     rects = []
     for index in range(12):
-        col = index % cols
-        row = index // cols
         rects.append(
             (
-                int(grid_x + col * (card_w + gap)),
-                int(grid_y + row * (card_h + gap)),
+                int(row_x + index * (card_w + gap)),
+                int(row_y),
                 int(card_w),
                 int(card_h),
             )

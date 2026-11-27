@@ -9,8 +9,8 @@ use super::stamp_hitch_report;
 use super::{
     App, LAUNCHER_NAV_NOT_READY_MS, LauncherKeyAction, Message, PAD_POLL_SLOW_MS,
     PAD_POLL_STALL_MS, PadInputOwner, RELOAD_FEEDBACK_DELAY, RUNNING_CHECK_INTERVAL,
-    SCROLL_RESTORE_AUTHORITY, SHELL_CURSOR_IDLE_HIDE, SNAPSHOT_STALE_MS, chord_held_on_any_pad,
-    delay, is_manual_target_missing, spawn_blocking, steam_appid_from_target,
+    SCROLL_RESTORE_AUTHORITY, SHELL_CURSOR_IDLE_HIDE, SNAPSHOT_STALE_MS, delay,
+    is_manual_target_missing, spawn_blocking, steam_appid_from_target,
 };
 use crate::AppResult;
 use crate::browser::cursor::{JumpDir, VIEWPORT_H, VIEWPORT_W};
@@ -27,7 +27,7 @@ use crate::persist::prefs::{
 use crate::platform::app_log;
 use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::configure::{PadInputPanel, Section};
-use crate::ui::launcher::gesture::{self, ChordReleaseTick};
+use crate::ui::launcher::gesture;
 use crate::ui::launcher::input::{self as launcher_input, FaceHeld, NavAction, NavLogSnapshot};
 use crate::ui::launcher::mode::{self as launcher_mode};
 use crate::ui::launcher::view::{self as launcher_view, LauncherMessage, ReplaceConfirm};
@@ -2607,7 +2607,7 @@ impl App {
         // global. Analog movement is handled by the pull-model OSK surface;
         // only source-side taps (and the PS chord) cross the app boundary.
         if self.osk.state.open {
-            if self.home_chord_fires(&readings) {
+            if self.ps_released(&readings) {
                 crate::controller::hid::diag::diag_info("ui-diag: PS dismisses screen over OSK");
                 return self.close_osk("home").chain(self.ps_screen_toggle());
             }
@@ -3082,28 +3082,7 @@ impl App {
         if !self.session.prefs.home_enabled {
             return Task::none();
         }
-        let required = gesture::default_gesture();
-        let chord_held = chord_held_on_any_pad(&required, readings);
-        let now = Instant::now();
-        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
-        if glitch {
-            crate::controller::hid::diag::diag_info("ui-diag: reopen chord glitch ignored");
-        }
-        match tick {
-            ChordReleaseTick::Blocked => {
-                if chord_held {
-                    self.gesture_detectors.consume_pending_match(readings);
-                }
-                return Task::none();
-            }
-            ChordReleaseTick::Cleared => {
-                // The release matured between HID samples. Disarm, then let
-                // the normal rising-edge check below evaluate this sample.
-                self.gesture_detectors.disarm(&required);
-            }
-            ChordReleaseTick::Open => {}
-        }
-        if self.gesture_detectors.update(&required, readings) {
+        if self.ps_released(readings) {
             let held = launcher_input::preferred_reading(readings)
                 .map(|r| {
                     gesture::format_gesture(&r.sample.held.iter().copied().collect::<Vec<_>>())
@@ -3118,11 +3097,11 @@ impl App {
         }
     }
 
-    /// Rising-edge PS chord while Launcher is open dismisses the screen; the
-    /// next PS restores Launcher. True modals (replace/edit/manual dialogs,
+    /// PS release while Launcher is open dismisses the screen; the next PS
+    /// release restores Launcher. True modals (replace/edit/manual dialogs,
     /// open or animating settings, ambient tuning) swallow the chord so PS
-    /// cannot strand them mid-dialog. The release gate consumes the sticky
-    /// hold so the opening press cannot immediately re-fire.
+    /// cannot strand them mid-dialog. PS never acts on a held sample, so one
+    /// physical press cannot open and then close the shell.
     pub(crate) fn toggle_home_on_reopen_chord(
         &mut self,
         readings: &[launcher_input::NavReading],
@@ -3139,31 +3118,7 @@ impl App {
         if modal_blocking {
             return None;
         }
-        let required = gesture::default_gesture();
-        let chord_held = chord_held_on_any_pad(&required, readings);
-        let now = Instant::now();
-        let (tick, glitch) = self.chord_release_gate.tick(chord_held, now);
-        if glitch {
-            crate::controller::hid::diag::diag_info("ui-diag: reopen chord glitch ignored");
-        }
-        match tick {
-            ChordReleaseTick::Blocked => {
-                if chord_held {
-                    self.gesture_detectors.consume_pending_match(readings);
-                }
-                return None;
-            }
-            ChordReleaseTick::Cleared => {
-                // The release matured between HID samples. Disarm, then let
-                // the rising-edge check below evaluate this sample.
-                self.gesture_detectors.disarm(&required);
-            }
-            ChordReleaseTick::Open => {}
-        }
-        // Rising-edge guard: the gate reports Open on every tick once
-        // unlatched, even with the chord absent. Only a genuine new press
-        // (detector rising edge) opens Home.
-        if self.gesture_detectors.update(&required, readings) {
+        if self.ps_released(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Launcher");
             Some(self.ps_screen_toggle())
         } else {
@@ -4265,14 +4220,14 @@ impl App {
         {
             self.session.auto_open_pending = false;
             self.last_running_check = None;
-            self.arm_chord_release_latch();
+            self.consume_ps_release();
             let badge = self.refresh_running_badge();
             return badge.chain(Task::batch([focus_window(id)]));
         }
 
         // Mark the current chord consumed (do not reset): a held PS from power-on
         // must not reopen Launcher immediately after a focus-close.
-        self.arm_chord_release_latch();
+        self.consume_ps_release();
         self.clear_start_nav_diag();
         self.launcher_opened_at = Some(Instant::now());
         self.launcher_revealed_at = Some(Instant::now());
@@ -4346,26 +4301,11 @@ impl App {
         None
     }
 
-    /// Arm the debounced release latch and mark any locally visible chord consumed.
-    ///
-    /// When no fresh readings are published, leave detectors alone (do not
-    /// reset/disarm). Live pad edges while latched call `consume_pending_match`.
-    pub(crate) fn arm_chord_release_latch(&mut self) {
-        self.chord_release_gate.arm();
-        self.consume_reopen_gesture_chord();
-    }
-
-    /// Mark the live reopen chord as already matched so a sticky hold cannot fire.
-    pub(crate) fn consume_reopen_gesture_chord(&mut self) {
-        match self.input_hub.read() {
-            launcher_input::NavReadingsOutcome::Readings { readings, .. } => {
-                self.gesture_detectors.consume_pending_match(&readings);
-            }
-            launcher_input::NavReadingsOutcome::Missing { .. } => {
-                // No fresh readings — resetting would disarm detectors
-                // and let the same press reopen after a one-sample gap.
-            }
-        }
+    /// Consume the current PS hold: its release must not toggle a screen.
+    /// Called after opens/closes so a duplicate open or the press that just
+    /// acted cannot fire a second time.
+    pub(crate) fn consume_ps_release(&mut self) {
+        self.ps_release.reset();
     }
 
     /// Re-arm pad nav for an open: selection, drawer, scrolls and drafts all
@@ -4544,7 +4484,7 @@ impl App {
         self.cancel_key_held = false;
         self.pad_held = FaceHeld::default();
         self.clear_start_nav_diag();
-        self.arm_chord_release_latch();
+        self.consume_ps_release();
         rehost_toast
     }
 

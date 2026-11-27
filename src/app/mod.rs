@@ -37,6 +37,7 @@ use crate::controller::known::KnownControllers;
 #[cfg(debug_assertions)]
 use crate::controller::model::Connection;
 use crate::controller::model::{ControllerStatus, Serial};
+use crate::domain::pad::ChordReleaseDetector;
 use crate::games::GamesCatalog;
 use crate::games::process_match::RunningSession;
 use crate::games::process_match::SeenCache;
@@ -55,10 +56,9 @@ use crate::ui::configure::{
 };
 use crate::ui::cursor_hide;
 use crate::ui::launcher::art_worker::ArtOwner;
-use crate::ui::launcher::gesture::{self, ChordReleaseGate};
 use crate::ui::launcher::input::{
-    self as launcher_input, CrossHold, FaceHeld, GestureDetectorBank, NavAction, NavBank,
-    NavLogSnapshot, NavProfile, NavStepper,
+    self as launcher_input, CrossHold, FaceHeld, NavAction, NavBank, NavLogSnapshot, NavProfile,
+    NavStepper,
 };
 use crate::ui::launcher::view::{self as launcher_view, LauncherMessage};
 use crate::ui::layout::{MonitorCover, ToastPlacement, TrayAnchor, focus_window};
@@ -830,8 +830,8 @@ pub struct App {
     shell_opening: bool,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
     launcher_file_dialog_open: bool,
-    /// After open / hide: ignore reopen until a debounced full release.
-    chord_release_gate: ChordReleaseGate,
+    /// PS fires on release only; a reset consumes the current hold.
+    ps_release: ChordReleaseDetector,
     /// Face-button release latch after Home closes on Circle/Cross. The
     /// Home consumed the press; without this the same hold reaches the app
     /// underneath and dismisses its popup/window. Time-bounded so a missed
@@ -839,7 +839,6 @@ pub struct App {
     home_face_latch_until: Option<Instant>,
     /// When Launcher was last revealed (unfocus grace).
     launcher_revealed_at: Option<Instant>,
-    gesture_detectors: GestureDetectorBank,
     pad_nav: NavBank,
     /// Source-action delivery gate (sequence dedupe + owner arming).
     pad_actions: PadActionGate,
@@ -1258,10 +1257,9 @@ impl App {
             shell_cursor_hidden: false,
             shell_opening: false,
             launcher_file_dialog_open: false,
-            chord_release_gate: ChordReleaseGate::default(),
+            ps_release: ChordReleaseDetector::default(),
             home_face_latch_until: None,
             launcher_revealed_at: None,
-            gesture_detectors: GestureDetectorBank::default(),
             pad_nav: NavBank::default(),
             pad_actions: PadActionGate::default(),
             pending_pad_actions: VecDeque::new(),
@@ -2520,7 +2518,7 @@ impl App {
                 self.pad_nav.reset();
                 self.browser.dpad_stepper.reset();
                 self.clear_start_nav_diag();
-                self.consume_reopen_gesture_chord();
+                self.ps_release.reset();
             }
             self.restore_cursor_if_desktop();
             let sync = rehost_toast.chain(self.sync_toast_zorder());
@@ -4113,18 +4111,6 @@ fn is_emulated_serial(serial: &str) -> bool {
         let _ = serial;
         false
     }
-}
-
-fn chord_held_on_any_pad(
-    required: &[gesture::GestureControl],
-    readings: &[launcher_input::NavReading],
-) -> bool {
-    if required.is_empty() {
-        return false;
-    }
-    readings
-        .iter()
-        .any(|r| required.iter().all(|c| r.sample.held.contains(c)))
 }
 
 // ---------------------------------------------------------------------------
