@@ -13,9 +13,9 @@ pad-input transport, and one shared navigation profile for every controller surf
 > **Follow-up:** WO-1 landed the shared mechanics. The surface policy layer
 > then landed in `src/domain/navigation.rs` (`NavList`, `MoveOutcome`/
 > `ActionOutcome`, `NavDispatcher`) across Browser tabs/bookmarks, Home
-> tiles/apps menu/dock/settings, and Launcher selector menus. Launcher's
-> Games-strip bank and the OSK pull surface still use their existing
-> `NavBank`/`NavStepper` mechanics, with no behavior change. See
+> tiles/apps menu/dock/settings, Launcher (including the Games strip tick and
+> selector menus), and the OSK pull surface. Launcher's Games strip keeps only
+> its linear skip/scroll policy in `view::move_selection`. See
 > [navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
 
 ## 1. Why this work order exists

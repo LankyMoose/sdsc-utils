@@ -1,9 +1,8 @@
 # Work order: navigation dispatcher + feedback ownership
 
 **Status:** NAV-1..6 landed 2026-11-28. The dispatcher covers Browser
-tabs/bookmarks, Home tiles/app actions/dock/settings, and Launcher selector
-menus; the Launcher Games-strip bank and OSK pull surface keep their existing
-mechanics (no behavior change).
+tabs/bookmarks, Home tiles/app actions/dock/settings, Launcher (including the
+Games strip tick), Launcher selector menus, and the OSK pull surface.
 **Baseline:** `77b5a42` (newest-first tabs, reserved scrollbar lane, shell
 foreground/topmost fallback).
 **Scope:** the policy layer above `NavBank`/`NavStepper`: list focus validity,
@@ -351,10 +350,11 @@ policy entry points).
 - [x] Migrate Home apps (tiles + app actions) next; then Home dock/settings.
       All four movement paths and the app menu use `NavList`; Home's
       `NavStepper` field is replaced by `NavDispatcher`.
-- [ ] Migrate Launcher and OSK after parity; remove per-surface
-      `NavStepper`/`NavBank` fields. Launcher selector menus are migrated; the
-      Games strip (`view::move_selection` + `App::pad_nav`) and the OSK pull
-      surface keep their banks so their feel is unchanged.
+- [x] Migrate Launcher and OSK after parity; remove per-surface
+      `NavStepper`/`NavBank` fields. `App::pad_nav` and `SurfaceState::nav` are
+      `NavDispatcher`s (`tick_full` keeps Launcher's hold/replace/edit flags;
+      the OSK uses the shared menu tick). The Games strip keeps only its linear
+      skip/scroll policy in `view::move_selection`.
 - [x] Keep `PadActionGate` at the input boundary for tap dedupe/latch; the
       dispatcher never re-implements edge dedupe.
 - [x] Remove `cue: bool`-style parameters and direct `play_ui_cue` calls from
