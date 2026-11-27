@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::domain::navigation::{ActionOutcome, NavAxis, NavCue};
+use crate::domain::navigation::{ActionOutcome, MoveOutcome, NavAxis, NavCue, NavSurface};
 use crate::domain::pad::{PadAction, PadButton, PadButtonAction};
 use crate::platform::ui_sound::UiSoundKind;
 
@@ -227,6 +227,28 @@ fn home_tap_message(
         | PadButton::R1
         | PadButton::L3
         | PadButton::R3 => None,
+    }
+}
+
+/// Home app-menu action surface: Confirm is accepted only while an action is
+/// present; everything else is rejected silently.
+struct HomeActionSurface {
+    available: bool,
+}
+
+impl NavSurface for HomeActionSurface {
+    fn try_move(&mut self, _dir: crate::domain::navigation::NavDir) -> MoveOutcome {
+        MoveOutcome::Rejected
+    }
+
+    fn try_action(&mut self, action: crate::domain::pad::NavAction) -> ActionOutcome {
+        if self.available && action == crate::domain::pad::NavAction::Confirm {
+            ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            }
+        } else {
+            ActionOutcome::Rejected
+        }
     }
 }
 
@@ -784,6 +806,14 @@ impl App {
         let Some(action) = self.home_state.apps_menu_action() else {
             return Task::none();
         };
+        let mut surface = HomeActionSurface { available: true };
+        let outcome = self
+            .home_state
+            .dispatch_action(&mut surface, crate::domain::pad::NavAction::Confirm);
+        self.apply_action_outcome(outcome);
+        if !outcome.accepted() {
+            return Task::none();
+        }
         self.apps_menu_action(action)
     }
 
@@ -791,9 +821,6 @@ impl App {
         let Some(index) = self.home_state.apps_menu else {
             return Task::none();
         };
-        self.apply_action_outcome(ActionOutcome::Accepted {
-            cue: NavCue::Action,
-        });
         match action {
             home_view::AppAction::Install | home_view::AppAction::Update => {
                 self.home_state.close_apps_menu();

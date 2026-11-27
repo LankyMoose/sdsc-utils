@@ -13,7 +13,9 @@
 use crate::app::installs::{DOWNLOAD_LIMIT_OPTIONS_KBPS, download_limit_label};
 use crate::controller::dualsense::lightbar;
 use crate::controller::model::Serial;
-use crate::domain::navigation::{MoveOutcome, NavAxis, NavDir, NavDispatcher, NavList};
+use crate::domain::navigation::{
+    ActionOutcome, MoveOutcome, NavAxis, NavDir, NavDispatcher, NavList, NavSurface,
+};
 use crate::persist::prefs::{AUTO_OPEN_MODES, HomeAutoOpen};
 use crate::ui::face::{
     FaceButton, RingStyle, action_cluster_spaced, face_glyph, hint_text_capsule, hold_hint,
@@ -599,16 +601,43 @@ fn nav_dir(delta: i32, axis: NavAxis) -> NavDir {
     }
 }
 
-/// Shared clamp-only list step for Home. `focus` is written back only through
-/// `NavList`, so the boundary policy and the cue outcome cannot diverge.
-fn move_list(focus: &mut usize, len: usize, axis: NavAxis, delta: i32) -> MoveOutcome {
+/// Focus adapter for a Home list. The dispatcher calls `try_move`; the list
+/// writes the clamped focus back to the owning field.
+struct HomeListSurface<'a> {
+    list: NavList,
+    focus: &'a mut usize,
+}
+
+impl NavSurface for HomeListSurface<'_> {
+    fn try_move(&mut self, dir: NavDir) -> MoveOutcome {
+        let outcome = self.list.try_move(dir);
+        *self.focus = self.list.focus;
+        outcome
+    }
+
+    fn try_action(&mut self, _action: crate::domain::pad::NavAction) -> ActionOutcome {
+        ActionOutcome::Rejected
+    }
+}
+
+/// Shared clamp-only list step for Home. The dispatcher is the policy entry
+/// point; `focus` is written back only through `NavList`, so the boundary
+/// policy and the cue outcome cannot diverge.
+fn dispatch_list(
+    nav: &mut NavDispatcher,
+    focus: &mut usize,
+    len: usize,
+    axis: NavAxis,
+    delta: i32,
+) -> MoveOutcome {
     if delta == 0 {
         return MoveOutcome::Rejected;
     }
-    let mut list = NavList::new(len, axis).with_focus(*focus);
-    let outcome = list.try_move(nav_dir(delta, axis));
-    *focus = list.focus;
-    outcome
+    let mut surface = HomeListSurface {
+        list: NavList::new(len, axis).with_focus(*focus),
+        focus,
+    };
+    nav.dispatch_move(&mut surface, nav_dir(delta, axis).to_action())
 }
 
 impl State {
@@ -623,7 +652,13 @@ impl State {
     /// Move the app highlight. Clamps at the row edges; an edge rejection is
     /// silent and carries no cue.
     pub fn move_selection(&mut self, delta: i32) -> MoveOutcome {
-        move_list(&mut self.selected, TILES.len(), NavAxis::Horizontal, delta)
+        dispatch_list(
+            &mut self.nav,
+            &mut self.selected,
+            TILES.len(),
+            NavAxis::Horizontal,
+            delta,
+        )
     }
 
     /// Move within the focused row. The apps row is horizontal and the
@@ -643,7 +678,8 @@ impl State {
     }
 
     fn move_controller_selection(&mut self, delta: i32) -> MoveOutcome {
-        let outcome = move_list(
+        let outcome = dispatch_list(
+            &mut self.nav,
             &mut self.controller_focus,
             self.controllers.len(),
             NavAxis::Vertical,
@@ -1020,7 +1056,13 @@ impl State {
             .iter()
             .position(|row| *row == self.settings_focus)
             .unwrap_or(0);
-        let outcome = move_list(&mut position, rows.len(), NavAxis::Vertical, delta);
+        let outcome = dispatch_list(
+            &mut self.nav,
+            &mut position,
+            rows.len(),
+            NavAxis::Vertical,
+            delta,
+        );
         if outcome.moved() {
             self.settings_focus = rows[position];
         }
@@ -1087,7 +1129,7 @@ impl State {
         };
         let count = Self::settings_option_count(row);
         let mut focus = highlight;
-        let outcome = move_list(&mut focus, count, NavAxis::Vertical, delta);
+        let outcome = dispatch_list(&mut self.nav, &mut focus, count, NavAxis::Vertical, delta);
         if outcome.moved() {
             self.settings_menu = Some((row, focus));
         }
@@ -1211,7 +1253,7 @@ impl State {
     /// MoveX/MoveY routes share it), so the caller supplies the axis.
     pub fn apps_menu_move(&mut self, delta: i32, axis: NavAxis) -> MoveOutcome {
         let len = self.apps_menu_actions().len();
-        move_list(&mut self.apps_menu_focus, len, axis, delta)
+        dispatch_list(&mut self.nav, &mut self.apps_menu_focus, len, axis, delta)
     }
 
     /// Estimated pixel height of the Info changelog wrapped into the fixed
@@ -1383,6 +1425,16 @@ impl State {
         } else {
             self.progress.bar_value()
         }
+    }
+
+    /// Dispatch one action through the same per-pad policy layer used by list
+    /// moves. Surfaces decide acceptance; the app applies the returned cue.
+    pub fn dispatch_action<S: NavSurface>(
+        &mut self,
+        surface: &mut S,
+        action: crate::domain::pad::NavAction,
+    ) -> ActionOutcome {
+        self.nav.dispatch_action(surface, action)
     }
 
     /// Feed one pad frame. Taps arrive as source-side actions (`tap`); this
