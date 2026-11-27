@@ -2,7 +2,7 @@
 //!
 //! The keyboard layout is built by [`super::view`]; this widget owns the
 //! per-window analog poll. It reads the shared [`OskInputSlot`] at redraw
-//! time, runs the shared [`NavBank`], and publishes only discrete move
+//! time, runs the shared [`NavDispatcher`], and publishes only discrete move
 //! messages. No app message is produced per pad sample.
 
 use super::{OskMessage, OskState, view};

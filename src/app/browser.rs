@@ -213,7 +213,7 @@ const GRID_NAV_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(2
 /// Frame-demand clock for held tabs-view sticks.
 ///
 /// A held stick keeps the grid ticker running; after release it keeps pulling
-/// neutral frames through the shared `NavBank` neutral grace so the next press
+/// neutral frames through the shared `NavDispatcher` neutral grace so the next press
 /// starts as `First` instead of inheriting the old repeat schedule.
 #[derive(Debug, Default)]
 pub(crate) struct GridNavClock {
