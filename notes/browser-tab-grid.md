@@ -30,8 +30,15 @@ bookmark UI, or Browser screen/back behavior.
   left stick is shaped by `NavProfile::MENU` and the right stick is excluded.
   Cross opens, Square closes, Triangle bookmarks. Down from the bottom row
   enters the bookmark strip. Right stick scrolls bookmarks horizontally.
-- A footer hint island (Launcher glass style) shows Open/Close/Bookmark/Back
-  and Page hints; each card has an overlaid bottom title footer with ellipsis.
+- A footer hint island (Launcher glass style, full **pill** radius) shows
+  Open/Close/Bookmark/Back and Page hints; each card has an overlaid bottom
+  title footer with ellipsis.
+- **One cue per action.** Opening/closing the tabs view, paging, moving focus,
+  bookmarking, and selecting a card each emit exactly one `play_ui_cue` (sound
+  and haptics). The plus card/new-tab path and bookmark navigation already cue
+  from the tab/navigation call, so their grid close is silent
+  (`close_browser_grid_with(..., false)`); selecting a card cues when the FLIP
+  starts and the late tab activation stays silent.
 - **No engine resize.** The FLIP overlay draws the tab's existing `FrameSlot`
   texture at an animating rectangle; card aspect equals the live page viewport
   aspect. Entering shrinks the page into the active card; selecting a card
@@ -43,10 +50,12 @@ bookmark UI, or Browser screen/back behavior.
   page's y offset interpolates for the whole FLIP instead of snapping on the
   last frame.
 - The Browser header is part of the same transition. `HeaderCurtain` draws the
-  normal header over the tabs view and slides it down/up while compositing a
-  card-background curtain at the inverse alpha; it uses the FLIP clock, so
-  exit (page) slides up + fades in and enter (tabs) reverses it. The header
-  area sits above every grid card, so the curtain never hides card content.
+  normal header over the tabs view and **slides it up** into its row while
+  compositing a card-background curtain that travels with it; entering (tabs)
+  lifts the header out as it fades, leaving drops it back in from above. The
+  curtain alpha fades faster than linear (`1 - appear²`) so the content is
+  clearly gone before the animation ends. The header area sits above every grid
+  card, so the curtain never hides card content.
 - Never render the same tab id twice in one frame (`BrowserFramePipeline`
   stores one uniform block per tab id): the animating tab's grid card omits its
   shader until the transition lands.

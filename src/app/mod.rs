@@ -268,8 +268,6 @@ pub enum Message {
     /// Deferred Launcher HWND destruction (second close phase; see
     /// `launcher_close_armed`). Lets the cursor-restore present land first.
     FinishStartClose,
-    /// Deferred Browser HWND destruction (cursor-restore present lands first).
-    FinishBrowserClose,
     /// Drive launcher animation frames.
     LauncherFrame,
     /// Low-rate idle timer (sleep/dim) while no animation needs frames.
@@ -413,7 +411,6 @@ impl Message {
             | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
-            | Message::FinishBrowserClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
             | Message::ShellCursorTick
@@ -549,7 +546,6 @@ impl Message {
             | Message::HomeOpened(_)
             | Message::LauncherOpened(_)
             | Message::FinishStartClose
-            | Message::FinishBrowserClose
             | Message::LauncherFrame
             | Message::LauncherIdleTick
             | Message::ShellCursorTick
@@ -759,8 +755,16 @@ pub struct App {
     /// Browser HWND is created hidden until its final size + DWM transition
     /// setup; then it is shown so no create-time scale animation is visible.
     browser_pending_show: bool,
-    /// Launcher instant for the Browser backdrop fade-in (card first, scrim after).
-    browser_backdrop_fade: Option<Instant>,
+    /// Browser window entrance/exit (card scale/opacity/y), same language as
+    /// Home.
+    browser_shell_anim: Option<crate::ui::home::ShellAnim>,
+    /// One dim backdrop shared by Home/Browser/Launcher. Whichever visible
+    /// screen owns it paints the same alpha, so swaps never expose the desktop.
+    shell_backdrop: crate::ui::motion::ShellBackdrop,
+    shell_backdrop_owner: Option<home::ShellScreen>,
+    /// Home was opened while Launcher is still up; tear Launcher down only
+    /// after Home has actually presented (avoids a desktop gap on Circle).
+    deferred_launcher_close: bool,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
     /// card centered in it.
     home_window: Option<window::Id>,
@@ -788,10 +792,9 @@ pub struct App {
     /// OS first. Destroying a hidden-cursor window skips that push and
     /// leaks a global `ShowCursor(FALSE)` (winit only pushes on change).
     launcher_close_armed: bool,
-    /// Browser equivalent: destruction waits one loop pass when the last shell
-    /// screen is closing with a hidden cursor, so the visible interaction can
-    /// present before the HWND is destroyed.
-    browser_close_armed: bool,
+    /// The Browser exit fade settled and hide/close was issued; the id is kept
+    /// until `WindowClosed` so the PS-resume retry and cleanup still run.
+    browser_close_issued: bool,
     /// Last Launcher-window paint (for the transition paint-gap witness;
     /// `Cell` because `view()` only gets `&self`).
     last_start_paint_at: std::cell::Cell<Option<Instant>>,
@@ -1222,7 +1225,10 @@ impl App {
             browser_monitor_cover: None,
             browser_window_size: None,
             browser_pending_show: false,
-            browser_backdrop_fade: None,
+            browser_shell_anim: None,
+            shell_backdrop: crate::ui::motion::ShellBackdrop::Hidden,
+            shell_backdrop_owner: None,
+            deferred_launcher_close: false,
             home_window: None,
             home_visible: false,
             ps_resume: None,
@@ -1233,7 +1239,7 @@ impl App {
             home_monitor_cover: None,
             home_state: crate::ui::home::State::default(),
             launcher_close_armed: false,
-            browser_close_armed: false,
+            browser_close_issued: false,
             last_start_paint_at: std::cell::Cell::new(None),
             last_start_paint_active: std::cell::Cell::new(false),
             launcher_nav_ready: false,
@@ -1660,7 +1666,10 @@ impl App {
                 .push(iced::time::every(EMULATOR_COMMIT_POLL).map(|_| Message::EmulatorCommitTick));
         }
 
-        if self.browser_backdrop_fade.is_some() || self.home_shell_anim.is_some() {
+        if self.browser_shell_anim.is_some()
+            || self.home_shell_anim.is_some()
+            || self.shell_backdrop.animating(Instant::now())
+        {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
         }
 
@@ -1896,13 +1905,24 @@ impl App {
                 .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
                 .unwrap_or((1920.0, 1080.0));
             let now = Instant::now();
-            let backdrop_alpha = self
-                .browser_backdrop_fade
-                .map(|started| {
-                    crate::ui::motion::shell_backdrop_alpha(started, now, theme::BACKDROP_ALPHA)
-                })
-                .unwrap_or(theme::BACKDROP_ALPHA);
-            let draws = crate::ui::browser::view::cursor_draws(&self.browser.panel);
+            let reduced =
+                crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+            let panel = self
+                .browser_shell_anim
+                .map(|anim| anim.frame(now, reduced).panel)
+                .unwrap_or_else(crate::ui::home::PanelVisual::full);
+            let backdrop_alpha =
+                if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Browser) {
+                    self.shell_backdrop_alpha(now)
+                } else {
+                    0.0
+                };
+            let shell = crate::ui::home::ShellFrame {
+                panel,
+                backdrop_alpha,
+            };
+            let draws = crate::ui::browser::view::cursor_draws(&self.browser.panel)
+                && self.browser_shell_anim.is_none();
             let cursor = crate::ui::browser::cursor_surface::CursorSurfaceSpec {
                 handle: self.browser.panel.cursor.clone(),
                 hub: self.input_hub.clone(),
@@ -1919,7 +1939,7 @@ impl App {
                 self.browser.engine_available,
                 w,
                 h,
-                backdrop_alpha,
+                shell,
                 cursor,
                 self.shell_cursor_hidden || !self.browser.panel.page_mouse_active,
             )
@@ -1934,12 +1954,18 @@ impl App {
                 .home_shell_anim
                 .map(|anim| anim.frame(now, reduced))
                 .unwrap_or_else(crate::ui::home::ShellFrame::full);
+            let backdrop_alpha =
+                if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Home) {
+                    self.shell_backdrop_alpha(now)
+                } else {
+                    0.0
+                };
             let home_panel = crate::ui::home::view(
                 &self.home_state,
                 &self.session.prefs.spectrum,
                 self.home_stage.0,
                 self.home_stage.1,
-                shell.backdrop_alpha,
+                backdrop_alpha,
                 shell.panel,
                 now,
             )
@@ -2256,12 +2282,18 @@ impl App {
             Message::ShellFadeTick => {
                 let now = Instant::now();
                 let mut redraw = Task::none();
-                if let Some(started) = self.browser_backdrop_fade {
+                let mut finish_browser = false;
+                if let Some(anim) = self.browser_shell_anim {
                     if let Some(id) = self.browser_window {
                         redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
                     }
-                    if crate::ui::motion::shell_backdrop_done(started, now) {
-                        self.browser_backdrop_fade = None;
+                    if anim.done(now) {
+                        match anim.dir {
+                            crate::ui::home::ShellDir::Enter => {
+                                self.browser_shell_anim = None;
+                            }
+                            crate::ui::home::ShellDir::Exit => finish_browser = true,
+                        }
                     }
                 }
                 if let Some(anim) = self.home_shell_anim {
@@ -2272,10 +2304,31 @@ impl App {
                         match anim.dir {
                             crate::ui::home::ShellDir::Enter => self.home_shell_anim = None,
                             crate::ui::home::ShellDir::Exit => {
-                                return redraw.chain(self.finish_home_close(now));
+                                redraw = redraw.chain(self.finish_home_close(now));
                             }
                         }
                     }
+                }
+                if self.shell_backdrop.animating(now) {
+                    if let Some(id) = self.shell_backdrop_window() {
+                        redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
+                    }
+                    if self.shell_backdrop.done(now) {
+                        self.shell_backdrop = match self.shell_backdrop {
+                            crate::ui::motion::ShellBackdrop::Entering { .. } => {
+                                crate::ui::motion::ShellBackdrop::Full
+                            }
+                            crate::ui::motion::ShellBackdrop::Exiting { .. }
+                                if self.shell_backdrop_owner.is_none() =>
+                            {
+                                crate::ui::motion::ShellBackdrop::Hidden
+                            }
+                            other => other,
+                        };
+                    }
+                }
+                if finish_browser {
+                    redraw = redraw.chain(self.finish_browser_window_close());
                 }
                 redraw
             }
@@ -2306,14 +2359,6 @@ impl App {
 
             Message::LauncherOpened(id) => self.on_start_opened(id),
             Message::FinishStartClose => self.finish_start_close(),
-            Message::FinishBrowserClose => {
-                if self.browser_close_armed {
-                    self.browser_close_armed = false;
-                    self.finish_browser_window_close()
-                } else {
-                    Task::none()
-                }
-            }
             Message::LauncherArtEvent(ev) => self.on_start_art_event(ev),
             Message::LauncherFrame => self.on_start_frame(),
             Message::LauncherIdleTick => {
@@ -2481,11 +2526,13 @@ impl App {
         } else if Some(id) == self.browser_window {
             self.browser_window = None;
             self.browser_visible = false;
-            self.browser_close_armed = false;
+            self.browser_close_issued = false;
+            self.browser_shell_anim = None;
             self.browser_monitor_cover = None;
             if self.browser.panel.session.is_open() {
                 let _ = self.close_browser_surface();
             }
+            self.release_shell_backdrop(home::ShellScreen::Browser);
             self.restore_cursor_if_desktop();
             self.maybe_resume_ps_after_close()
         } else if Some(id) == self.osk.window {
@@ -2494,6 +2541,7 @@ impl App {
             self.home_window = None;
             self.home_visible = false;
             self.home_shell_anim = None;
+            self.release_shell_backdrop(home::ShellScreen::Home);
             self.resume_launcher_after_home(Instant::now());
             self.restore_cursor_if_desktop();
             // Return focus to Launcher when it is the app underneath. The toast
@@ -2515,6 +2563,7 @@ impl App {
             self.launcher_visible = false;
             self.launcher_close_armed = false;
             self.launcher_nav_ready = false;
+            self.release_shell_backdrop(home::ShellScreen::Launcher);
             let rehost_toast = self.rehost_toast_after_composite();
             let resume_ps = self.ps_resume_pending;
             // Close preserves all visual state (selection, dock, drawer,

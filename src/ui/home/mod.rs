@@ -76,7 +76,7 @@ pub struct PanelVisual {
 }
 
 impl PanelVisual {
-    const fn full() -> Self {
+    pub const fn full() -> Self {
         Self {
             alpha: 1.0,
             scale: 1.0,

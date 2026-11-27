@@ -313,6 +313,26 @@ pub fn menu_panel(_theme: &Theme) -> container::Style {
     }
 }
 
+/// [`menu_panel`] with a shell fade applied to every paint layer.
+pub fn menu_panel_fade(fade: f32) -> impl Fn(&Theme) -> container::Style {
+    let fade = fade.clamp(0.0, 1.0);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(scale_alpha(lighten(BASE_BG, 0.04), fade))),
+        text_color: Some(scale_alpha(INK, fade)),
+        border: Border {
+            color: scale_alpha(GLASS_HAIRLINE, fade),
+            width: 1.0,
+            radius: radius::LG.into(),
+        },
+        shadow: iced::Shadow {
+            color: scale_alpha(alpha(Color::BLACK, 0.35), fade),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 16.0,
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Wrap in-window modal content in a [`modal_card`]. Window roots use
 /// [`crate::ui::chrome::window`] instead.
 pub fn framed<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
@@ -355,11 +375,17 @@ pub fn status_overlay(_theme: &Theme) -> container::Style {
 /// Browser URL well: the single header input surface. Idle keeps a hairline;
 /// editing pins the border to the accent.
 pub fn browser_url_bar(editing: bool) -> impl Fn(&Theme) -> container::Style {
+    browser_url_bar_fade(editing, 1.0)
+}
+
+/// [`browser_url_bar`] with a shell fade applied.
+pub fn browser_url_bar_fade(editing: bool, fade: f32) -> impl Fn(&Theme) -> container::Style {
+    let fade = fade.clamp(0.0, 1.0);
     move |_theme| container::Style {
-        background: Some(Background::Color(alpha(INK, 0.06))),
-        text_color: Some(INK),
+        background: Some(Background::Color(scale_alpha(alpha(INK, 0.06), fade))),
+        text_color: Some(scale_alpha(INK, fade)),
         border: Border {
-            color: if editing { ACCENT } else { LINE },
+            color: scale_alpha(if editing { ACCENT } else { LINE }, fade),
             width: 1.0,
             radius: radius::SM.into(),
         },
@@ -449,6 +475,27 @@ pub fn glass(radius: f32) -> impl Fn(&Theme) -> container::Style {
 /// Capsule island shared by footer hints (fixed radius).
 pub fn immersive_island(theme: &Theme) -> container::Style {
     glass(radius::XL)(theme)
+}
+
+/// [`glass`] with every layer scaled by a shell fade.
+pub fn glass_fade(radius: f32, fade: f32) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.max(0.0);
+    let fade = fade.clamp(0.0, 1.0);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(scale_alpha(GLASS_FILL, fade))),
+        text_color: Some(scale_alpha(INK, fade)),
+        border: Border {
+            color: scale_alpha(GLASS_HAIRLINE, fade),
+            width: 1.0,
+            radius: radius.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Fading footer pill (same capsule as the Launcher's hint island).
+pub fn immersive_footer_pill_fade(fade: f32) -> impl Fn(&Theme) -> container::Style {
+    glass_fade(radius::PILL, fade)
 }
 
 /// Controllers dock island — pass `ring_radius + edge_inset` for concentric corners.

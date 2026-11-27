@@ -309,6 +309,22 @@ impl super::App {
             .and_then(|plan| plan.peek_action())
             .is_some_and(|action| matches!(action, "screen.ps" | "screen.home"));
         if wants_browser && !screen_step && !self.browser_visible {
+            // A PS deferral owns the next open; clearing it here would turn
+            // the resume into a plain replay open (and emit no screen.resume).
+            // A closing window owns the same transition until WindowClosed.
+            if self.ps_resume_pending || self.browser_window.is_some() {
+                return self
+                    .replay_install_wait(
+                        crate::app::browser::ReplayWait {
+                            needs_browser_ready: true,
+                            needs_engine: true,
+                            needs_redraw: true,
+                            ..Default::default()
+                        },
+                        REPLAY_BROWSER_WAIT,
+                    )
+                    .unwrap_or_else(Task::none);
+            }
             let open = self.open_browser_window();
             let wait = crate::app::browser::ReplayWait {
                 needs_browser_ready: true,
@@ -785,7 +801,8 @@ impl super::App {
                 if let Some(url) = url {
                     let open = self.open_browser_tab(Some(url.to_string()));
                     let id = self.browser.panel.active_tab;
-                    open.chain(self.close_browser_grid(Some(id)))
+                    // Opening the tab already cues; the close FLIP is silent.
+                    open.chain(self.close_browser_grid_with(Some(id), false))
                 } else {
                     self.browser_grid_open_plus()
                 }
@@ -1780,6 +1797,17 @@ impl super::App {
         &mut self,
         select: Option<crate::browser::engine::TabId>,
     ) -> Task<Message> {
+        self.close_browser_grid_with(select, true)
+    }
+
+    /// Close the tabs view. `cue` is false when the initiating action already
+    /// played one (the plus card opens a tab, which cues itself), so a single
+    /// press never emits two navigation sounds/haptics.
+    fn close_browser_grid_with(
+        &mut self,
+        select: Option<crate::browser::engine::TabId>,
+        cue: bool,
+    ) -> Task<Message> {
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
@@ -1803,6 +1831,9 @@ impl super::App {
             .field("select", select.is_some())
             .field("reduced_motion", true)
             .emit();
+            if cue {
+                self.play_ui_cue(UiSoundKind::Nav);
+            }
             if let Some(id) = pending {
                 return self.activate_browser_tab(id);
             }
@@ -1850,7 +1881,9 @@ impl super::App {
             tab,
             entering: false,
         });
-        self.play_ui_cue(UiSoundKind::Nav);
+        if cue {
+            self.play_ui_cue(UiSoundKind::Nav);
+        }
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.grid.close")
             .field("tab", tab.0)
             .field("select", select.is_some())
@@ -1948,7 +1981,8 @@ impl super::App {
         self.browser.panel.grid.source_override = Some(layout.card_rect(0));
         let open = self.open_browser_tab(None);
         let id = self.browser.panel.active_tab;
-        open.chain(self.close_browser_grid(Some(id)))
+        // `open_browser_tab` already plays the tab-open cue.
+        open.chain(self.close_browser_grid_with(Some(id), false))
     }
 
     pub(crate) fn browser_grid_close_tab(
@@ -2030,7 +2064,8 @@ impl super::App {
             return Task::none();
         };
         let navigate = self.navigate_browser_to(bookmark.url);
-        navigate.chain(self.close_browser_grid(None))
+        // Navigation already played the cue; the FLIP close stays silent.
+        navigate.chain(self.close_browser_grid_with(None, false))
     }
 
     pub(crate) fn browser_grid_page(&mut self, delta: i32) -> Task<Message> {
@@ -2623,6 +2658,8 @@ impl super::App {
         self.browser.panel.cursor.reset_for_page();
         self.browser_visible = true;
         self.browser_pending_show = true;
+        self.browser_shell_anim = None;
+        self.browser_close_issued = false;
         let was_open = self.browser.panel.session.is_open();
         let (id, open) = iced::window::open(iced::window::Settings {
             size: cover.size(),
@@ -2661,44 +2698,73 @@ impl super::App {
     }
 
     /// Close the standalone Browser window and suspend its engine (cached
-    /// page survives for the next open).
+    /// page survives for the next open). The card/scrim run the same
+    /// entrance/exit language as Home; the HWND is torn down when the fade
+    /// settles.
     pub(crate) fn close_browser_window(&mut self) -> Task<Message> {
+        if self.browser_close_issued
+            || self
+                .browser_shell_anim
+                .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
+        {
+            return Task::none();
+        }
         self.browser_visible = false;
         // Destroying the last shell window while the pointer is hidden would
-        // leak winit's global ShowCursor(FALSE). Restore on the frame before
-        // the HWND goes away; a swap keeps the pointer hidden.
+        // leak winit's global ShowCursor(FALSE). Restore now; the exit frames
+        // below present the restored pointer before the HWND goes away.
         let last_shell = !self.home_visible && !self.launcher_visible && !self.shell_opening;
-        let restore_cursor = self.shell_cursor_hidden && last_shell;
-        if restore_cursor {
+        if self.shell_cursor_hidden && last_shell {
             self.set_shell_cursor_hidden(false);
         }
         self.browser_monitor_cover = None;
         self.browser_window_size = None;
-        self.browser_pending_show = false;
-        self.browser_backdrop_fade = None;
-        self.reset_shell_cursor_clock();
-        let task = self.close_osk("browser_close");
-        let task = task.chain(self.close_browser_surface());
-        let Some(id) = self.browser_window else {
-            return task;
-        };
-        if restore_cursor {
-            self.browser_close_armed = true;
-            return task
-                .chain(crate::ui::layout::invalidate_window(id))
-                .chain(Task::done(Message::FinishBrowserClose));
+        if self.browser_pending_show {
+            self.browser_pending_show = false;
+            return self
+                .close_browser_surface()
+                .chain(self.finish_browser_window_close());
         }
-        task.chain(self.finish_browser_window_close())
+        self.browser_pending_show = false;
+        self.reset_shell_cursor_clock();
+        let now = Instant::now();
+        self.begin_shell_backdrop_exit(crate::app::home::ShellScreen::Browser, now);
+        let close_osk = self.close_osk("browser_close");
+        let Some(id) = self.browser_window else {
+            self.browser_shell_anim = None;
+            self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
+            return close_osk.chain(self.close_browser_surface());
+        };
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        let from = self
+            .browser_shell_anim
+            .map(|anim| anim.frame(now, reduced))
+            .unwrap_or_else(crate::ui::home::ShellFrame::full);
+        self.browser_shell_anim = Some(crate::ui::home::ShellAnim::exit(now, from));
+        close_osk.chain(crate::ui::layout::invalidate_window(id))
     }
 
-    /// Second Browser close phase: destroy the HWND after the cursor-restore
-    /// present has landed (see `browser_close_armed`).
+    /// Second Browser close phase: the exit fade has settled. Hide + destroy
+    /// the HWND (and suspend the engine) only now, so the final frame matches.
+    /// The id stays tracked until `WindowClosed` so the deferred PS resume and
+    /// cursor cleanup still run.
     pub(crate) fn finish_browser_window_close(&mut self) -> Task<Message> {
-        let Some(id) = self.browser_window.take() else {
+        self.browser_shell_anim = None;
+        if self.browser_close_issued {
+            return Task::none();
+        }
+        let Some(id) = self.browser_window else {
+            self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
             return Task::none();
         };
+        self.browser_close_issued = true;
+        self.release_shell_backdrop(crate::app::home::ShellScreen::Browser);
+        let surface = self.close_browser_surface();
         crate::controller::hid::diag::diag_info("ui-diag: browser window close");
-        let task = iced::window::close(id);
+        let task = surface
+            .chain(iced::window::set_mode(id, iced::window::Mode::Hidden))
+            .chain(iced::window::close(id));
         if self.launcher_visible
             && let Some(start) = self.launcher_window
         {
@@ -2720,7 +2786,7 @@ impl super::App {
         // can race creation and report the pre-fullscreen default, which
         // would briefly shrink the cursor space (the quarter-screen bug).
         self.sync_browser_viewport();
-        Task::none()
+        self.replay_kick()
     }
 
     /// Show the hidden Browser window after the DWM transition task has run
@@ -2735,7 +2801,9 @@ impl super::App {
         let Some(id) = self.browser_window else {
             return Task::none();
         };
-        self.browser_backdrop_fade = Some(Instant::now());
+        let now = Instant::now();
+        self.browser_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
+        self.claim_shell_backdrop(crate::app::home::ShellScreen::Browser, now);
         self.sync_browser_viewport();
         crate::ui::layout::show_window(id).chain(crate::ui::layout::focus_window(id))
     }

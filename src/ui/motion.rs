@@ -140,6 +140,82 @@ pub fn shell_backdrop_done(started: std::time::Instant, now: std::time::Instant)
     now.saturating_duration_since(started) >= SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE
 }
 
+/// One shared full-screen dim behind Home/Browser/Launcher.
+///
+/// The screens own separate windows, but they must never expose an undimmed
+/// desktop between them. This is the single alpha timeline; whichever visible
+/// screen owns it draws the same value, so handing ownership between windows
+/// is pixel-identical and swap transitions never flash.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ShellBackdrop {
+    #[default]
+    Hidden,
+    Entering {
+        started: Instant,
+    },
+    Full,
+    Exiting {
+        started: Instant,
+        from: f32,
+    },
+}
+
+impl ShellBackdrop {
+    pub fn alpha(&self, now: Instant) -> f32 {
+        match *self {
+            Self::Hidden => 0.0,
+            Self::Entering { started } => {
+                shell_backdrop_alpha(started, now, crate::ui::theme::BACKDROP_ALPHA)
+            }
+            Self::Full => crate::ui::theme::BACKDROP_ALPHA,
+            Self::Exiting { started, from } => {
+                let t = progress_linear(
+                    now.saturating_duration_since(started).as_millis() as u64,
+                    BASE_MS,
+                );
+                from * (1.0 - ease_in_out_cubic(t))
+            }
+        }
+    }
+
+    pub fn enter(&mut self, now: Instant) {
+        *self = Self::Entering { started: now };
+    }
+
+    pub fn hold_full(&mut self) {
+        *self = Self::Full;
+    }
+
+    pub fn exit(&mut self, now: Instant) {
+        if matches!(self, Self::Hidden) {
+            return;
+        }
+        let from = self.alpha(now);
+        *self = Self::Exiting { started: now, from };
+    }
+
+    /// True while a frame clock is needed for this timeline.
+    pub fn animating(&self, now: Instant) -> bool {
+        match *self {
+            Self::Hidden | Self::Full => false,
+            Self::Entering { started } => !shell_backdrop_done(started, now),
+            Self::Exiting { started, .. } => {
+                (now.saturating_duration_since(started).as_millis() as u64) < BASE_MS
+            }
+        }
+    }
+
+    pub fn done(&self, now: Instant) -> bool {
+        match *self {
+            Self::Hidden | Self::Full => true,
+            Self::Entering { started } => shell_backdrop_done(started, now),
+            Self::Exiting { started, .. } => {
+                now.saturating_duration_since(started).as_millis() as u64 >= BASE_MS
+            }
+        }
+    }
+}
+
 /// Linear 0..=1 fraction of `elapsed_ms / duration_ms` (zero duration = done).
 pub fn progress_linear(elapsed_ms: u64, duration_ms: u64) -> f32 {
     if duration_ms == 0 {
@@ -360,5 +436,28 @@ mod shell_fade_tests {
             t0,
             t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE
         ));
+    }
+
+    #[test]
+    fn shared_backdrop_holds_through_swaps_and_fades_only_for_desktop() {
+        let t0 = Instant::now();
+        let mut backdrop = ShellBackdrop::Hidden;
+        assert_eq!(backdrop.alpha(t0), 0.0);
+        backdrop.enter(t0);
+        let mid = backdrop.alpha(t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE / 2);
+        assert!(mid > 0.0 && mid < crate::ui::theme::BACKDROP_ALPHA);
+        assert!(backdrop.animating(t0 + SHELL_BACKDROP_DELAY));
+        assert!(!backdrop.animating(t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE));
+        backdrop.hold_full();
+        assert_eq!(
+            backdrop.alpha(t0 + Duration::from_secs(10)),
+            crate::ui::theme::BACKDROP_ALPHA
+        );
+        backdrop.exit(t0 + Duration::from_secs(10));
+        let now = t0 + Duration::from_secs(10) + Duration::from_millis(BASE_MS / 2);
+        let half = backdrop.alpha(now);
+        assert!(half > 0.0 && half < crate::ui::theme::BACKDROP_ALPHA);
+        assert!(backdrop.done(t0 + Duration::from_secs(10) + Duration::from_millis(BASE_MS)));
+        assert!(!backdrop.animating(t0 + Duration::from_secs(10) + Duration::from_millis(BASE_MS)));
     }
 }

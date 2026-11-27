@@ -16,13 +16,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// NDC quad placement. The shader reads only `rect`; the pad keeps the
-/// uniform block at 32 bytes.
+/// NDC quad placement. `rect` places the quad; `params.x` is the shell fade
+/// opacity. The pad keeps the uniform block at 32 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     rect: [f32; 4],
-    _pad: [f32; 4],
+    params: [f32; 4],
 }
 
 struct FrameEntry {
@@ -69,7 +69,7 @@ impl Pipeline for BrowserFramePipeline {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -103,7 +103,7 @@ impl Pipeline for BrowserFramePipeline {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -267,13 +267,13 @@ impl BrowserFramePipeline {
         entry.uploaded_gen = generation;
     }
 
-    fn prepare(&self, queue: &wgpu::Queue, id: u64, rect_ndc: [f32; 4]) {
+    fn prepare(&self, queue: &wgpu::Queue, id: u64, rect_ndc: [f32; 4], opacity: f32) {
         let Some(entry) = self.frames.get(&id) else {
             return;
         };
         let uniforms = Uniforms {
             rect: rect_ndc,
-            _pad: [0.0; 4],
+            params: [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&entry.uniforms, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -316,15 +316,23 @@ pub struct BrowserFramePrimitive {
     alive: Arc<AtomicBool>,
     slot: Arc<FrameSlot>,
     upload: bool,
+    opacity: f32,
 }
 
 impl BrowserFramePrimitive {
-    fn new(id: u64, alive: Arc<AtomicBool>, slot: Arc<FrameSlot>, upload: bool) -> Self {
+    fn new(
+        id: u64,
+        alive: Arc<AtomicBool>,
+        slot: Arc<FrameSlot>,
+        upload: bool,
+        opacity: f32,
+    ) -> Self {
         Self {
             id,
             alive,
             slot,
             upload,
+            opacity,
         }
     }
 }
@@ -355,6 +363,7 @@ impl Primitive for BrowserFramePrimitive {
             queue,
             self.id,
             [ndc.x, ndc.y, ndc.x + ndc.width, ndc.y + ndc.height],
+            self.opacity,
         );
     }
 
@@ -377,12 +386,24 @@ pub struct BrowserFrameProgram {
     id: u64,
     slot: Arc<FrameSlot>,
     alive: Arc<AtomicBool>,
+    opacity: f32,
 }
 
 impl BrowserFrameProgram {
     pub fn new(slot: Arc<FrameSlot>, id: u64) -> Self {
         let alive = slot.alive();
-        Self { id, slot, alive }
+        Self {
+            id,
+            slot,
+            alive,
+            opacity: 1.0,
+        }
+    }
+
+    /// Shell fade applied to the page texture (1.0 = fully opaque).
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -430,6 +451,7 @@ impl<Message> iced::widget::shader::Program<Message> for BrowserFrameProgram {
             Arc::clone(&self.alive),
             Arc::clone(&self.slot),
             upload,
+            self.opacity,
         )
     }
 }

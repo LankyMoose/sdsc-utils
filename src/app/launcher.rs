@@ -434,6 +434,9 @@ impl App {
 
     /// Switch the live tab. Dormant stored tabs create their engine view on
     /// first activation; loaded tabs just foreground their existing view.
+    /// Activate a tab selected from the tabs view. The grid close already
+    /// played the navigation cue at the start of the FLIP, so this must stay
+    /// silent (otherwise one selection emits two sounds/haptics).
     pub(crate) fn activate_browser_tab(
         &mut self,
         id: crate::browser::engine::TabId,
@@ -479,7 +482,6 @@ impl App {
             engine.send(EngineCommand::SetActiveTab { tab: id });
         }
         self.note_launcher_activity();
-        self.play_ui_cue(UiSoundKind::Nav);
         self.resume_browser_engine();
         self.save_page();
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.switch")
@@ -4576,6 +4578,13 @@ impl App {
         // Clear visibility before any hide task so Resting toast RaiseInteractive
         // cannot resurface Launcher while the hide is in flight.
         self.launcher_visible = false;
+        if self.shell_backdrop_owner == Some(crate::app::home::ShellScreen::Launcher)
+            && !self.home_visible
+            && !self.browser_visible
+        {
+            self.shell_backdrop_owner = None;
+            self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
+        }
         if restore_cursor {
             self.set_shell_cursor_hidden(false);
         }

@@ -220,10 +220,14 @@ meters still use the legacy per-surface bank.
   the restore read it; `BrowserAppState::tabs_restored` gates that.
 - On alpha-capable backends the Browser root dims the whole screen with a
   55% black scrim behind the 16:9 card (`theme::BACKDROP_ALPHA`); opaque
-  backends keep the flat backdrop. The cursor is recentered in the live page
+  backends keep the flat backdrop. The scrim is the shared `ShellBackdrop`
+  timeline, painted only by the screen that currently owns it, so Home↔Browser
+  swaps hand the same dim between windows without a desktop flash. Browser now
+  uses the same `ShellAnim` entrance/exit as Home (card scale/opacity/y, CEF
+  texture + header + tabs fading). The cursor is recentered in the live page
   area every time the window opens.
-- The Home window always covers the monitor and draws the same scrim; the
-  card is centered and scales with the stage (icon tiles, no subtitles). On
+- The Home window always covers the monitor and draws the same shared scrim;
+  the card is centered and scales with the stage (icon tiles, no subtitles). On
   an opaque backend the scrim blends over the opaque clear color.
 
 ## Build prerequisites (Windows)

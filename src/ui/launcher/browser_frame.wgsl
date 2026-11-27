@@ -10,7 +10,7 @@ struct VertexOutput {
 
 struct Uniforms {
     rect: vec4<f32>,
-    _pad: vec4<f32>,
+    params: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -41,5 +41,6 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(frame_tex, frame_sampler, in.uv);
+    let color = textureSample(frame_tex, frame_sampler, in.uv);
+    return vec4<f32>(color.rgb, color.a * uniforms.params.x);
 }

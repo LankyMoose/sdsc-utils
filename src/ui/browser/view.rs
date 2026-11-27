@@ -14,10 +14,11 @@ use crate::ui::browser::state::{
     browser_url_text_budget, display_url,
 };
 use crate::ui::face::{FaceButton, RingStyle, face_glyph};
+use crate::ui::scale::Scale;
 use crate::ui::{svg_icon, text_fit, theme};
 use iced::widget::text::Wrapping;
 use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
-use iced::{Alignment, Color, Element, Fill, Font, Length, Padding};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Padding, Vector};
 
 /// Everything the standalone Browser window can ask the shell/engine to do.
 #[derive(Debug, Clone)]
@@ -232,11 +233,12 @@ fn history_hint(
     icon_first: bool,
     pressed: bool,
     enabled: bool,
+    fade: f32,
 ) -> Element<'static, BrowserMessage> {
     const CAPSULE_H: f32 = 28.0;
     const KEY_SIZE: f32 = 11.0;
     const ICON_SIZE: f32 = 14.0;
-    let alpha = if enabled { 1.0 } else { 0.4 };
+    let alpha = fade.clamp(0.0, 1.0) * if enabled { 1.0 } else { 0.4 };
     let mut parts: Vec<Element<'static, BrowserMessage>> = Vec::with_capacity(2);
     // SVG tinting replaces only RGB; the color alpha is ignored by the
     // rasterizer. Use the widget opacity (applied in the image shader) so the
@@ -296,17 +298,18 @@ fn history_hint(
 }
 
 /// Shared Triangle face glyph; lives inside the URL well, anchored right.
-fn triangle_prompt(panel: &BrowserPanel) -> Element<'_, BrowserMessage> {
+fn triangle_prompt(panel: &BrowserPanel, fade: f32) -> Element<'_, BrowserMessage> {
     let style = if panel.triangle_held {
         RingStyle::Pressed
     } else {
         RingStyle::Idle
     };
-    face_glyph(FaceButton::Triangle, style, 0.0, true, 1.0)
+    face_glyph(FaceButton::Triangle, style, 0.0, true, fade)
 }
 
 /// URL well: globe + single-line URL + right-anchored Triangle prompt.
-fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessage> {
+fn browser_url_bar(panel: &BrowserPanel, url_w: f32, fade: f32) -> Element<'_, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let editing = panel.url_editing;
     let budget = browser_url_text_budget(url_w, editing);
     let value = if editing {
@@ -319,11 +322,11 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
         text_fit::ellipsize_to_width(display_url(panel.session.url()), 14.0, budget)
     };
     let mut content = row![
-        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED, 1.0),
+        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED, fade),
         text(value)
             .size(14.0)
             .wrapping(Wrapping::None)
-            .color(theme::INK),
+            .color(theme::scale_alpha(theme::INK, fade)),
     ]
     .spacing(BROWSER_URL_GAP)
     .align_y(Alignment::Center);
@@ -332,7 +335,7 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
     } else {
         content = content
             .push(space().width(Fill))
-            .push(triangle_prompt(panel));
+            .push(triangle_prompt(panel, fade));
     }
     container(content)
         .width(Length::Fixed(url_w))
@@ -344,12 +347,17 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32) -> Element<'_, BrowserMessa
             left: BROWSER_URL_BAR_PAD,
         })
         .align_y(Alignment::Center)
-        .style(theme::browser_url_bar(editing))
+        .style(theme::browser_url_bar_fade(editing, fade))
         .into()
 }
 
 /// One-row Browser header: `‹ L1` · URL well · `R1 ›`.
-pub(crate) fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, BrowserMessage> {
+pub(crate) fn browser_header(
+    panel: &BrowserPanel,
+    page_w: f32,
+    fade: f32,
+) -> Element<'_, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let content_w = (page_w - 2.0 * BROWSER_HEADER_PAD).max(1.0);
     let layout = browser_header_layout(content_w);
     let back_enabled = panel.can_go_back();
@@ -360,6 +368,7 @@ pub(crate) fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, B
         true,
         panel.l1_held,
         back_enabled,
+        fade,
     );
     let forward = history_hint(
         "R1",
@@ -367,12 +376,13 @@ pub(crate) fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, B
         false,
         panel.r1_held,
         forward_enabled,
+        fade,
     );
     let content = row![
         container(back)
             .width(Length::Fixed(layout.side_w))
             .align_x(Alignment::End),
-        browser_url_bar(panel, layout.url_w),
+        browser_url_bar(panel, layout.url_w, fade),
         container(forward)
             .width(Length::Fixed(layout.side_w))
             .align_x(Alignment::Start),
@@ -393,8 +403,11 @@ pub(crate) fn browser_header(panel: &BrowserPanel, page_w: f32) -> Element<'_, B
     let rule = container(space())
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(BROWSER_HEADER_RULE))
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(theme::LINE)),
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::LINE,
+                fade,
+            ))),
             ..container::Style::default()
         });
     column![row, rule].width(Length::Fixed(page_w)).into()
@@ -409,6 +422,7 @@ pub fn browser_page_view(
     engine_available: bool,
     page_w: f32,
     page_h: f32,
+    fade: f32,
 ) -> Element<'_, BrowserMessage> {
     let session = &panel.session;
     if session.has_frame() {
@@ -419,7 +433,8 @@ pub fn browser_page_view(
             crate::ui::launcher::browser_frame::BrowserFrameProgram::new(
                 std::sync::Arc::clone(session.frame_slot()),
                 panel.active_tab.0,
-            ),
+            )
+            .opacity(fade),
         )
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(page_h));
@@ -455,7 +470,7 @@ pub fn browser_page_view(
     scrollable(
         text(body_text)
             .size(13.0)
-            .color(theme::INK)
+            .color(theme::scale_alpha(theme::INK, fade))
             .wrapping(Wrapping::Word)
             .width(Fill),
     )
@@ -472,10 +487,11 @@ pub fn browser_view<'a>(
     engine_available: bool,
     page_w: f32,
     page_h: f32,
+    fade: f32,
     cursor: CursorSurfaceSpec,
 ) -> Element<'a, BrowserMessage> {
     let mut page = stack![
-        browser_page_view(panel, engine_available, page_w, page_h),
+        browser_page_view(panel, engine_available, page_w, page_h, fade),
         cursor_surface(cursor, page_w, page_h),
     ]
     .width(Length::Fixed(page_w))
@@ -484,7 +500,7 @@ pub fn browser_view<'a>(
     if let Some(debug) = browser_cursor_debug_overlay(panel, page_w, page_h) {
         page = page.push(debug);
     }
-    column![browser_header(panel, page_w), page]
+    column![browser_header(panel, page_w, fade), page]
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(BROWSER_HEADER_TOTAL + page_h))
         .clip(true)
@@ -505,10 +521,13 @@ pub fn root_view(
     engine_available: bool,
     stage_w: f32,
     stage_h: f32,
-    backdrop_alpha: f32,
+    shell: crate::ui::home::ShellFrame,
     cursor: CursorSurfaceSpec,
     cursor_hidden: bool,
 ) -> Element<'_, BrowserMessage> {
+    let panel_visual = shell.panel;
+    let backdrop_alpha = shell.backdrop_alpha;
+    let fade = panel_visual.alpha.clamp(0.0, 1.0);
     let (page_w, page_h) = fullscreen_layout(stage_w, stage_h);
     let layout = crate::ui::browser::state::browser_layout(stage_w, stage_h);
     let in_grid = panel.grid.mode != crate::ui::browser::grid::GridMode::Page;
@@ -519,15 +538,19 @@ pub fn root_view(
             engine_available,
             page_w,
             page_h + BROWSER_HEADER_TOTAL,
+            fade,
         )
     } else {
-        browser_view(panel, engine_available, page_w, page_h, cursor)
+        browser_view(panel, engine_available, page_w, page_h, fade, cursor)
     };
     let card = container(page_surface)
         .padding(crate::ui::browser::state::BROWSER_CARD_PAD)
-        .style(theme::menu_panel)
+        .style(theme::menu_panel_fade(fade))
         .width(Length::Fixed(layout.card_w))
         .height(Length::Fixed(layout.card_h));
+    // Same entrance/exit language as Home: center-anchored scale + bottom
+    // travel; opacity is threaded through the card content.
+    let card = Scale::new(card, panel_visual.scale).offset(Vector::new(0.0, panel_visual.offset_y));
     let transparent = crate::ui::chrome::transparent_windows();
     let root: Element<'_, BrowserMessage> = container(card)
         .width(Fill)

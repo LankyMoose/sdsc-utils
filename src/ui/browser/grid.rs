@@ -460,7 +460,9 @@ pub fn page_view<'a>(
     engine_available: bool,
     area_w: f32,
     area_h: f32,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let tabs = grid_tabs(panel, &panel.grid.visual);
     let layout = grid_layout(area_w, area_h);
     let state = &panel.grid;
@@ -476,6 +478,7 @@ pub fn page_view<'a>(
         layout.card_w,
         layout.card_h,
         state.focus == GridFocus::Plus,
+        fade,
     ));
     for tab in page_tabs {
         let focused = state.focus == GridFocus::Tab(tab.id);
@@ -489,6 +492,7 @@ pub fn page_view<'a>(
             focused,
             show_frame,
             engine_available,
+            fade,
         ));
     }
 
@@ -510,12 +514,12 @@ pub fn page_view<'a>(
     );
 
     let bookmarks = positioned(
-        bookmark_strip(panel, state, layout.bookmarks.width),
+        bookmark_strip(panel, state, layout.bookmarks.width, fade),
         layout.bookmarks,
         area_w,
         area_h,
     );
-    let island = positioned(island(pages), layout.island, area_w, area_h);
+    let island = positioned(island(pages, fade), layout.island, area_w, area_h);
 
     let mut layers: Vec<Element<'a, BrowserMessage>> = vec![grid_layer, bookmarks, island];
     if pages > 1 {
@@ -524,6 +528,7 @@ pub fn page_view<'a>(
                 svg_icon::CHEVRON_LEFT_SVG,
                 state.page > 0,
                 BrowserMessage::GridPagePrev,
+                fade,
             ),
             layout.prev,
             area_w,
@@ -534,6 +539,7 @@ pub fn page_view<'a>(
                 svg_icon::CHEVRON_RIGHT_SVG,
                 state.page + 1 < pages,
                 BrowserMessage::GridPageNext,
+                fade,
             ),
             layout.next,
             area_w,
@@ -545,7 +551,7 @@ pub fn page_view<'a>(
         // per view rebuild, so a rect sampled here would freeze at whatever
         // progress the last message landed on (the old 1–3 frame judder).
         layers.push(flip_page(
-            transition_page(panel, engine_available, anim.tab, layout.page_rect()),
+            transition_page(panel, engine_available, anim.tab, layout.page_rect(), fade),
             anim,
             layout.page_rect(),
             Size::new(area_w, area_h),
@@ -553,10 +559,11 @@ pub fn page_view<'a>(
         // The Browser header is part of the same transition: it must not
         // vanish/appear in a single frame while the page is still moving.
         layers.push(header_curtain(
-            crate::ui::browser::view::browser_header(panel, area_w),
+            crate::ui::browser::view::browser_header(panel, area_w, fade),
             anim,
             Size::new(area_w, area_h),
             crate::ui::browser::state::BROWSER_HEADER_TOTAL,
+            fade,
         ));
     }
     let body: Element<'a, BrowserMessage> = stack(layers)
@@ -588,7 +595,8 @@ fn positioned<'a>(
         .into()
 }
 
-fn island<'a>(pages: usize) -> Element<'a, BrowserMessage> {
+fn island<'a>(pages: usize, fade: f32) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let hint =
         |glyph: Option<&'static str>, face: Option<FaceButton>, label: &'static str| ActionHint {
             face,
@@ -598,7 +606,7 @@ fn island<'a>(pages: usize) -> Element<'a, BrowserMessage> {
             armed_t: 0.0,
             pressed: false,
             press_t: 0.0,
-            alpha: 1.0,
+            alpha: fade,
         };
     let mut hints = vec![
         hint(None, Some(FaceButton::Cross), "Open"),
@@ -618,7 +626,7 @@ fn island<'a>(pages: usize) -> Element<'a, BrowserMessage> {
             bottom: 6.0,
             left: 18.0,
         })
-        .style(theme::immersive_island);
+        .style(theme::immersive_footer_pill_fade(fade));
     container(pill)
         .width(Fill)
         .height(Fill)
@@ -631,12 +639,14 @@ fn page_button<'a>(
     icon: &'static str,
     enabled: bool,
     message: BrowserMessage,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let color = if enabled { theme::ACCENT } else { theme::DIM };
     let glyph: Element<'a, BrowserMessage> = svg(svg::Handle::from_memory(icon.as_bytes()))
         .width(Length::Fixed(16.0))
         .height(Length::Fixed(16.0))
-        .opacity(if enabled { 1.0_f32 } else { 0.4_f32 })
+        .opacity(if enabled { fade } else { 0.4 * fade })
         .style(move |_theme, _status| svg::Style { color: Some(color) })
         .into();
     let button = container(glyph)
@@ -645,13 +655,19 @@ fn page_button<'a>(
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_theme| container::Style {
-            background: Some(iced::Background::Color(theme::GLASS_FILL)),
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::GLASS_FILL,
+                fade,
+            ))),
             border: iced::Border {
-                color: if enabled {
-                    theme::GLASS_HAIRLINE
-                } else {
-                    theme::alpha(theme::LINE, 0.2)
-                },
+                color: theme::scale_alpha(
+                    if enabled {
+                        theme::GLASS_HAIRLINE
+                    } else {
+                        theme::alpha(theme::LINE, 0.2)
+                    },
+                    fade,
+                ),
                 width: 1.0,
                 radius: theme::radius::PILL.into(),
             },
@@ -675,13 +691,14 @@ fn transition_page<'a>(
     engine_available: bool,
     tab: TabId,
     page: Rectangle,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
     let page_ref = panel.tab_page(tab);
     let slot = page_ref
         .map(|page| Arc::clone(page.session.frame_slot()))
         .unwrap_or_else(|| Arc::clone(panel.session.frame_slot()));
     let inner: Element<'a, BrowserMessage> = if slot.has_frame() {
-        iced::widget::shader(BrowserFrameProgram::new(slot, tab.0))
+        iced::widget::shader(BrowserFrameProgram::new(slot, tab.0).opacity(fade.clamp(0.0, 1.0)))
             .width(Length::Fixed(page.width))
             .height(Length::Fixed(page.height))
             .into()
@@ -694,15 +711,18 @@ fn transition_page<'a>(
         container(
             text(label)
                 .size(theme::type_scale::META)
-                .color(theme::MUTED)
+                .color(theme::scale_alpha(theme::MUTED, fade))
                 .wrapping(Wrapping::Word),
         )
         .width(Length::Fixed(page.width))
         .height(Length::Fixed(page.height))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(theme::BASE_BG)),
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::BASE_BG,
+                fade,
+            ))),
             ..container::Style::default()
         })
         .into()
@@ -710,7 +730,7 @@ fn transition_page<'a>(
     container(inner)
         .width(Length::Fixed(page.width))
         .height(Length::Fixed(page.height))
-        .style(theme::menu_panel)
+        .style(theme::menu_panel_fade(fade))
         .into()
 }
 
@@ -908,6 +928,7 @@ struct HeaderCurtain<'a> {
     anim: GridAnim,
     area: Size,
     header_h: f32,
+    fade: f32,
 }
 
 fn header_curtain<'a>(
@@ -915,14 +936,22 @@ fn header_curtain<'a>(
     anim: GridAnim,
     area: Size,
     header_h: f32,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
     HeaderCurtain {
         content,
         anim,
         area,
         header_h,
+        fade: fade.clamp(0.0, 1.0),
     }
     .into()
+}
+
+/// Entering the tabs view lifts the header out of its row as it fades; leaving
+/// drops it back in from above. 0 = fully hidden, 1 = resting row.
+fn header_offset(appear: f32) -> f32 {
+    (appear.clamp(0.0, 1.0) - 1.0) * HEADER_SLIDE_PX
 }
 
 impl HeaderCurtain<'_> {
@@ -1009,14 +1038,16 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
             return;
         };
         let appear = self.appear(Instant::now());
-        if appear <= 0.001 {
+        if appear <= 0.001 || self.fade <= 0.001 {
             return;
         }
         let bounds = Rectangle::new(
             layout.bounds().position(),
             Size::new(self.area.width, self.header_h),
         );
-        let offset = (1.0 - appear) * HEADER_SLIDE_PX;
+        // Negative = slide up. Entering the tabs view lifts the header out of
+        // its row as it fades; leaving drops it back in from above.
+        let offset = header_offset(appear);
         renderer.with_layer(bounds, |renderer| {
             renderer.with_translation(Vector::new(0.0, offset), |renderer| {
                 self.content.as_widget().draw(
@@ -1028,20 +1059,22 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
                     cursor,
                     viewport,
                 );
+                // The curtain travels with the header, so no uncovered strip
+                // keeps fully-opaque content visible at the end of the slide.
+                if appear < 0.999 {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds,
+                            ..renderer::Quad::default()
+                        },
+                        Background::Color(theme::alpha(
+                            theme::lighten(theme::BASE_BG, 0.04),
+                            (1.0 - appear * appear) * self.fade,
+                        )),
+                    );
+                }
             });
         });
-        if appear < 0.999 {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds,
-                    ..renderer::Quad::default()
-                },
-                Background::Color(theme::alpha(
-                    theme::lighten(theme::BASE_BG, 0.04),
-                    1.0 - appear,
-                )),
-            );
-        }
     }
 
     fn mouse_interaction(
@@ -1080,12 +1113,14 @@ fn tab_card<'a>(
     focused: bool,
     show_frame: bool,
     engine_available: bool,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let surface: Element<'a, BrowserMessage> = if show_frame
         && tab.has_frame
         && let Some(slot) = &tab.slot
     {
-        iced::widget::shader(BrowserFrameProgram::new(Arc::clone(slot), tab.id.0))
+        iced::widget::shader(BrowserFrameProgram::new(Arc::clone(slot), tab.id.0).opacity(fade))
             .width(Length::Fixed(card_w))
             .height(Length::Fixed(card_h))
             .into()
@@ -1104,15 +1139,18 @@ fn tab_card<'a>(
                 card_w - 24.0,
             ))
             .size(theme::type_scale::META)
-            .color(theme::DIM)
+            .color(theme::scale_alpha(theme::DIM, fade))
             .wrapping(Wrapping::Word),
         )
         .width(Length::Fixed(card_w))
         .height(Length::Fixed(card_h))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(theme::darken(theme::BASE_BG, 0.18))),
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::darken(theme::BASE_BG, 0.18),
+                fade,
+            ))),
             ..container::Style::default()
         })
         .into()
@@ -1131,18 +1169,24 @@ fn tab_card<'a>(
     let star: Element<'a, BrowserMessage> = svg(svg::Handle::from_memory(star.as_bytes()))
         .width(Length::Fixed(18.0))
         .height(Length::Fixed(18.0))
+        .opacity(fade)
         .style(move |_theme, _status| svg::Style {
             color: Some(star_color),
         })
         .into();
-    let star_badge = container(star).padding(3).style(|_theme| container::Style {
-        background: Some(iced::Background::Color(theme::alpha(theme::BASE_BG, 0.55))),
-        border: iced::Border {
-            radius: theme::radius::PILL.into(),
-            ..iced::Border::default()
-        },
-        ..container::Style::default()
-    });
+    let star_badge = container(star)
+        .padding(3)
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::alpha(theme::BASE_BG, 0.55),
+                fade,
+            ))),
+            border: iced::Border {
+                radius: theme::radius::PILL.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        });
     let star_layer = container(star_badge)
         .width(Length::Fixed(card_w))
         .height(Length::Fixed(card_h))
@@ -1159,7 +1203,7 @@ fn tab_card<'a>(
         .height(Length::Fixed(card_h))
         .style(move |_theme| container::Style {
             border: iced::Border {
-                color: if focused { theme::ACCENT } else { theme::LINE },
+                color: theme::scale_alpha(if focused { theme::ACCENT } else { theme::LINE }, fade),
                 width: if focused { 2.5 } else { 1.0 },
                 radius: theme::radius::MD.into(),
             },
@@ -1172,7 +1216,7 @@ fn tab_card<'a>(
             card_w - 20.0,
         ))
         .size(theme::type_scale::CAPTION)
-        .color(theme::INK)
+        .color(theme::scale_alpha(theme::INK, fade))
         .wrapping(Wrapping::None),
     )
     .width(Length::Fixed(card_w))
@@ -1184,8 +1228,11 @@ fn tab_card<'a>(
         left: 10.0,
     })
     .align_y(Alignment::Center)
-    .style(|_theme| container::Style {
-        background: Some(iced::Background::Color(theme::alpha(theme::BASE_BG, 0.82))),
+    .style(move |_theme| container::Style {
+        background: Some(iced::Background::Color(theme::scale_alpha(
+            theme::alpha(theme::BASE_BG, 0.82),
+            fade,
+        ))),
         border: iced::Border {
             radius: iced::border::Radius {
                 top_left: 0.0,
@@ -1211,18 +1258,25 @@ fn tab_card<'a>(
     let card = container(body)
         .width(Length::Fixed(card_w))
         .height(Length::Fixed(card_h))
-        .style(move |_theme| grid_card_style(focused, _theme));
+        .style(move |_theme| grid_card_style(focused, fade, _theme));
     mouse_area(card)
         .on_press(BrowserMessage::GridActivate(tab.id))
         .interaction(mouse::Interaction::Pointer)
         .into()
 }
 
-fn plus_card<'a>(card_w: f32, card_h: f32, focused: bool) -> Element<'a, BrowserMessage> {
+fn plus_card<'a>(
+    card_w: f32,
+    card_h: f32,
+    focused: bool,
+    fade: f32,
+) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let glyph: Element<'a, BrowserMessage> =
         svg(svg::Handle::from_memory(svg_icon::PLUS_SVG.as_bytes()))
             .width(Length::Fixed(34.0))
             .height(Length::Fixed(34.0))
+            .opacity(fade)
             .style(|_theme, _status| svg::Style {
                 color: Some(theme::ACCENT),
             })
@@ -1232,22 +1286,25 @@ fn plus_card<'a>(card_w: f32, card_h: f32, focused: bool) -> Element<'a, Browser
         .height(Length::Fixed(card_h))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
-        .style(move |_theme| grid_card_style(focused, _theme));
+        .style(move |_theme| grid_card_style(focused, fade, _theme));
     mouse_area(body)
         .on_press(BrowserMessage::GridOpenPlus)
         .interaction(mouse::Interaction::Pointer)
         .into()
 }
 
-fn grid_card_style(focused: bool, _theme: &iced::Theme) -> container::Style {
+fn grid_card_style(focused: bool, fade: f32, _theme: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(if focused {
-            theme::PANEL_HOVER
-        } else {
-            theme::PANEL
-        })),
+        background: Some(iced::Background::Color(theme::scale_alpha(
+            if focused {
+                theme::PANEL_HOVER
+            } else {
+                theme::PANEL
+            },
+            fade,
+        ))),
         border: iced::Border {
-            color: if focused { theme::ACCENT } else { theme::LINE },
+            color: theme::scale_alpha(if focused { theme::ACCENT } else { theme::LINE }, fade),
             width: if focused { 2.5 } else { 1.0 },
             radius: theme::radius::MD.into(),
         },
@@ -1259,7 +1316,9 @@ fn bookmark_strip<'a>(
     panel: &'a BrowserPanel,
     state: &GridState,
     width: f32,
+    fade: f32,
 ) -> Element<'a, BrowserMessage> {
+    let fade = fade.clamp(0.0, 1.0);
     let mut chips: Vec<Element<'a, BrowserMessage>> = Vec::new();
     for (index, bookmark) in panel.bookmarks.iter().enumerate() {
         let focused = state.focus == GridFocus::Bookmark(index);
@@ -1272,12 +1331,13 @@ fn bookmark_strip<'a>(
             svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
                 .width(Length::Fixed(16.0))
                 .height(Length::Fixed(16.0))
+                .opacity(fade)
                 .style(|_theme, _status| svg::Style {
                     color: Some(theme::MUTED),
                 }),
             text(name)
                 .size(theme::type_scale::CAPTION)
-                .color(theme::INK)
+                .color(theme::scale_alpha(theme::INK, fade))
                 .wrapping(Wrapping::None),
         ]
         .spacing(8)
@@ -1293,13 +1353,19 @@ fn bookmark_strip<'a>(
             })
             .align_y(Alignment::Center)
             .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(if focused {
-                    theme::PANEL_HOVER
-                } else {
-                    theme::PANEL
-                })),
+                background: Some(iced::Background::Color(theme::scale_alpha(
+                    if focused {
+                        theme::PANEL_HOVER
+                    } else {
+                        theme::PANEL
+                    },
+                    fade,
+                ))),
                 border: iced::Border {
-                    color: if focused { theme::ACCENT } else { theme::LINE },
+                    color: theme::scale_alpha(
+                        if focused { theme::ACCENT } else { theme::LINE },
+                        fade,
+                    ),
                     width: if focused { 2.5 } else { 1.0 },
                     radius: theme::radius::SM.into(),
                 },
@@ -1317,7 +1383,7 @@ fn bookmark_strip<'a>(
             container(
                 text("No bookmarks yet")
                     .size(theme::type_scale::CAPTION)
-                    .color(theme::DIM),
+                    .color(theme::scale_alpha(theme::DIM, fade)),
             )
             .height(Length::Fixed(BOOKMARK_CARD_H))
             .align_y(Alignment::Center)
@@ -1478,6 +1544,14 @@ impl<'a> From<GridTicker<'a>> for Element<'a, BrowserMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_slides_up_while_fading_out() {
+        assert_eq!(header_offset(1.0), 0.0);
+        assert!(header_offset(0.0) < 0.0, "hidden header sits above its row");
+        assert!(header_offset(0.5) < header_offset(1.0));
+        assert!((header_offset(0.0) + HEADER_SLIDE_PX).abs() < 0.01);
+    }
 
     #[test]
     fn flip_transform_maps_the_absolute_page_onto_the_card() {
