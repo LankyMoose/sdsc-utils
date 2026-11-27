@@ -169,6 +169,15 @@ pub fn set_shell_visible<Message: Send + 'static>(
                 return;
             };
             let hwnd = win32_handle.hwnd.get();
+            let style = unsafe { crate::platform::win32::GetWindowLongW(hwnd, -16) };
+            let currently_visible = style & 0x1000_0000 != 0;
+            // A mode switch re-asserts visibility so a stale raw hide cannot
+            // win, but ShowWindow on an already-visible window forces an extra
+            // DWM repaint (the one-frame backdrop flicker). No-op when the
+            // requested state is already true.
+            if currently_visible == visible {
+                return;
+            }
             if visible {
                 if quiet {
                     if offscreen {
@@ -196,6 +205,56 @@ pub fn set_shell_visible<Message: Send + 'static>(
         } else {
             window::set_mode(id, window::Mode::Hidden)
         }
+    }
+}
+
+/// Set the shared shell window's z-order band without touching winit's
+/// show/hide path (its level change unconditionally calls `ShowWindow`, which
+/// can flash a transparent frame during a mode switch).
+pub fn set_shell_level<Message: Send + 'static>(id: window::Id, topmost: bool) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        window::run(id, move |window| {
+            use window::raw_window_handle::RawWindowHandle;
+
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = win32_handle.hwnd.get();
+            let insert_after = if topmost {
+                crate::platform::win32::HWND_TOPMOST
+            } else {
+                crate::platform::win32::HWND_NOTOPMOST
+            };
+            unsafe {
+                crate::platform::win32::SetWindowPos(
+                    hwnd,
+                    insert_after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    crate::platform::win32::SWP_NOMOVE
+                        | crate::platform::win32::SWP_NOSIZE
+                        | crate::platform::win32::SWP_NOACTIVATE,
+                );
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(windows))]
+    {
+        window::set_level(
+            id,
+            if topmost {
+                window::Level::AlwaysOnTop
+            } else {
+                window::Level::Normal
+            },
+        )
     }
 }
 

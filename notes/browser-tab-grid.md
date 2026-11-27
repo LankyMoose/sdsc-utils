@@ -19,8 +19,11 @@ bookmark UI, or Browser screen/back behavior.
 
 ## Contract
 
-- **Share/Create** toggles the tabs view; **Circle** from the page returns to
-  Home, while Circle/Share in tabs view exits back to the page.
+- Home -> Browser opens the **tabs view** (not the page). **Share/Create**
+  toggles page<->tabs; **Circle** from the page returns to the tabs view, and
+  Circle from the tabs view returns Home. Create in the tabs view still exits
+  to the page; the last remaining tab is never removed (closing it resets that
+  tab to the default page and opens the page view).
 - Tabs view is headerless, fixed **4 columns � 3 rows**. Slot 0 is ALWAYS the
   plus card, followed by up to 11 tabs (frozen visual order, active first).
   A 12th tab starts page 2; pages are swapped with the side chevrons, L1/R1,
@@ -30,6 +33,9 @@ bookmark UI, or Browser screen/back behavior.
   left stick is shaped by `NavProfile::MENU` and the right stick is excluded.
   Cross opens, Square closes, Triangle bookmarks. Down from the bottom row
   enters the bookmark strip. Right stick scrolls bookmarks horizontally.
+  The bank arms immediately when the entrance FLIP lands, and a direction
+  pressed during the FLIP is buffered, so the first post-transition move is
+  never swallowed.
 - A footer hint island (Launcher glass style, full **pill** radius) shows
   Open/Close/Bookmark/Back and Page hints; each card has an overlaid bottom
   title footer with ellipsis.
@@ -64,7 +70,8 @@ bookmark UI, or Browser screen/back behavior.
   title/URL placeholder.
 - Bookmarks are `bookmarks.json` entries matched by exact URL. The top-right
   star is filled/warning when the tab's current URL is bookmarked, outline
-  otherwise. Triangle on a focused bookmark removes it.
+  otherwise. Triangle on a focused bookmark removes it. Opening a bookmark
+  creates a new active tab for its URL (it never replaces the current page).
 - Reduced motion snaps between page and grid; the normal path uses the
   `GridTicker` wrapper to request display-rate redraws without a global timer.
 

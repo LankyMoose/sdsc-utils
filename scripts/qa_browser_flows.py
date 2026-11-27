@@ -365,19 +365,20 @@ def build_plan(session: Path) -> tuple[list[dict[str, object]], list[dict[str, o
         False,
     )
 
-    # Circle suspends and closes the Browser.
-    steps.append(
-        {
-            "app": "browser",
-            "action": "pad.tap",
-            "params": {"button": "circle"},
-            "requires": [
-                req("ui.url", manual_url),
-                req("ui.title", "Manual destination"),
-                req("ui.url_editing", False),
-            ],
-        }
-    )
+    # Circle: page -> tabs view, then tabs view -> Home.
+    for _ in range(2):
+        steps.append(
+            {
+                "app": "browser",
+                "action": "pad.tap",
+                "params": {"button": "circle"},
+                "requires": [
+                    req("ui.url", manual_url),
+                    req("ui.title", "Manual destination"),
+                    req("ui.url_editing", False),
+                ],
+            }
+        )
     return steps, shots, paths
 
 
@@ -497,10 +498,13 @@ def main() -> int:
             )
         return 1
     if not any(
-        event.get("event") == "browser.close" and event.get("source") == "circle"
+        event.get("event") == "browser.grid.open" and event.get("source") == "circle"
         for event in events
     ):
-        print("error: Circle did not emit browser.close(source=circle)", file=sys.stderr)
+        print("error: Circle did not open the tabs view from the page", file=sys.stderr)
+        return 1
+    if not any(event.get("event") == "screen.home" for event in events):
+        print("error: Circle in tabs view did not return Home", file=sys.stderr)
         return 1
 
     app_log = sandbox / "app.log"

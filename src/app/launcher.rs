@@ -589,17 +589,17 @@ impl App {
             return self.invalidate_browser_window();
         }
         if closed_active {
-            // Last tab: keep it. Closing the only surface would leave the
-            // Browser with nothing to show, and silently navigating it away is
-            // worse than a no-op.
+            // Last tab: keep the card and reset it to the default page, then
+            // leave the tabs view on that page. (Zero tabs is not allowed.)
             crate::platform::trace::event(
                 crate::platform::trace::Lane::Browser,
                 "browser.tab.close",
             )
             .field("tab", id.0)
-            .field("next", "last_tab_noop")
+            .field("next", "last_tab_default")
             .emit();
-            return Task::none();
+            let default = self.on_browser_go_default();
+            return default.chain(self.close_browser_grid_with(None, false));
         }
         if panel.remove_stored_tab(id) {
             if let Some(engine) = &self.browser.engine {

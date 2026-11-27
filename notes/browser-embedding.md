@@ -118,10 +118,11 @@ capability/API lookup, start with [cef-api.md](cef-api.md).
 PS is a screen hide/resume toggle: while Browser owns the pad a PS press
 dismisses the shared shell window to the desktop (engine suspended, cached page
 and grid state preserved) and the next PS shows the same warm HWND again.
-Circle from the page (no active URL edit) suspends the Browser and switches the
-same shell window to the Home screen; Home is a peer full-screen mode, never an
-overlay on a running managed app. Circle cancels an active URL edit instead of
-leaving; Escape cancels the edit but never leaves.
+Circle from the page (no active URL edit) opens the tabs view; Circle again
+from the tabs view suspends the Browser and switches the same shell window to
+Home. Home is a peer full-screen mode, never an overlay on a running managed
+app. Circle cancels an active URL edit instead of leaving; Escape cancels the
+edit but never leaves.
 
 Input priority is **Home → Browser → Launcher**. The Browser window has its own
 pad bank (`BrowserAppState::nav`) and D-pad stepper; Launcher's bank no longer
@@ -157,17 +158,18 @@ meters still use the legacy per-surface bank.
 - Cross clicks the docked page target (exact-element click, else point click).
   Cross on a page text field also requests the system OSK. L1/R1/Options are
   semantic back/forward/reload actions from the OS binding table (tap only);
-  L3 toggles magnet; R3 dumps an issue bundle. Circle suspends/closes the
-  Browser when no URL edit owns the pad (if editing, it cancels the edit
-  first); Escape cancels the edit only. PS dismisses to desktop; Circle goes
-  to Home.
+  L3 toggles magnet; R3 dumps an issue bundle. Circle from the page opens the
+  tabs view (if editing, it cancels the edit first); Escape cancels the edit
+  only. PS dismisses to desktop; Circle again from the tabs view returns Home.
 - **Share/Create toggles the tabs view.** It has no Browser header. D-pad and
   the left stick move card focus through the shared per-pad `NavBank` (MENU
   deadzone/repeat/neutral grace/arming); Cross expands the focused
-  card (or the plus card/new tab/bookmark), Square closes the focused tab,
+  card (or the plus card/new tab/bookmark), Square closes the focused tab
+  (the last tab resets to the default page instead of leaving zero tabs),
   Triangle toggles its bookmark, Down from the last card row enters the
-  bookmark strip, and Share/Circle leaves back to the active page. L1/R1 swap
-  pages (chevron buttons do the same); right stick scrolls the bookmark strip.
+  bookmark strip, Share/Create leaves back to the active page, and Circle
+  returns Home. L1/R1 swap pages (chevron buttons do the same); right stick
+  scrolls the bookmark strip.
   Mouse click/wheel work. L1/R1/Options page-history actions are disabled while
   tabs view owns the surface. Slot 0 is always the plus card; 11 tabs per page;
   card and plus aspect matches the live page aspect. The FLIP overlay reuses

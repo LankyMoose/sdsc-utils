@@ -192,6 +192,11 @@ pub struct BrowserAppState {
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
     pub tabs_restored: bool,
+    /// Home tile open should land on the tabs view, not the current page.
+    pub start_in_grid: bool,
+    /// Direction pressed during the tabs-view entrance FLIP; applied once the
+    /// grid is armed so the first navigation is not swallowed.
+    pub pending_grid_move: Option<(crate::browser::cursor::JumpDir, PadId)>,
 }
 
 use iced::Task;
@@ -236,6 +241,52 @@ fn grid_nav_readings(
             reading
         })
         .collect()
+}
+
+/// Dominant direction in a pad snapshot, shaped by the same MENU profile as
+/// tabs focus. Used to buffer an input that arrives while the entrance FLIP is
+/// still running.
+fn grid_direction(
+    readings: &[crate::ui::launcher::input::NavReading],
+) -> Option<(crate::browser::cursor::JumpDir, PadId)> {
+    use crate::browser::cursor::JumpDir;
+    let shaped = grid_nav_readings(readings);
+    for reading in &shaped {
+        if crate::domain::pad::sample_nav_resting(&reading.sample) {
+            continue;
+        }
+        let s = &reading.sample;
+        let x = if s.dpad_left {
+            -1.0
+        } else if s.dpad_right {
+            1.0
+        } else {
+            s.stick_x
+        };
+        let y = if s.dpad_up {
+            -1.0
+        } else if s.dpad_down {
+            1.0
+        } else {
+            s.stick_y
+        };
+        if x == 0.0 && y == 0.0 {
+            continue;
+        }
+        let dir = if x.abs() > y.abs() {
+            if x < 0.0 {
+                JumpDir::Left
+            } else {
+                JumpDir::Right
+            }
+        } else if y < 0.0 {
+            JumpDir::Up
+        } else {
+            JumpDir::Down
+        };
+        return Some((dir, reading.id.clone()));
+    }
+    None
 }
 
 const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -469,6 +520,13 @@ impl super::App {
             | "grid.bookmark" | "grid.focus" | "grid.page_prev" | "grid.page_next" => {
                 wait.needs_redraw = true;
                 wait.needs_grid_idle = true;
+            }
+            "pad.tap" if button == "circle" && self.browser_visible => {
+                // Page -> tabs, or tabs -> Home. Wait for the grid FLIP and
+                // the shell mode switch respectively.
+                wait.needs_redraw = true;
+                wait.needs_grid_idle = true;
+                wait.needs_shell_idle = true;
             }
             "screen.ps" | "screen.home" => {
                 // Resume opens the Browser asynchronously; dismiss has no
@@ -1748,7 +1806,8 @@ impl super::App {
                 panel.grid.source_override = None;
             }
             self.browser.dpad_stepper.reset();
-            self.browser.grid_nav.prepare_on_open(false);
+            self.browser.grid_nav.prepare_on_open(true);
+            self.browser.pending_grid_move = None;
             self.note_launcher_activity();
             self.play_ui_cue(UiSoundKind::Action);
             crate::platform::trace::event(
@@ -1775,6 +1834,7 @@ impl super::App {
         panel.grid.bookmark_scroll_x = 0.0;
         panel.grid.pending_tab = None;
         panel.grid.source_override = None;
+        self.browser.pending_grid_move = None;
         panel.grid.anim = Some(crate::ui::browser::grid::GridAnim {
             generation,
             started: Instant::now(),
@@ -1811,7 +1871,7 @@ impl super::App {
     /// Close the tabs view. `cue` is false when the initiating action already
     /// played one (the plus card opens a tab, which cues itself), so a single
     /// press never emits two navigation sounds/haptics.
-    fn close_browser_grid_with(
+    pub(crate) fn close_browser_grid_with(
         &mut self,
         select: Option<crate::browser::engine::TabId>,
         cue: bool,
@@ -1926,13 +1986,23 @@ impl super::App {
             crate::ui::browser::grid::GridMode::Entering => {
                 self.browser.panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
                 self.browser.panel.sync_grid_visual();
+                // Arm immediately: the grid is visible now, and waiting for a
+                // neutral sample swallowed the first D-pad/stick move.
+                self.browser.grid_nav.prepare_on_open(true);
                 crate::controller::hid::diag::diag_info("ui-diag: browser grid entered");
+                if let Some((dir, pad)) = self.browser.pending_grid_move.take() {
+                    self.set_haptic_pad_from_id(Some(&pad));
+                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.haptic_pad_serial = None;
+                    return self.browser_grid_move_focus(dir);
+                }
                 self.invalidate_browser_window()
             }
             crate::ui::browser::grid::GridMode::Leaving => {
                 self.browser.panel.grid.mode = crate::ui::browser::grid::GridMode::Page;
                 self.browser.dpad_stepper.reset();
                 self.browser.grid_nav.reset();
+                self.browser.pending_grid_move = None;
                 if let Some(id) = pending {
                     crate::controller::hid::diag::diag_info("ui-diag: browser grid select->page");
                     self.activate_browser_tab(id)
@@ -1954,6 +2024,7 @@ impl super::App {
         panel.grid.source_override = None;
         self.browser.dpad_stepper.reset();
         self.browser.grid_nav.reset();
+        self.browser.pending_grid_move = None;
         match panel.grid.mode {
             crate::ui::browser::grid::GridMode::Entering => {
                 panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
@@ -2071,9 +2142,13 @@ impl super::App {
         let Some(bookmark) = self.browser.panel.bookmarks.get(index).cloned() else {
             return Task::none();
         };
-        let navigate = self.navigate_browser_to(bookmark.url);
-        // Navigation already played the cue; the FLIP close stays silent.
-        navigate.chain(self.close_browser_grid_with(None, false))
+        if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
+            return Task::none();
+        }
+        // Bookmarks open in a new tab (active), then the FLIP lands on its page.
+        let open = self.open_browser_tab(Some(bookmark.url));
+        let id = self.browser.panel.active_tab;
+        open.chain(self.close_browser_grid_with(Some(id), false))
     }
 
     pub(crate) fn browser_grid_page(&mut self, delta: i32) -> Task<Message> {
@@ -2651,11 +2726,12 @@ impl super::App {
         // Center before the first frame, not after the window has painted the
         // previous open's cursor position.
         self.browser.panel.cursor.reset_for_page();
+        let start_in_grid = std::mem::take(&mut self.browser.start_in_grid);
         let was_open = self.browser.panel.session.is_open();
         self.arm_chord_release_latch();
         crate::controller::hid::diag::diag_info("ui-diag: browser window open");
         let activation = self.activate_shell_mode(crate::app::home::ShellScreen::Browser, cover);
-        if was_open {
+        let session = if was_open {
             // Reopen after close: cached page, suspended engine.
             self.browser.panel.session.open_surface();
             self.resume_browser_engine();
@@ -2663,7 +2739,34 @@ impl super::App {
         } else {
             // Fresh surface: restore the saved page or open the default page.
             activation.chain(self.open_browser_session())
+        };
+        if start_in_grid {
+            self.prepare_browser_grid_on_open();
         }
+        session
+    }
+
+    /// Home tile opens the Browser directly on its tabs view. The page is
+    /// still live behind it; selecting a card runs the normal FLIP into page
+    /// mode.
+    fn prepare_browser_grid_on_open(&mut self) {
+        let panel = &mut self.browser.panel;
+        panel.cancel_url_edit();
+        panel.grid.mode = crate::ui::browser::grid::GridMode::Grid;
+        panel.grid.anim = None;
+        panel.grid.pending_tab = None;
+        panel.grid.source_override = None;
+        panel.grid.page = 0;
+        panel.grid.bookmark_scroll_x = 0.0;
+        panel.refresh_grid_visual();
+        panel.grid.focus = if panel.order.is_empty() {
+            crate::ui::browser::grid::GridFocus::Plus
+        } else {
+            crate::ui::browser::grid::GridFocus::Tab(panel.active_tab)
+        };
+        self.browser.grid_nav.prepare_on_open(true);
+        self.browser.pending_grid_move = None;
+        self.browser.dpad_stepper.reset();
     }
 
     /// True while the Browser card is animating out.
@@ -2908,6 +3011,11 @@ impl super::App {
     ) -> Task<Message> {
         use crate::browser::cursor::JumpDir;
         if self.browser.panel.grid.animating() {
+            if self.browser.panel.grid.mode == crate::ui::browser::grid::GridMode::Entering
+                && let Some(mv) = grid_direction(readings)
+            {
+                self.browser.pending_grid_move = Some(mv);
+            }
             return Task::none();
         }
         let previous_haptic = self.haptic_pad_serial.take();
@@ -2948,7 +3056,8 @@ impl super::App {
         if let Some(action) = button {
             self.set_haptic_pad_from_id(Some(&action.pad));
             let action = match action.button {
-                PadButton::Create | PadButton::Circle => self.close_browser_grid(None),
+                PadButton::Create => self.close_browser_grid(None),
+                PadButton::Circle => self.return_to_home_screen(),
                 PadButton::Cross => self.browser_grid_activate_focus(),
                 PadButton::Square => self.browser_grid_close_focused_tab(),
                 PadButton::Triangle => self.browser_grid_toggle_focused_bookmark(),
@@ -3015,10 +3124,11 @@ impl super::App {
         if self.browser.panel.url_editing {
             return self.cancel_browser_url_edit();
         }
-        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.close")
+        // Page -> tabs. Tabs -> Home is handled by the grid pad path.
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.grid.open")
             .field("source", "circle")
             .emit();
-        self.return_to_home_screen()
+        self.open_browser_grid()
     }
 
     /// Open the URL editor (Triangle). If already editing, commit instead.

@@ -235,12 +235,7 @@ impl App {
         let Some(id) = self.shell_window else {
             return Task::none();
         };
-        let level = if mode == ShellScreen::Home {
-            window::Level::AlwaysOnTop
-        } else {
-            window::Level::Normal
-        };
-        window::set_level(id, level)
+        layout::set_shell_level(id, mode == ShellScreen::Home)
     }
 
     pub(crate) fn start_shell_enter(&mut self, mode: ShellScreen) -> Task<Message> {

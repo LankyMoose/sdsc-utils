@@ -1003,6 +1003,7 @@ impl App {
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Browser");
                 self.shell_opening = true;
+                self.browser.start_in_grid = true;
                 Task::batch([self.close_home(), self.open_browser_window()])
             }
         }

@@ -3145,9 +3145,9 @@ impl App {
         let liveness_due = !self.session.controllers.is_empty()
             && self.last_battery_poll.elapsed() >= LIVENESS_INTERVAL;
         // HID can list a pad that we cannot open/read yet (sleeping BT, exclusive access).
-        // While the tray is empty, retry on the fast presence cadence so 0→1 open is snappy.
-        let unread_retry = !self.last_discovered.is_empty()
-            && self.session.controllers.is_empty()
+        // While the tray is empty, retry on the fast presence cadence so 0→1 open is
+        // snappy even when the OS watcher missed the device (present before launch).
+        let unread_retry = self.session.controllers.is_empty()
             && self.last_battery_poll.elapsed()
                 >= if self.session.prefs.home_enabled {
                     PRESENCE_INTERVAL_EMPTY
