@@ -151,6 +151,10 @@ impl ShellAnim {
         }
     }
 
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
     pub fn frame(&self, now: Instant, reduced: bool) -> ShellFrame {
         let elapsed = now.saturating_duration_since(self.started);
         match self.dir {
@@ -254,6 +258,8 @@ pub enum HomeMessage {
     AppsMenuClose,
     Confirm,
     Close,
+    /// Click outside the active card: same as PS (dismiss to desktop).
+    Backdrop,
 }
 
 impl HomeMessage {
@@ -272,6 +278,7 @@ impl HomeMessage {
             Self::AppsMenuClose => "home.menu.close",
             Self::Confirm => "home.confirm",
             Self::Close => "home.close",
+            Self::Backdrop => "home.backdrop",
         }
     }
 }
@@ -1538,8 +1545,8 @@ pub fn view<'a>(
 ) -> Element<'a, HomeMessage> {
     let fade = panel.alpha.clamp(0.0, 1.0);
     // Controller-first: the only mouse binding is a backdrop click, which
-    // mirrors Circle. Card layers are shielded so only clicks outside the
-    // active panel reach this backdrop.
+    // mirrors PS (dismiss the shell). Card layers are shielded so only clicks
+    // outside the active panel reach this backdrop.
     let mut layers: Vec<Element<'a, HomeMessage>> = vec![
         mouse_area(
             container(space())
@@ -1547,7 +1554,7 @@ pub fn view<'a>(
                 .height(Fill)
                 .style(theme::scrim(backdrop_alpha)),
         )
-        .on_press(HomeMessage::Close)
+        .on_press(HomeMessage::Backdrop)
         .interaction(iced::mouse::Interaction::Pointer)
         .into(),
     ];
@@ -1594,8 +1601,8 @@ pub fn view<'a>(
 
     let modal_open = state.apps_info.is_some() || state.apps_menu.is_some();
     // While a modal card owns the screen, leave Home card unshielded so a
-    // click anywhere outside the modal falls through to the backdrop (Circle
-    // closes the modal, not Home).
+    // click anywhere outside the modal falls through to the backdrop (same
+    // as PS).
     let card: Element<'a, HomeMessage> = if modal_open {
         card
     } else {
@@ -2089,77 +2096,184 @@ pub fn info_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("home-info-changelog")
 }
 
-fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, HomeMessage> {
-    let card_w = (stage_w - 32.0).clamp(340.0, HOME_WIDTH);
-    let mut rows = column![].spacing(6).width(Fill);
-    for (i, label) in SETTINGS_ROWS.iter().enumerate() {
+const SETTINGS_CARD_PAD: f32 = 16.0;
+const SETTINGS_ITEM_GAP: f32 = 6.0;
+
+/// One stacked settings entry. Dropdown panels are NOT layout items: they
+/// float over the card so opening one never moves a row or grows the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsLayoutItem {
+    Section(&'static str),
+    Gap,
+    Row(usize),
+}
+
+fn settings_layout(state: &State) -> Vec<SettingsLayoutItem> {
+    let mut items = Vec::new();
+    for i in 0..SETTINGS_ROWS.len() {
         if !state.settings_visible(i) {
             continue;
         }
         match i {
-            SETTINGS_AUTO_OPEN => {
-                rows = rows.push(settings_section("Home", fade));
-            }
-            SETTINGS_SOUNDS => {
-                rows = rows.push(settings_section("Feedback", fade));
-            }
+            SETTINGS_AUTO_OPEN => items.push(SettingsLayoutItem::Section("Home")),
+            SETTINGS_SOUNDS => items.push(SettingsLayoutItem::Section("Feedback")),
             SETTINGS_DOWNLOAD => {
-                rows = rows.push(space().height(Length::Fixed(16.0)));
-                rows = rows.push(settings_section("App installs", fade));
+                items.push(SettingsLayoutItem::Gap);
+                items.push(SettingsLayoutItem::Section("App installs"));
             }
             _ => {}
         }
-        let focused = i == state.settings_focus;
-        let row = match i {
-            SETTINGS_AUTO_OPEN => {
-                settings_selector_row(label, None, &state.settings_value(i), focused, fade)
-            }
-            SETTINGS_SOUNDS => {
-                settings_toggle_row("UI sounds", None, state.sound_enabled, focused, fade)
-            }
-            SETTINGS_VOLUME => settings_slider_row(
-                &format!("Volume {}%", state.sound_volume),
-                None,
-                state.sound_volume,
-                focused,
-                fade,
-            ),
-            SETTINGS_HAPTICS => settings_toggle_row(
-                "Controller haptics",
-                None,
-                state.haptics_enabled,
-                focused,
-                fade,
-            ),
-            SETTINGS_STRENGTH => settings_slider_row(
-                &format!("Strength {}%", state.haptics_strength),
-                None,
-                state.haptics_strength,
-                focused,
-                fade,
-            ),
-            SETTINGS_DOWNLOAD => settings_selector_row(
-                label,
-                Some("Applies to apps installed outside the Store"),
-                &state.settings_value(i),
-                focused,
-                fade,
-            ),
-            _ => continue,
-        };
-        rows = rows.push(row);
-        if state
-            .settings_menu
-            .is_some_and(|(open_row, _)| open_row == i)
-        {
-            rows = rows.push(settings_menu_panel(state, i, fade));
-        }
+        items.push(SettingsLayoutItem::Row(i));
     }
-    container(rows)
-        .padding(16)
+    items
+}
+
+/// Estimated heights for overlay geometry (iced text uses a 1.25 line box).
+fn settings_item_h(item: SettingsLayoutItem) -> f32 {
+    match item {
+        SettingsLayoutItem::Section(_) => 15.0 * 1.25 + 6.0 + 1.0,
+        SettingsLayoutItem::Gap => 16.0,
+        SettingsLayoutItem::Row(row) => settings_row_h(row),
+    }
+}
+
+fn settings_row_h(row: usize) -> f32 {
+    match row {
+        SETTINGS_AUTO_OPEN => 40.0,
+        SETTINGS_SOUNDS | SETTINGS_HAPTICS => 42.0,
+        SETTINGS_VOLUME | SETTINGS_STRENGTH => 57.5,
+        SETTINGS_DOWNLOAD => 59.5,
+        _ => 42.0,
+    }
+}
+
+fn settings_menu_option_h() -> f32 {
+    16.0 + 14.0 * 1.25
+}
+
+fn settings_menu_panel_h(options: usize) -> f32 {
+    if options == 0 {
+        return 0.0;
+    }
+    let count = options as f32;
+    12.0 + count * settings_menu_option_h() + (count - 1.0) * 4.0
+}
+
+/// Outer-card rects `(top, height)` for every row, plus the card height.
+fn settings_row_geometry(state: &State) -> ([Option<(f32, f32)>; SETTINGS_ROWS.len()], f32) {
+    let mut tops = [None; SETTINGS_ROWS.len()];
+    let mut y = SETTINGS_CARD_PAD;
+    for (index, item) in settings_layout(state).iter().enumerate() {
+        if index > 0 {
+            y += SETTINGS_ITEM_GAP;
+        }
+        let height = settings_item_h(*item);
+        if let SettingsLayoutItem::Row(row) = item {
+            tops[*row] = Some((y, height));
+        }
+        y += height;
+    }
+    (tops, y + SETTINGS_CARD_PAD)
+}
+
+/// Float the dropdown below its row, flipping above near the card bottom.
+fn settings_menu_overlay_y(state: &State, row: usize, card_h: f32) -> f32 {
+    let (tops, _) = settings_row_geometry(state);
+    let Some((top, height)) = tops.get(row).copied().flatten() else {
+        return SETTINGS_CARD_PAD;
+    };
+    let panel_h = settings_menu_panel_h(State::settings_option_count(row));
+    let max_bottom = (card_h - SETTINGS_CARD_PAD).max(SETTINGS_CARD_PAD + panel_h);
+    let below = top + height;
+    let fits_below = below + panel_h <= max_bottom;
+    let fits_above = top - panel_h >= SETTINGS_CARD_PAD;
+    let y = if fits_below || !fits_above {
+        below
+    } else {
+        top - panel_h
+    };
+    y.clamp(
+        SETTINGS_CARD_PAD,
+        (max_bottom - panel_h).max(SETTINGS_CARD_PAD),
+    )
+}
+
+fn settings_view<'a>(state: &'a State, stage_w: f32, fade: f32) -> Element<'a, HomeMessage> {
+    let card_w = (stage_w - 32.0).clamp(340.0, HOME_WIDTH);
+    let mut rows = column![].spacing(SETTINGS_ITEM_GAP).width(Fill);
+    for item in settings_layout(state) {
+        let element: Element<'a, HomeMessage> = match item {
+            SettingsLayoutItem::Section(title) => settings_section(title, fade),
+            SettingsLayoutItem::Gap => space().height(Length::Fixed(16.0)).into(),
+            SettingsLayoutItem::Row(i) => {
+                let focused = i == state.settings_focus;
+                match i {
+                    SETTINGS_AUTO_OPEN => settings_selector_row(
+                        SETTINGS_ROWS[i],
+                        None,
+                        &state.settings_value(i),
+                        focused,
+                        fade,
+                    ),
+                    SETTINGS_SOUNDS => {
+                        settings_toggle_row("UI sounds", None, state.sound_enabled, focused, fade)
+                    }
+                    SETTINGS_VOLUME => settings_slider_row(
+                        &format!("Volume {}%", state.sound_volume),
+                        None,
+                        state.sound_volume,
+                        focused,
+                        fade,
+                    ),
+                    SETTINGS_HAPTICS => settings_toggle_row(
+                        "Controller haptics",
+                        None,
+                        state.haptics_enabled,
+                        focused,
+                        fade,
+                    ),
+                    SETTINGS_STRENGTH => settings_slider_row(
+                        &format!("Strength {}%", state.haptics_strength),
+                        None,
+                        state.haptics_strength,
+                        focused,
+                        fade,
+                    ),
+                    SETTINGS_DOWNLOAD => settings_selector_row(
+                        SETTINGS_ROWS[i],
+                        Some("Applies to apps installed outside the Store"),
+                        &state.settings_value(i),
+                        focused,
+                        fade,
+                    ),
+                    _ => continue,
+                }
+            }
+        };
+        rows = rows.push(element);
+    }
+    let card = container(rows)
+        .padding(SETTINGS_CARD_PAD)
         .width(Length::Fixed(card_w))
-        .style(move |theme| card_style(fade, theme))
-        .into()
+        .style(move |theme| card_style(fade, theme));
+    let Some((open_row, _)) = state.settings_menu else {
+        return card.into();
+    };
+    if !state.settings_visible(open_row) {
+        return card.into();
+    }
+    let (_, card_h) = settings_row_geometry(state);
+    let overlay_y = settings_menu_overlay_y(state, open_row, card_h);
+    let overlay = container(
+        column![
+            space().height(Length::Fixed(overlay_y)),
+            settings_menu_panel(state, open_row, fade),
+        ]
+        .width(Fill),
+    )
+    .padding([0.0, SETTINGS_CARD_PAD])
+    .width(Length::Fixed(card_w));
+    stack![card, overlay].width(Length::Fixed(card_w)).into()
 }
 
 /// Expanded dropdown panel for a selector row: same ✓/○ option language as
@@ -3185,6 +3299,46 @@ mod tests {
             state.settings_menu_choice(),
             Some(HomeSettingChoice::DownloadLimit(0))
         );
+    }
+
+    #[test]
+    fn settings_dropdown_overlay_never_reflows_rows() {
+        let mut state = State::default();
+        state.set_settings(true, 70, true, 40, 2 * 1024, HomeAutoOpen::Bluetooth);
+        let (closed, card_h) = settings_row_geometry(&state);
+        assert!(state.open_settings_menu(SETTINGS_AUTO_OPEN));
+        let (open, open_card_h) = settings_row_geometry(&state);
+        assert_eq!(closed, open, "opening a menu must not move any row");
+        assert_eq!(card_h, open_card_h, "opening a menu must not grow the card");
+    }
+
+    #[test]
+    fn settings_dropdown_flips_above_at_the_card_bottom() {
+        let mut state = State::default();
+        state.set_settings(true, 70, true, 40, 2 * 1024, HomeAutoOpen::Bluetooth);
+        let (tops, card_h) = settings_row_geometry(&state);
+
+        state.settings_menu = Some((SETTINGS_AUTO_OPEN, 0));
+        let auto_y = settings_menu_overlay_y(&state, SETTINGS_AUTO_OPEN, card_h);
+        let auto = tops[SETTINGS_AUTO_OPEN].unwrap();
+        assert!(
+            auto_y >= auto.0 + auto.1,
+            "top selector hangs below its row"
+        );
+
+        state.settings_menu = Some((SETTINGS_DOWNLOAD, 0));
+        let download_y = settings_menu_overlay_y(&state, SETTINGS_DOWNLOAD, card_h);
+        let download = tops[SETTINGS_DOWNLOAD].unwrap();
+        assert!(
+            download_y + settings_menu_panel_h(4) <= download.0,
+            "bottom selector flips above its row"
+        );
+
+        for (row, count) in [(SETTINGS_AUTO_OPEN, 3), (SETTINGS_DOWNLOAD, 4)] {
+            let y = settings_menu_overlay_y(&state, row, card_h);
+            assert!(y >= SETTINGS_CARD_PAD);
+            assert!(y + settings_menu_panel_h(count) <= card_h - SETTINGS_CARD_PAD + 0.01);
+        }
     }
 
     #[test]

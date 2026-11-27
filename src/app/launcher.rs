@@ -103,6 +103,7 @@ impl App {
             LauncherMessage::MoveDown => self.on_launcher_move(1),
             LauncherMessage::Confirm => self.on_launcher_confirm(),
             LauncherMessage::Close => self.on_launcher_close(),
+            LauncherMessage::Backdrop => self.screen_toggle("backdrop"),
             LauncherMessage::Noop => Task::none(),
             LauncherMessage::DismissEditConfirm => {
                 self.apply_action_outcome(ActionOutcome::Accepted {
@@ -386,9 +387,7 @@ impl App {
                 self.cancel_launcher_edit()
             }
         } else if self.launcher_visible {
-            self.apply_action_outcome(ActionOutcome::Accepted {
-                cue: NavCue::Action,
-            });
+            // `return_to_home_screen` owns the one commit cue for the swap.
             self.return_to_home_screen()
         } else {
             Task::none()
@@ -564,7 +563,7 @@ impl App {
                 .apply_failed(generation, "Browser engine not installed".to_string());
         }
         self.note_launcher_activity();
-        self.apply_nav_cue(NavCue::Nav);
+        self.apply_nav_cue(NavCue::Action);
         self.resume_browser_engine();
         self.save_page();
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.open")
@@ -4542,8 +4541,10 @@ impl App {
     }
 
     /// Clear Launcher-owned state without touching the shared shell window.
-    fn retire_launcher(&mut self) -> Task<Message> {
-        crate::controller::hid::diag::diag_info("ui-diag: launcher close");
+    /// `stop_haptics` is false on a Launcher -> Home swap so the close cue's
+    /// pulse finishes instead of being cancelled by `rumble_stop_all`.
+    fn retire_launcher(&mut self, stop_haptics: bool) -> Task<Message> {
+        crate::controller::hid::diag::diag_info("ui-diag: launcher retired");
         self.launcher_visible = false;
         self.launcher_window = None;
         let rehost_toast = self.rehost_toast_after_composite();
@@ -4560,8 +4561,10 @@ impl App {
         self.launcher_state.art_awaiting_paint = false;
         self.launcher_monitor_cover = None;
         self.reset_shell_activity();
-        self.haptic_pad_serial = None;
-        self.hid_worker.rumble_stop_all();
+        if stop_haptics {
+            self.haptic_pad_serial = None;
+            self.hid_worker.rumble_stop_all();
+        }
         self.pad_nav.reset();
         self.keyboard_cross_hold.reset();
         self.confirm_key_held = false;
@@ -4572,19 +4575,74 @@ impl App {
         rehost_toast
     }
 
-    pub(crate) fn close_launcher(&mut self) -> Task<Message> {
+    /// True while the Launcher card is animating out.
+    pub(crate) fn launcher_closing(&self) -> bool {
+        self.launcher_shell_anim
+            .is_some_and(|anim| anim.dir == crate::ui::home::ShellDir::Exit)
+    }
+
+    /// Begin the Launcher exit tween. The warm shell stays alive; the finish
+    /// callback switches to a waiting screen or hides it for the desktop.
+    fn begin_launcher_exit(&mut self) -> Task<Message> {
+        if self.launcher_closing() {
+            return Task::none();
+        }
+        crate::controller::hid::diag::diag_info("ui-diag: launcher close");
+        self.launcher_visible = false;
         let last_shell = !self.home_visible && !self.browser_visible && !self.shell_opening;
         if self.shell_cursor_hidden && last_shell {
             self.set_shell_cursor_hidden(false);
         }
-        let retire = self.retire_launcher();
-        retire.chain(self.hide_shell_window())
+        let now = Instant::now();
+        if !self.shell_opening && self.pending_shell_mode.is_none() {
+            self.begin_shell_backdrop_exit(now);
+        } else {
+            self.shell_backdrop.hold_full();
+        }
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        let from = self
+            .launcher_shell_anim
+            .map(|anim| anim.frame(now, reduced))
+            .unwrap_or_else(crate::ui::home::ShellFrame::full);
+        self.launcher_shell_anim = Some(crate::ui::home::ShellAnim::exit(now, from));
+        #[cfg(debug_assertions)]
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: launcher exit haptics={}",
+            Self::ui_haptic_count()
+        ));
+        match self.launcher_window {
+            Some(id) => crate::ui::layout::invalidate_window(id),
+            None => Task::none(),
+        }
     }
 
-    /// Launcher -> Home mode switch: retire Launcher state but keep the shell
-    /// visible for Home's entrance.
+    /// Complete the Launcher exit: retire state, then switch or hide.
+    pub(crate) fn finish_launcher_close(&mut self) -> Task<Message> {
+        self.launcher_shell_anim = None;
+        if self.ps_resume_pending {
+            self.pending_shell_mode = None;
+            return self.retire_launcher(true).chain(self.hide_shell_window());
+        }
+        if let Some(mode) = self.take_pending_shell_mode() {
+            return self
+                .retire_launcher(false)
+                .chain(self.switch_shell_mode(mode));
+        }
+        if self.home_visible || self.browser_visible {
+            return self.retire_launcher(false);
+        }
+        self.retire_launcher(true).chain(self.hide_shell_window())
+    }
+
+    pub(crate) fn close_launcher(&mut self) -> Task<Message> {
+        self.begin_launcher_exit()
+    }
+
+    /// Launcher -> Home mode switch: start the exit tween now; Home's entrance
+    /// is deferred until it completes.
     pub(crate) fn retire_launcher_for_home(&mut self) -> Task<Message> {
-        self.retire_launcher()
+        self.begin_launcher_exit()
     }
 
     pub(crate) fn clear_start_nav_diag(&mut self) {
@@ -4793,7 +4851,7 @@ impl App {
 
 /// Cold-ambient gate: only Close is live, everything else is dropped.
 pub(crate) fn launcher_cold_allows(message: &LauncherMessage) -> bool {
-    matches!(message, LauncherMessage::Close)
+    matches!(message, LauncherMessage::Close | LauncherMessage::Backdrop)
 }
 
 /// Whether pad directionals flow into the nav stepper, read off live Launcher

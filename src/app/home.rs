@@ -257,6 +257,12 @@ impl App {
     /// desktop, then restore that exact screen on the next press. Circle is
     /// the only path back to the Home screen.
     pub(crate) fn ps_screen_toggle(&mut self) -> Task<Message> {
+        self.screen_toggle("ps")
+    }
+
+    /// Dismiss the visible shell screen to the desktop. PS and a backdrop
+    /// click share this exact path; only the trace source differs.
+    pub(crate) fn screen_toggle(&mut self, source: &'static str) -> Task<Message> {
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: PS toggle home={} browser={} launcher={} windows=({},{},{}) resume={:?} pending={}",
             self.home_visible,
@@ -282,7 +288,7 @@ impl App {
                     "screen.dismiss",
                 )
                 .field("screen", "home")
-                .field("source", "ps")
+                .field("source", source)
                 .emit();
                 let task = self.close_home();
                 // `close_home` clears resume state (Circle/auto-close
@@ -298,7 +304,7 @@ impl App {
                     "screen.dismiss",
                 )
                 .field("screen", "browser")
-                .field("source", "ps")
+                .field("source", source)
                 .emit();
                 let task = self.close_osk("ps").chain(self.close_browser_window());
                 self.ps_resume = Some(ShellScreen::Browser);
@@ -313,7 +319,7 @@ impl App {
                     "screen.dismiss",
                 )
                 .field("screen", "launcher")
-                .field("source", "ps")
+                .field("source", source)
                 .emit();
                 let task = self.close_osk("ps").chain(self.close_launcher());
                 self.ps_resume = Some(ShellScreen::Launcher);
@@ -409,6 +415,16 @@ impl App {
         self.ps_resume_pending = false;
         if self.home_visible {
             return Task::none();
+        }
+        // One commit cue for the screen change; the close paths themselves
+        // stay silent. A close already in flight owns the cue.
+        if (self.browser_visible || self.launcher_visible)
+            && !self.browser_closing()
+            && !self.launcher_closing()
+        {
+            self.apply_action_outcome(ActionOutcome::Accepted {
+                cue: NavCue::Action,
+            });
         }
         // Tell the outgoing screen's close path that another shell screen is
         // taking over, so the native cursor stays hidden across the swap.
@@ -785,6 +801,7 @@ impl App {
                         self.apply_nav_cue(NavCue::Nav);
                     } else {
                         self.home_state.close_settings();
+                        self.apply_nav_cue(NavCue::Action);
                     }
                     Task::none()
                 } else if self.home_state.apps_menu.is_some() {
@@ -799,6 +816,7 @@ impl App {
                     self.close_home()
                 }
             }
+            HomeMessage::Backdrop => self.screen_toggle("backdrop"),
         }
     }
 
@@ -1026,6 +1044,9 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Launcher");
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 // Launcher and Browser are exclusive; `open_launcher` closes
                 // the Browser before showing the Launcher. Keep the pointer
                 // hidden across the Home->Launcher swap.
@@ -1041,6 +1062,9 @@ impl App {
                     return Task::none();
                 }
                 crate::controller::hid::diag::diag_info("ui-diag: home launch Browser");
+                self.apply_action_outcome(ActionOutcome::Accepted {
+                    cue: NavCue::Action,
+                });
                 self.shell_opening = true;
                 self.browser.start_in_grid = true;
                 Task::batch([self.close_home(), self.open_browser_window()])

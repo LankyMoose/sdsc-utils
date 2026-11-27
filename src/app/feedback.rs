@@ -15,6 +15,9 @@ use iced::Task;
 /// single action cannot double-sound.
 #[cfg(debug_assertions)]
 static UI_CUE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Debug-only tally of haptic commands actually sent to the HID worker.
+#[cfg(debug_assertions)]
+static UI_HAPTIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl App {
     pub(crate) fn play_ui_sound(&self, kind: UiSoundKind) {
@@ -37,6 +40,11 @@ impl App {
     #[cfg(debug_assertions)]
     pub(crate) fn ui_cue_count() -> u64 {
         UI_CUE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn ui_haptic_count() -> u64 {
+        UI_HAPTIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn nav_cue_kind(cue: NavCue) -> UiSoundKind {
@@ -83,6 +91,8 @@ impl App {
         if right == 0 && left == 0 {
             return;
         }
+        #[cfg(debug_assertions)]
+        UI_HAPTIC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.hid_worker
             .rumble(serial.clone(), right, left, duration.as_millis() as u64);
     }

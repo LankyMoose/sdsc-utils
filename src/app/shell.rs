@@ -19,11 +19,14 @@ impl App {
     /// True when no shell mode switch or hide/resume animation is in flight.
     pub(crate) fn shell_idle(&self) -> bool {
         !self.shell_pending_show
+            && !self.shell_reveal_armed
             && self.pending_shell_mode.is_none()
             && !self.home_closing()
             && !self.browser_closing()
+            && !self.launcher_closing()
             && self.home_shell_anim.is_none()
             && self.browser_shell_anim.is_none()
+            && self.launcher_shell_anim.is_none()
             && !self.shell_backdrop.animating(std::time::Instant::now())
     }
 
@@ -44,6 +47,8 @@ impl App {
         self.shell_hidden = false;
         self.shell_opening = false;
         self.shell_presented = false;
+        self.shell_reveal_armed = false;
+        self.shell_reveal_started = Some(std::time::Instant::now());
         // Invalidate any hide task still queued from the previous dismiss:
         // the raw offscreen show below bypasses `shell_visibility_task`, so
         // this show needs its own epoch to win the ordering race.
@@ -58,12 +63,15 @@ impl App {
             return enter.chain(self.on_shell_present(id));
         }
         // Prime an offscreen frame with the entrance pose, then move the warm
-        // surface onscreen. Showing the hidden HWND directly would present the
-        // previous full-size frame for one beat before the intro.
+        // surface onscreen. A fixed delay could present the stale full-size
+        // frame when the first paint is slow: arm on the completed offscreen
+        // show and wait for that window's first redraw event. The timer is
+        // only a lost-event fallback.
         enter
             .chain(layout::show_shell_offscreen(id))
+            .chain(Task::done(Message::ShellRevealArmed(id)))
             .chain(Task::perform(
-                super::delay(std::time::Duration::from_millis(32)),
+                super::delay(std::time::Duration::from_millis(250)),
                 move |_| Message::ShellPresent(id),
             ))
             .chain(Task::perform(
@@ -97,13 +105,62 @@ impl App {
             .chain(layout::force_shell_foreground(id))
     }
 
+    /// The offscreen prime ran; wait for that window's first redraw before
+    /// moving it onscreen.
+    pub(crate) fn on_shell_reveal_armed(&mut self, id: window::Id) -> Task<Message> {
+        if self.shell_window == Some(id) && !self.shell_hidden && !self.shell_presented {
+            self.shell_reveal_armed = true;
+        }
+        Task::none()
+    }
+
+    /// First redraw of the primed shell: the entrance pose has painted (the
+    /// event is broadcast after draw/present), so it is safe to reveal.
+    pub(crate) fn on_shell_window_event(
+        &mut self,
+        id: window::Id,
+        event: iced::window::Event,
+    ) -> Task<Message> {
+        if self.shell_reveal_armed
+            && self.shell_window == Some(id)
+            && matches!(event, iced::window::Event::RedrawRequested(_))
+        {
+            return self.on_shell_present(id);
+        }
+        Task::none()
+    }
+
     /// Present the shell on the monitor after the offscreen entrance frame.
     pub(crate) fn on_shell_present(&mut self, id: window::Id) -> Task<Message> {
-        if self.shell_window != Some(id) || self.shell_hidden {
+        if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
             return Task::none();
         }
         let mode = self.shell_mode;
+        self.shell_reveal_armed = false;
         self.shell_presented = true;
+        let now = std::time::Instant::now();
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        let anim = match mode {
+            ShellScreen::Home => self.home_shell_anim,
+            ShellScreen::Browser => self.browser_shell_anim,
+            ShellScreen::Launcher => self.launcher_shell_anim,
+        };
+        let panel = anim
+            .map(|anim| anim.frame(now, reduced).panel)
+            .unwrap_or_else(crate::ui::home::PanelVisual::full);
+        let elapsed_ms = anim
+            .map(|anim| now.saturating_duration_since(anim.started()).as_millis())
+            .or_else(|| {
+                self.shell_reveal_started
+                    .map(|started| now.saturating_duration_since(started).as_millis())
+            })
+            .unwrap_or(0);
+        self.shell_reveal_started = None;
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: shell first present mode={mode:?} elapsed_ms={elapsed_ms} scale={:.3} alpha={:.3}",
+            panel.scale, panel.alpha
+        ));
         let level = self.shell_level_task(mode);
         let toast = self.shell_toast_task(mode);
         let show = if crate::platform::debug_quiet::enabled() {
@@ -207,14 +264,16 @@ impl App {
         cover: MonitorCover,
     ) -> Task<Message> {
         if self.shell_window.is_some() && !self.shell_hidden {
-            let outgoing = self.home_closing() || self.browser_closing();
+            let outgoing = self.home_closing() || self.browser_closing() || self.launcher_closing();
             if outgoing {
                 crate::controller::hid::diag::diag_info(format!(
-                    "ui-diag: shell switch {mode:?} deferred home_closing={} browser_closing={} home_anim={:?} browser_anim={:?}",
+                    "ui-diag: shell switch {mode:?} deferred home_closing={} browser_closing={} launcher_closing={} home_anim={:?} browser_anim={:?} launcher_anim={:?}",
                     self.home_closing(),
                     self.browser_closing(),
+                    self.launcher_closing(),
                     self.home_shell_anim.map(|a| a.dir),
                     self.browser_shell_anim.map(|a| a.dir),
+                    self.launcher_shell_anim.map(|a| a.dir),
                 ));
                 self.pending_shell_mode = Some(mode);
                 return Task::none();
@@ -314,14 +373,17 @@ impl App {
             ShellScreen::Home => {
                 self.home_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
                 self.browser_shell_anim = None;
+                self.launcher_shell_anim = None;
             }
             ShellScreen::Browser => {
                 self.browser_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
                 self.home_shell_anim = None;
+                self.launcher_shell_anim = None;
             }
             ShellScreen::Launcher => {
                 self.home_shell_anim = None;
                 self.browser_shell_anim = None;
+                self.launcher_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
             }
         }
         self.claim_shell_backdrop(now);
@@ -346,6 +408,8 @@ impl App {
         }
         self.shell_hidden = true;
         self.shell_presented = false;
+        self.shell_reveal_armed = false;
+        self.shell_reveal_started = None;
         self.shell_pending_show = false;
         self.pending_shell_mode = None;
         self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;

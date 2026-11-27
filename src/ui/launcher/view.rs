@@ -49,6 +49,8 @@ pub enum LauncherMessage {
     MoveDown,
     Confirm,
     Close,
+    /// Click outside the active card: same as PS (dismiss to desktop).
+    Backdrop,
     /// Absorb a click with no state change (modal card click shield so
     /// clicks never fall through to the dimmed stage behind a dialog).
     Noop,
@@ -127,6 +129,7 @@ impl LauncherMessage {
             Self::MoveUp | Self::MoveDown => Some("launcher.nav"),
             Self::Confirm => Some("launcher.confirm"),
             Self::Close => Some("launcher.close"),
+            Self::Backdrop => Some("launcher.backdrop"),
             Self::Noop
             | Self::SettingsScrolled(..)
             | Self::ManualAddTitle(_)

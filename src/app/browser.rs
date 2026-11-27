@@ -2228,7 +2228,7 @@ impl super::App {
         self.browser.panel.grid.focus = GridFocus::Tab(id);
         match self.close_browser_grid_with(Some(id), Some(GridFocus::Tab(id))) {
             GridCloseOutcome::Started(task) => {
-                self.apply_nav_cue(NavCue::Nav);
+                self.apply_nav_cue(NavCue::Action);
                 task
             }
             GridCloseOutcome::Rejected => Task::none(),
@@ -2582,6 +2582,7 @@ impl super::App {
                 Task::none()
             }
             BrowserMessage::ToggleGrid => self.toggle_browser_grid(),
+            BrowserMessage::Backdrop => self.screen_toggle("backdrop"),
             BrowserMessage::GridActivate(id) => self.browser_grid_select(id),
             BrowserMessage::GridOpenPlus => self.browser_grid_open_plus(),
             BrowserMessage::GridCloseTab(id) => self.browser_grid_close_tab(id),
@@ -3319,7 +3320,7 @@ impl super::App {
     fn browser_grid_activate_focus(&mut self) -> Task<Message> {
         use crate::ui::browser::grid::GridFocus;
         match self.browser.panel.grid.focus {
-            GridFocus::Tab(id) => self.close_browser_grid(Some(id)),
+            GridFocus::Tab(id) => self.browser_grid_select(id),
             GridFocus::Plus => self.browser_grid_open_plus(),
             GridFocus::Bookmark(index) => self.browser_grid_open_bookmark(index),
         }

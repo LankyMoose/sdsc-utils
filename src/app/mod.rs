@@ -236,6 +236,10 @@ pub enum Message {
     /// Shell is shown offscreen with the entrance pose; present it on the
     /// monitor after one paint.
     ShellPresent(window::Id),
+    /// Offscreen prime ran; arm the first-redraw reveal gate.
+    ShellRevealArmed(window::Id),
+    /// Window event used by the reveal gate (first `RedrawRequested`).
+    ShellWindowEvent(window::Id, iced::window::Event),
     /// Safety net: re-present/re-focus the shell if the first present was lost.
     ShellFocusFallback(window::Id),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
@@ -409,6 +413,8 @@ impl Message {
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
+            | Message::ShellRevealArmed(_)
+            | Message::ShellWindowEvent(_, _)
             | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
@@ -555,6 +561,8 @@ impl Message {
             | Message::WindowShowNow(_)
             | Message::ShellOpened(_)
             | Message::ShellPresent(_)
+            | Message::ShellRevealArmed(_)
+            | Message::ShellWindowEvent(_, _)
             | Message::ShellFocusFallback(_)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
@@ -773,6 +781,9 @@ pub struct App {
     /// Browser window entrance/exit (card scale/opacity/y), same language as
     /// Home.
     browser_shell_anim: Option<crate::ui::home::ShellAnim>,
+    /// Launcher entrance/exit (black-veil fade + card movement). The Launcher
+    /// keeps its own ceremony; this only wraps the shared shell transition.
+    launcher_shell_anim: Option<crate::ui::home::ShellAnim>,
     /// One dim backdrop for the one shell window.
     shell_backdrop: crate::ui::motion::ShellBackdrop,
     /// Topmost PS app-switcher overlay: a full-screen dim scrim with the
@@ -833,6 +844,11 @@ pub struct App {
     shell_opening: bool,
     /// The current show sequence already ran its present/focus pass.
     shell_presented: bool,
+    /// Offscreen prime finished; wait for the shell's first redraw event
+    /// before moving the warm HWND onscreen (REV-1).
+    shell_reveal_armed: bool,
+    /// Entrance clock for the first-present diagnostic.
+    shell_reveal_started: Option<Instant>,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
     launcher_file_dialog_open: bool,
     /// PS fires on release only; a reset consumes the current hold.
@@ -1230,6 +1246,7 @@ impl App {
             browser_monitor_cover: None,
             browser_window_size: None,
             browser_shell_anim: None,
+            launcher_shell_anim: None,
             shell_backdrop: crate::ui::motion::ShellBackdrop::Hidden,
             home_window: None,
             home_visible: false,
@@ -1262,6 +1279,8 @@ impl App {
             shell_cursor_hidden: false,
             shell_opening: false,
             shell_presented: false,
+            shell_reveal_armed: false,
+            shell_reveal_started: None,
             launcher_file_dialog_open: false,
             ps_release: ChordReleaseDetector::default(),
             home_face_latch_until: None,
@@ -1667,9 +1686,16 @@ impl App {
 
         if self.browser_shell_anim.is_some()
             || self.home_shell_anim.is_some()
+            || self.launcher_shell_anim.is_some()
             || self.shell_backdrop.animating(Instant::now())
         {
             subscriptions.push(iced::time::every(UI_TICK).map(|_| Message::ShellFadeTick));
+        }
+        // Only while the offscreen prime is armed: one redraw is all the
+        // reveal gate needs, so this never stays subscribed.
+        if self.shell_reveal_armed && !self.shell_presented {
+            subscriptions
+                .push(window::events().map(|(id, event)| Message::ShellWindowEvent(id, event)));
         }
 
         if self.toast_message.is_some() && !self.toast_machine.is_resting() {
@@ -2040,6 +2066,29 @@ impl App {
                 Some(toast) => stack![start, toast].width(Fill).height(Fill).into(),
                 None => start,
             };
+            // Shared shell transition: the Launcher is full-bleed, so its
+            // fade is a black veil driven by the same panel alpha Home and
+            // Browser use (reduced motion still fades; movement is gated).
+            let start: Element<'_, Message> = if let Some(anim) = self.launcher_shell_anim {
+                let now = Instant::now();
+                let reduced =
+                    crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+                let frame = anim.frame(now, reduced);
+                let card = crate::ui::scale::Scale::new(start, frame.panel.scale)
+                    .offset(iced::Vector::new(0.0, frame.panel.offset_y));
+                let veil = 1.0 - frame.panel.alpha.clamp(0.0, 1.0);
+                if veil > 0.001 {
+                    let scrim = container(space())
+                        .width(Fill)
+                        .height(Fill)
+                        .style(crate::ui::theme::scrim(veil));
+                    stack![card, scrim].width(Fill).height(Fill).into()
+                } else {
+                    card.into()
+                }
+            } else {
+                start
+            };
             return cursor_hide::force_cursor(start, self.shell_cursor_hidden).into();
         }
 
@@ -2261,6 +2310,8 @@ impl App {
             Message::WindowShowNow(id) => self.on_shell_show_now(id),
             Message::ShellOpened(id) => self.on_shell_opened(id),
             Message::ShellPresent(id) => self.on_shell_present(id),
+            Message::ShellRevealArmed(id) => self.on_shell_reveal_armed(id),
+            Message::ShellWindowEvent(id, event) => self.on_shell_window_event(id, event),
             Message::ShellFocusFallback(id) => self.on_shell_focus_fallback(id),
             Message::ShellFadeTick => {
                 let now = Instant::now();
@@ -2276,6 +2327,19 @@ impl App {
                                 self.browser_shell_anim = None;
                             }
                             crate::ui::home::ShellDir::Exit => finish_browser = true,
+                        }
+                    }
+                }
+                if let Some(anim) = self.launcher_shell_anim {
+                    if let Some(id) = self.launcher_window {
+                        redraw = redraw.chain(crate::ui::layout::invalidate_window(id));
+                    }
+                    if anim.done(now) {
+                        match anim.dir {
+                            crate::ui::home::ShellDir::Enter => self.launcher_shell_anim = None,
+                            crate::ui::home::ShellDir::Exit => {
+                                redraw = redraw.chain(self.finish_launcher_close());
+                            }
                         }
                     }
                 }
@@ -2509,10 +2573,13 @@ impl App {
             self.shell_window = None;
             self.shell_hidden = true;
             self.shell_pending_show = false;
+            self.shell_reveal_armed = false;
+            self.shell_reveal_started = None;
             self.pending_shell_mode = None;
             self.clear_shell_aliases();
             self.home_shell_anim = None;
             self.browser_shell_anim = None;
+            self.launcher_shell_anim = None;
             self.browser_monitor_cover = None;
             self.home_monitor_cover = None;
             self.launcher_monitor_cover = None;

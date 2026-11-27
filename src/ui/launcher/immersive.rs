@@ -17,7 +17,7 @@ use crate::ui::scale::Scale;
 use crate::ui::shader::{AmbientProgram, VignetteProgram};
 use crate::ui::theme;
 use iced::font::Weight;
-use iced::widget::{Float, column, container, row, shader, space, stack, text};
+use iced::widget::{Float, column, container, mouse_area, row, shader, space, stack, text};
 use iced::{Alignment, Element, Fill, Font, Length, Padding, Vector};
 use std::time::Instant;
 
@@ -200,7 +200,11 @@ pub fn view<'a>(
     let chrome = stack(chrome_layers).width(Fill).height(Fill);
     let base = stack![atmosphere, chrome].width(Fill).height(Fill);
 
-    let mut layers: Vec<Element<'_, LauncherMessage>> = vec![base.into()];
+    // Clicks the stage does not claim act like PS: dismiss the shell.
+    let backdrop = mouse_area(container(space()).width(Fill).height(Fill))
+        .on_press(LauncherMessage::Backdrop)
+        .interaction(iced::mouse::Interaction::Pointer);
+    let mut layers: Vec<Element<'_, LauncherMessage>> = vec![backdrop.into(), base.into()];
     // Dialogs keep the stage mounted behind their dims so they read as
     // overlays, not screen swaps.
     // Dialog overlays (manual form, replace confirm, save guard on top):

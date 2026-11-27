@@ -48,6 +48,8 @@ pub enum BrowserMessage {
     Scrolled(f32),
     /// Share/Create toggles the tab grid.
     ToggleGrid,
+    /// Click outside the active card: same as PS (dismiss to desktop).
+    Backdrop,
     /// Mouse/card activation (visual card identity, never an index).
     GridActivate(crate::browser::engine::TabId),
     /// Mouse clicked the plus card.
@@ -96,6 +98,7 @@ impl BrowserMessage {
             | Self::TabsScrolled(_)
             | Self::BookmarksScrolled(_) => None,
             Self::ToggleGrid => Some("browser.grid.toggle"),
+            Self::Backdrop => Some("browser.backdrop"),
             Self::GridActivate(_) => Some("browser.tab.switch"),
             Self::GridOpenPlus => Some("browser.tab.open"),
             Self::GridCloseTab(_) => Some("browser.tab.close"),
@@ -618,24 +621,30 @@ pub fn root_view(
     // travel; opacity is threaded through the card content.
     let card =
         Scale::new(stage_stack, panel_visual.scale).offset(Vector::new(0.0, panel_visual.offset_y));
+    // Clicks outside the active card behave exactly like PS. The card layers
+    // sit above this full-window catcher, so only unclaimed hits reach it.
+    let backdrop = mouse_area(container(space()).width(Fill).height(Fill))
+        .on_press(BrowserMessage::Backdrop)
+        .interaction(iced::mouse::Interaction::Pointer);
     let transparent = crate::ui::chrome::transparent_windows();
-    let root: Element<'_, BrowserMessage> = container(card)
-        .width(Fill)
-        .height(Fill)
-        .center_x(Fill)
-        .center_y(Fill)
-        .style(move |_theme| container::Style {
-            // Alpha-capable backends dim the whole screen behind the card;
-            // opaque backends keep the flat dark backdrop.
-            background: Some(iced::Background::Color(if transparent {
-                theme::alpha(iced::Color::BLACK, backdrop_alpha)
-            } else {
-                theme::BASE_BG
-            })),
-            text_color: Some(theme::INK),
-            ..container::Style::default()
-        })
-        .into();
+    let root: Element<'_, BrowserMessage> =
+        container(stack![backdrop, card].width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(move |_theme| container::Style {
+                // Alpha-capable backends dim the whole screen behind the card;
+                // opaque backends keep the flat dark backdrop.
+                background: Some(iced::Background::Color(if transparent {
+                    theme::alpha(iced::Color::BLACK, backdrop_alpha)
+                } else {
+                    theme::BASE_BG
+                })),
+                text_color: Some(theme::INK),
+                ..container::Style::default()
+            })
+            .into();
     // The native pointer is owned by the shell cursor clock (idle hide) and
     // the browser's controller-vs-mouse mode. Automated sessions never hide
     // the host cursor.
