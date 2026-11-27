@@ -96,6 +96,13 @@ boot-time engine events that would otherwise clobber the saved strip before
 restore. Circle->Home runs `persist_grid_selection`, which activates the focused
 card first, so the next Browser open focuses the selection the user left behind.
 
+## Open work order
+
+Navigation validity/cue ownership and held-analog sampling for this surface are
+tracked by [navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
+The current grid still cues before a move is known to be valid and only sees
+analog samples through the Browser edge filter.
+
 ## QA
 
 ```bash

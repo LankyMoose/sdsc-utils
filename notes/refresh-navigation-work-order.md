@@ -10,6 +10,11 @@ pad-input transport, and one shared navigation profile for every controller surf
 [windows-toast.md](windows-toast.md), [ui-refresh.md](ui-refresh.md),
 [launcher-immersive.md](launcher-immersive.md), [browser-embedding.md](browser-embedding.md).
 
+> **Follow-up:** WO-1 landed the shared mechanics, but the surface policy
+> layer (list validity, no-wrap rule, single-cue ownership, held-analog
+> sampling for edge consumers) is still open. See
+> [navigation-dispatcher-work-order.md](navigation-dispatcher-work-order.md).
+
 ## 1. Why this work order exists
 
 The OSK and toast are topmost windows, but iced 0.14 has no per-window update
