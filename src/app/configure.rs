@@ -66,7 +66,6 @@ impl App {
             lightbar_enabled: self.session.prefs.lightbar_enabled,
             home_enabled: self.session.prefs.home_enabled,
             home_auto_open: self.session.prefs.home_auto_open,
-            osk_mode: self.session.prefs.osk_mode,
             launcher_immersive_layout: self.session.prefs.launcher_immersive_layout,
             launcher_clock_enabled: self.session.prefs.launcher_clock_enabled,
             launcher_navbar: self.session.prefs.launcher_navbar,
@@ -321,7 +320,6 @@ impl App {
                 Task::none()
             }
             ConfigureMessage::SetHomeAutoOpen(enabled) => self.apply_home_auto_open(enabled),
-            ConfigureMessage::SetOskMode(mode) => self.apply_osk_mode(mode),
             ConfigureMessage::SetStartScreenClock(enabled) => self.apply_launcher_clock(enabled),
             ConfigureMessage::SetImmersiveLayout(layout) => {
                 self.apply_launcher_immersive_layout(layout)

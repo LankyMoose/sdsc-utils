@@ -470,13 +470,8 @@ impl super::App {
                 wait.needs_redraw = true;
                 wait.needs_osk_ready = true;
             }
-            // OSK trigger/stick steps queue synthetic pull-model frames; gate
-            // the next step on the widget consuming them.
-            "osk.trigger" | "osk.stick" => {
-                wait.needs_redraw = true;
-                wait.needs_osk_ready = true;
-                wait.needs_osk_idle = true;
-            }
+            // OSK input uses the shared D-pad replay path; there is no
+            // split-stick/trigger surface to synthesize.
             "pad.tap" if step.app == "browser" && button == "circle" => {
                 // Circle closed the Browser: there may be no window left to
                 // present. Finish this step immediately.
@@ -495,14 +490,22 @@ impl super::App {
             }
             "pad.dir" => {
                 wait.needs_redraw = true;
-                wait.needs_cursor_idle = true;
-                // A nudge ends with a DOM reseed around the landing point. The
-                // next direction reads the freshly culled target set, so wait
-                // for that tree instead of the pre-jump one. A no-op press
-                // leaves the cursor in place and needs no reseed.
-                if self.browser.panel.cursor.snapshot().fly_to.is_some() {
-                    wait.needs_focusables = true;
-                    wait.focusables_after = Some(self.browser.panel.page.focusables_generation);
+                if self.osk.state.open {
+                    // The key follows the same D-pad tick inside the pull
+                    // model; wait for the queued synthetic frames to drain.
+                    wait.needs_osk_ready = true;
+                    wait.needs_osk_idle = true;
+                } else {
+                    wait.needs_cursor_idle = true;
+                    // A nudge ends with a DOM reseed around the landing point.
+                    // The next direction reads the freshly culled target set,
+                    // so wait for that tree instead of the pre-jump one. A
+                    // no-op press leaves the cursor in place and needs no
+                    // reseed.
+                    if self.browser.panel.cursor.snapshot().fly_to.is_some() {
+                        wait.needs_focusables = true;
+                        wait.focusables_after = Some(self.browser.panel.page.focusables_generation);
+                    }
                 }
             }
             _ => {
@@ -832,33 +835,8 @@ impl super::App {
                 };
                 self.replay_pad_dir(action)
             }
-            #[cfg(debug_assertions)]
-            "osk.stick" => {
-                let x = step
-                    .params
-                    .get("x")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                let y = step
-                    .params
-                    .get("y")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                let pair = (x, y);
-                match step.params.get("side").and_then(serde_json::Value::as_str) {
-                    Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
-                    _ => self.replay_osk_stick(pair, (0.0, 0.0)),
-                }
-            }
-            #[cfg(debug_assertions)]
-            "osk.trigger" => {
-                let side = step
-                    .params
-                    .get("side")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("left");
-                self.replay_osk_trigger(side)
-            }
+            // OSK input uses the shared D-pad replay path; there is no
+            // split-stick/trigger surface to synthesize.
             #[cfg(debug_assertions)]
             "osk.open" => self.request_osk_open(crate::ui::osk::OskTarget::BrowserPage),
             #[cfg(debug_assertions)]

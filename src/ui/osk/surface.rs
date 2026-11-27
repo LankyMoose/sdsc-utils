@@ -1,15 +1,12 @@
 //! Pull-model wrapper for the system OSK.
 //!
-//! The keyboard layout is still built by [`super::view`]; this widget owns the
-//! per-window analog poll. It reads the shared [`OskInputSlot`] at redraw time,
-//! runs the shared [`DualNav`]/[`NavBank`], and publishes only discrete
-//! step/commit messages. No app message is produced per pad sample.
+//! The keyboard layout is built by [`super::view`]; this widget owns the
+//! per-window analog poll. It reads the shared [`OskInputSlot`] at redraw
+//! time, runs the shared [`NavBank`], and publishes only discrete move
+//! messages. No app message is produced per pad sample.
 
-use super::{Dir, OskMessage, OskState, view};
-use crate::domain::pad::{
-    DualNav, NavAction, NavBank, NavHalf, NavPhase, NavReading, OskInputSlot, dpad_only,
-};
-use crate::persist::prefs::OskMode;
+use super::{OskMessage, OskState, view};
+use crate::domain::pad::{NavAction, NavBank, NavReading, OskInputSlot, dpad_only};
 use iced::advanced::Shell;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
@@ -28,7 +25,6 @@ pub fn surface<'a>(
         content: view(state),
         slot,
         open: state.open,
-        mode: state.mode,
         epoch,
     }
     .into()
@@ -38,7 +34,6 @@ pub struct OskSurface<'a> {
     content: Element<'a, OskMessage>,
     slot: Arc<OskInputSlot>,
     open: bool,
-    mode: OskMode,
     epoch: u64,
 }
 
@@ -46,9 +41,7 @@ pub struct OskSurface<'a> {
 pub struct SurfaceState {
     last_seq: u64,
     was_open: bool,
-    mode: Option<OskMode>,
-    dual: DualNav,
-    grid: NavBank,
+    nav: NavBank,
     /// Last poll saw a non-neutral pad; keep polling even if the slot seq
     /// stalls so repeat cadence still fires from the widget clock.
     last_active: bool,
@@ -56,12 +49,10 @@ pub struct SurfaceState {
 }
 
 impl SurfaceState {
-    fn reset(&mut self, mode: OskMode) {
-        self.dual.prepare_on_open(false);
-        self.grid.prepare_on_open(false);
+    fn reset(&mut self) {
+        self.nav.prepare_on_open(false);
         self.last_seq = 0;
         self.last_active = false;
-        self.mode = Some(mode);
         self.epoch = None;
     }
 }
@@ -111,8 +102,8 @@ impl Widget<OskMessage, iced::Theme, iced::Renderer> for OskSurface<'_> {
     ) {
         let state = tree.state.downcast_mut::<SurfaceState>();
         if self.open {
-            if !state.was_open || state.mode != Some(self.mode) || state.epoch != Some(self.epoch) {
-                state.reset(self.mode);
+            if !state.was_open || state.epoch != Some(self.epoch) {
+                state.reset();
                 state.epoch = Some(self.epoch);
             }
             state.was_open = true;
@@ -129,12 +120,7 @@ impl Widget<OskMessage, iced::Theme, iced::Renderer> for OskSurface<'_> {
             }
         } else if state.was_open {
             state.was_open = false;
-            state.mode = None;
-            state.last_seq = 0;
-            state.last_active = false;
-            state.epoch = None;
-            state.dual.reset();
-            state.grid.reset();
+            state.reset();
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -210,59 +196,33 @@ impl OskSurface<'_> {
             return;
         }
         let now = Instant::now();
+        let masked: Vec<NavReading> = readings
+            .iter()
+            .cloned()
+            .map(|mut reading| {
+                reading.sample = dpad_only(&reading.sample);
+                reading
+            })
+            .collect();
         let mut emitted = false;
-        match self.mode {
-            OskMode::Dual => {
-                let tick = state.dual.tick(readings, now);
-                for step in tick.steps {
-                    if step.step.phase == NavPhase::Release {
-                        continue;
-                    }
-                    emitted = true;
-                    shell.publish(OskMessage::Step {
-                        pad: step.pad,
-                        half: step.half,
-                        direction: step.step.direction,
-                        phase: step.step.phase,
-                    });
-                }
-                for edge in tick.triggers {
-                    emitted = true;
-                    shell.publish(OskMessage::Commit {
-                        pad: edge.pad,
-                        half: edge.half,
-                    });
-                }
-            }
-            OskMode::Grid => {
-                let masked: Vec<NavReading> = readings
-                    .iter()
-                    .cloned()
-                    .map(|mut reading| {
-                        reading.sample = dpad_only(&reading.sample);
-                        reading
-                    })
-                    .collect();
-                let tick = state
-                    .grid
-                    .tick(&masked, now, true, true, false, false, false, false, false);
-                if let Some(action) = tick.action
-                    && let Some(pad) = tick.action_pad
-                    && matches!(
-                        action,
-                        NavAction::Up | NavAction::Down | NavAction::Left | NavAction::Right
-                    )
-                {
-                    emitted = true;
-                    shell.publish(OskMessage::GridStep {
-                        pad,
-                        direction: action,
-                    });
-                }
-            }
+        let tick = state
+            .nav
+            .tick(&masked, now, true, true, false, false, false, false, false);
+        if let Some(action) = tick.action
+            && let Some(pad) = tick.action_pad
+            && matches!(
+                action,
+                NavAction::Up | NavAction::Down | NavAction::Left | NavAction::Right
+            )
+        {
+            emitted = true;
+            shell.publish(OskMessage::Move {
+                pad,
+                direction: action,
+            });
         }
-        // Own the poll cadence while a stick/trigger is non-neutral; stop at
-        // rest so a static keyboard never repaints. The pad edge stream is
+        // Own the poll cadence while a D-pad direction is held; stop at rest
+        // so a static keyboard never repaints. The pad edge stream is
         // change-gated, so this keeps repeat cadence alive without per-sample
         // app messages.
         if emitted
@@ -283,24 +243,5 @@ impl OskSurface<'_> {
 impl<'a> From<OskSurface<'a>> for Element<'a, OskMessage> {
     fn from(value: OskSurface<'a>) -> Self {
         Element::new(value)
-    }
-}
-
-/// DQ half -> existing layout direction helper used by tests.
-pub fn dir_for(direction: NavAction) -> Option<Dir> {
-    match direction {
-        NavAction::Up => Some(Dir::Up),
-        NavAction::Down => Some(Dir::Down),
-        NavAction::Left => Some(Dir::Left),
-        NavAction::Right => Some(Dir::Right),
-        _ => None,
-    }
-}
-
-/// Test/helper: current half for a shared nav step.
-pub fn half_label(half: NavHalf) -> &'static str {
-    match half {
-        NavHalf::Left => "left",
-        NavHalf::Right => "right",
     }
 }

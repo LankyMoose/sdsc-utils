@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """System OSK behaviour test (no OS input).
 
-Covers both modes:
-- Dual QWERTY (default): first Cross on a page text field opens the system OSK,
-  both sticks move independent cursors, L2/R2 type from both halves, Cross is
-  space, Triangle backspaces, Square switches symbols, Options enters, real
-  mouse input dismisses it, and keyboard input closes + hands off the key.
-- Grid (`SDSC_OSK_MODE=grid`): the same Cross open, D-pad/Cross activation
-  path types the focused grid key.
+One simple QWERTY layout: the first Cross on a page text field opens the
+system OSK, D-pad moves the single focus, Cross types the focused key,
+Triangle backspaces, Square switches symbols, Options enters, real mouse
+input dismisses it, and keyboard input closes + hands off the key.
 
 The app runs with SDSC_DEBUG_INPUT=0 and is killed as soon as replay.done is
-observed. The OSK is a separate topmost no-activate overlay; Browser-owned OSK
-code no longer exists.
+observed. The OSK is a separate topmost no-activate overlay; Browser-owned
+OSK code no longer exists.
 """
 
 from __future__ import annotations
@@ -52,12 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, help="debug sdsc-utils executable")
     parser.add_argument("--keep", action="store_true", help="keep the app running")
-    parser.add_argument(
-        "--mode",
-        choices=("dual", "grid", "both"),
-        default="both",
-        help="OSK mode(s) to exercise (default: both)",
-    )
     return parser.parse_args()
 
 
@@ -91,67 +82,51 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
+def run(exe: Path, root: Path, page: Path, keep: bool) -> tuple[bool, str]:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    session = Path(tempfile.gettempdir()) / f"sdsc-system-osk-{mode}-qa" / stamp
+    session = Path(tempfile.gettempdir()) / "sdsc-system-osk-qa" / stamp
     session.mkdir(parents=True, exist_ok=True)
-    if mode == "dual":
-        actions = [
-            {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
-            {"app": "browser", "action": "cursor.dock", "params": {"x": 100, "y": 70}},
-            # First Cross on the text field: focus + open the system OSK.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            # D and K: one character from each half's persistent cursor.
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
-            # Move the left cursor D -> F and type F.
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.95, "y": 0.0}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "left", "x": 0.0, "y": 0.0}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
-            # Move the right cursor K -> J and type J. Both halves stay independent.
-            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": -0.95, "y": 0.0}},
-            {"app": "browser", "action": "osk.stick", "params": {"side": "right", "x": 0.0, "y": 0.0}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
-            # Cross Space, Triangle Backspace.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            {"app": "browser", "action": "pad.tap", "params": {"button": "triangle"}},
-            # Symbols: left F slot is ';', right J slot is '$' on the symbol layer.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "left"}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
-            # Back to alpha, the right cursor persisted on J across the layer.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
-            {"app": "browser", "action": "osk.trigger", "params": {"side": "right"}},
-            # Options is Enter; the page field keeps its value.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "options"}},
-            # Real keyboard closes the OSK, then hands 'a' to the page field.
-            {"app": "browser", "action": "key", "params": {"key": "a"}},
-            # Reopen with Cross, then dismiss with real mouse input.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            {"app": "browser", "action": "mouse.click", "params": {"x": 100, "y": 270}},
-            # Reopen and close with Escape (consumed by the OSK).
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            {"app": "browser", "action": "key", "params": {"key": "escape"}},
-        ]
-        expected = "dkfj;$ja"
-    else:
-        actions = [
-            {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
-            {"app": "browser", "action": "cursor.dock", "params": {"x": 100, "y": 70}},
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            # Grid focus starts on 'q'; Cross activates it.
-            {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
-            {"app": "browser", "action": "key", "params": {"key": "a"}},
-        ]
-        expected = "qa"
-
+    actions = [
+        {"app": "browser", "action": "navigate", "params": {"url": page.as_uri()}},
+        {"app": "browser", "action": "cursor.dock", "params": {"x": 100, "y": 70}},
+        # First Cross on the text field: focus + open the system OSK.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        # Focus starts on Q; Cross types it.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        # Move right Q -> W and type W.
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "right"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        # Move down W -> S and type S.
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "down"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        # Triangle backspaces the S.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "triangle"}},
+        # Symbols: the S slot is '/'. Then back to alpha and type S again.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "square"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        # Control row, same column: pass X, then Space. Options is Enter.
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "down"}},
+        {"app": "browser", "action": "pad.dir", "params": {"dir": "down"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        {"app": "browser", "action": "pad.tap", "params": {"button": "options"}},
+        # Real keyboard closes the OSK, then hands 'a' to the page field.
+        {"app": "browser", "action": "key", "params": {"key": "a"}},
+        # Reopen with Cross, then dismiss with real mouse input.
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        {"app": "browser", "action": "mouse.click", "params": {"x": 100, "y": 270}},
+        # Reopen and close with Escape (consumed by the OSK).
+        {"app": "browser", "action": "pad.tap", "params": {"button": "cross"}},
+        {"app": "browser", "action": "key", "params": {"key": "escape"}},
+    ]
+    expected = "qw/s a"
     write_plan(session, actions)
     replay_root = Path(tempfile.gettempdir()) / "sdsc-replay"
     prefix = session.name
     before = set(replay_root.glob(f"{prefix}-*")) if replay_root.is_dir() else set()
     env = os.environ.copy()
     qa_offscreen.apply_env(env)
-    env["SDSC_OSK_MODE"] = mode
     print(f"session={session}")
     proc = subprocess.Popen(
         [str(exe), "--trace-replay", str(session), "--flow", "1"],
@@ -178,7 +153,7 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
                         break
             time.sleep(0.5)
         if not done:
-            return False, f"{mode}: replay.done not observed before timeout"
+            return False, "replay.done not observed before timeout"
 
         close_deadline = time.time() + 5
         while time.time() < close_deadline:
@@ -201,34 +176,33 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
         closes = [row for row in platform if row.get("event") == "osk.close"]
         enters = [row for row in platform if row.get("event") == "osk.enter"]
         pad_taps = [row for row in platform if row.get("event") == "replay.pad_tap"]
-        print(f"{mode}: sandbox={sandbox}")
+        print(f"sandbox={sandbox}")
         print(
-            f"{mode}: title={title!r} opens={len(opens)} closes={len(closes)} "
+            f"title={title!r} opens={len(opens)} closes={len(closes)} "
             f"enters={len(enters)}"
         )
         if title != f"typed={expected}":
-            return False, f"{mode}: expected typed={expected}, got {title!r}"
+            return False, f"expected typed={expected}, got {title!r}"
         if not opens:
-            return False, f"{mode}: OSK never opened"
+            return False, "OSK never opened"
         if not pad_taps:
-            return False, f"{mode}: no Cross pad tap was recorded"
+            return False, "no Cross pad tap was recorded"
         first_open = min(row.get("ts", 0) for row in opens)
         first_tap = min(row.get("ts", 0) for row in pad_taps)
         if first_open < first_tap:
-            return False, f"{mode}: OSK opened before Cross (focus auto-open regression)"
+            return False, "OSK opened before Cross (focus auto-open regression)"
+        if not enters:
+            return False, "Options never emitted osk.enter"
         if not any(row.get("reason") == "keyboard" for row in closes):
-            return False, f"{mode}: keyboard did not close the OSK"
-        if mode == "dual":
-            if not enters:
-                return False, "dual: Options never emitted osk.enter"
-            if not any(row.get("reason") == "mouse" for row in closes):
-                return False, "dual: real mouse did not close the OSK"
+            return False, "keyboard did not close the OSK"
+        if not any(row.get("reason") == "mouse" for row in closes):
+            return False, "real mouse did not close the OSK"
         if not offscreen.report():
-            return False, f"{mode}: offscreen QA failed"
+            return False, "offscreen QA failed"
         return True, ""
     finally:
         offscreen.stop()
-        if not args_keep and proc.poll() is None:
+        if not keep and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -238,35 +212,26 @@ def run(exe: Path, root: Path, page: Path, mode: str) -> tuple[bool, str]:
                 )
             else:
                 proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
-args_keep = False
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
 
 def main() -> int:
-    global args_keep
     args = parse_args()
-    args_keep = args.keep
     root = Path(__file__).resolve().parent.parent
     exe = args.exe or root / "target" / "debug" / "sdsc-utils.exe"
     if not exe.is_file():
         print(f"error: executable not found: {exe}", file=sys.stderr)
         return 2
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    session = Path(tempfile.gettempdir()) / "sdsc-system-osk-page" / stamp
-    session.mkdir(parents=True, exist_ok=True)
-    page = session / "osk.html"
+    page = Path(tempfile.gettempdir()) / "sdsc-system-osk-qa.html"
     page.write_text(PAGE, encoding="utf-8")
-    modes = ("dual", "grid") if args.mode == "both" else (args.mode,)
-    for mode in modes:
-        ok, error = run(exe, root, page, mode)
-        if not ok:
-            print(f"error: {error}", file=sys.stderr)
-            return 1
+    ok, error = run(exe, root, page, args.keep)
+    if not ok:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print("system OSK passed")
     return 0
 
 

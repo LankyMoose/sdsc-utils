@@ -165,7 +165,7 @@ meters still use the legacy per-surface bank.
 - Page `window.open` / `target=_blank` is denied entirely: no native popup,
   no new tab, no navigation. `PopupRequested` is traced as
   `browser.popup_denied`.
-- The system controller keyboard (Dual QWERTY default, Grid fallback) is a
+- The system controller keyboard (single QWERTY: D-pad focus, Cross type) is a
   topmost no-activate overlay owned by the main app. Cross on a page text
   field opens it for `OskTarget::BrowserPage`; Triangle in the URL well opens
   it for `OskTarget::BrowserUrl`. Focus/autofocus never opens it. Real
@@ -177,7 +177,7 @@ meters still use the legacy per-surface bank.
   keyboard, mouse, and touch input (`ui::input_lock`). Quiet sessions also
   suppress the startup toast and controller auto-open Home. Replay drives the
   same handlers through synthetic `text`, `key`, `mouse.click`, `mouse.drag`,
-  `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.stick`
+  `mouse.wheel`, `ime.*`, `cursor.dock`, `pad.tap`, `pad.dir`, and `osk.screenshot`
   steps and closes the Browser window at `replay.done`; never use OS input
   injection for QA and do not leave test windows on screen.
 - v0 is single-tab with one header row (`‹ L1` · URL well · `R1 ›`). History

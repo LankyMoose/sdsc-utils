@@ -1,22 +1,20 @@
 //! System controller keyboard (OSK).
 //!
 //! Owned by the main app/OS, not by the Browser. The OSK renders as a topmost
-//! no-activate overlay and receives pad input from the main HID path. Modes:
-//! Dual QWERTY (split sticks, default) and Grid (D-pad fallback).
+//! no-activate overlay and receives pad input from the main HID path. One
+//! layout: QWERTY, with D-pad focus movement and Cross activation.
 
-pub mod dual;
-pub mod grid;
+pub mod qwerty;
 pub mod surface;
 
+pub use qwerty::OskKey;
 pub use surface::surface;
 
-use crate::domain::pad::{NavAction, NavHalf, PadId};
-use crate::persist::prefs::OskMode;
+use crate::domain::pad::{NavAction, PadId};
 use crate::ui::theme;
-use dual::{Cursor, DualKeyboard, Half};
-use grid::{GridKey, GridKeyboard};
 use iced::widget::{button, column, container, row, space, text};
-use iced::{Element, Fill, Length};
+use iced::{Alignment, Element, Fill, Length};
+use qwerty::QwertyKeyboard;
 
 /// Text host currently owning the keyboard. The Browser is an in-process host
 /// in v0; Launcher Settings is the system-app proof host.
@@ -39,7 +37,7 @@ impl OskTarget {
     }
 }
 
-/// Shared key layer for both keyboard modes.
+/// Shared key layer for the QWERTY keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layer {
     #[default]
@@ -47,7 +45,7 @@ pub enum Layer {
     Symbol,
 }
 
-/// Shared directional step (sticks in DQ, D-pad in Grid).
+/// Shared directional step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Up,
@@ -56,7 +54,7 @@ pub enum Dir {
     Right,
 }
 
-/// Text/control output from a keyboard mode.
+/// Text/control output from the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
     Text(char),
@@ -65,25 +63,11 @@ pub enum Output {
     Enter,
 }
 
-/// Discrete output from the pull-model OSK surface. The app changes cursor or
-/// dispatches text/feedback only on these messages; analog samples stay in the
-/// shared input slot.
+/// Discrete movement from the pull-model OSK surface. The app changes focus
+/// only on these messages; analog samples stay in the shared input slot.
 #[derive(Debug, Clone)]
 pub enum OskMessage {
-    Step {
-        pad: PadId,
-        half: NavHalf,
-        direction: NavAction,
-        phase: crate::domain::pad::NavPhase,
-    },
-    Commit {
-        pad: PadId,
-        half: NavHalf,
-    },
-    GridStep {
-        pad: PadId,
-        direction: NavAction,
-    },
+    Move { pad: PadId, direction: NavAction },
 }
 
 /// System-owned OSK UI state. No Browser or app dependencies.
@@ -91,19 +75,15 @@ pub enum OskMessage {
 pub struct OskState {
     pub open: bool,
     pub target: Option<OskTarget>,
-    pub mode: OskMode,
-    pub dual: DualKeyboard,
-    pub grid: GridKeyboard,
+    pub qwerty: QwertyKeyboard,
 }
 
 impl OskState {
-    pub fn new(mode: OskMode) -> Self {
+    pub fn new() -> Self {
         Self {
             open: false,
             target: None,
-            mode,
-            dual: DualKeyboard::new(),
-            grid: GridKeyboard::new(),
+            qwerty: QwertyKeyboard::new(),
         }
     }
 
@@ -120,56 +100,30 @@ impl OskState {
     }
 
     pub fn reset(&mut self) {
-        self.dual.reset();
-        self.grid.reset();
-    }
-
-    /// Mode changes while open reset both layouts.
-    pub fn set_mode(&mut self, mode: OskMode) {
-        if self.mode == mode {
-            return;
-        }
-        self.mode = mode;
-        self.reset();
+        self.qwerty.reset();
     }
 
     pub fn layer(&self) -> Layer {
-        match self.mode {
-            OskMode::Dual => self.dual.layer(),
-            OskMode::Grid => self.grid.layer,
-        }
+        self.qwerty.layer
     }
 
     pub fn toggle_layer(&mut self) {
-        match self.mode {
-            OskMode::Dual => self.dual.toggle_layer(),
-            OskMode::Grid => self.grid.toggle_layer(),
-        }
+        self.qwerty.toggle_layer();
     }
 
-    /// Grid D-pad focus movement (no-op in Dual QWERTY mode).
-    pub fn grid_move(&mut self, direction: Dir) {
-        if self.mode == OskMode::Grid {
-            self.grid.move_focus(direction);
-        }
+    /// Move the single focus cursor.
+    pub fn move_focus(&mut self, direction: Dir) {
+        self.qwerty.move_focus(direction);
     }
 
-    pub fn grid_key(&self) -> GridKey {
-        self.grid.focus_key()
+    pub fn key(&self) -> OskKey {
+        self.qwerty.focus_key()
     }
+}
 
-    pub fn dual_view(&self) -> dual::DualView {
-        self.dual.view()
-    }
-
-    /// Move one DQ half's cursor. The app only calls this in Dual mode.
-    pub fn dual_move(&mut self, half: Half, direction: Dir) {
-        self.dual.move_cursor(half, direction);
-    }
-
-    /// Selected DQ key for a half. The app only calls this in Dual mode.
-    pub fn dual_key(&self, half: Half) -> char {
-        self.dual.key(half)
+impl Default for OskState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -186,28 +140,22 @@ pub fn view(state: &OskState) -> Element<'static, OskMessage> {
             .size(12.0)
             .color(theme::MUTED),
         text(" · ").size(12.0).color(theme::DIM),
-        text(state.mode.label()).size(12.0).color(theme::MUTED),
+        text("QWERTY").size(12.0).color(theme::MUTED),
     ]
-    .align_y(iced::Alignment::Center)
+    .align_y(Alignment::Center)
     .width(Fill);
 
-    let body: Element<'static, OskMessage> = match state.mode {
-        OskMode::Dual => dual_body(state),
-        OskMode::Grid => grid_body(state),
-    };
-    let hint = match state.mode {
-        OskMode::Dual => {
-            "Sticks move cursors · L2/R2 type · Cross Space · Triangle Bksp · Square Symbols · Options Enter · Circle Close"
-        }
-        OskMode::Grid => {
-            "D-pad Move · Cross Type · Triangle Bksp · Square Symbols · Options Enter · Circle Close"
-        }
-    };
+    let hint =
+        "D-pad Move · Cross Type · Triangle Bksp · Square Symbols · Options Enter · Circle Close";
     let card = container(
-        column![header, body, text(hint).size(11.0).color(theme::DIM)]
-            .spacing(10)
-            .width(Fill)
-            .align_x(iced::Alignment::Center),
+        column![
+            header,
+            qwerty_body(state),
+            text(hint).size(11.0).color(theme::DIM)
+        ]
+        .spacing(10)
+        .width(Fill)
+        .align_x(Alignment::Center),
     )
     .padding(14)
     .width(Fill)
@@ -223,55 +171,20 @@ pub fn view(state: &OskState) -> Element<'static, OskMessage> {
         .into()
 }
 
-fn dual_body(state: &OskState) -> Element<'static, OskMessage> {
-    let view = state.dual_view();
-    let body = row![
-        half_column(view.left, state.dual.rows(Half::Left)),
-        space().width(Length::Fixed(32.0)),
-        half_column(view.right, state.dual.rows(Half::Right)),
-    ]
-    .width(Fill);
-    container(body).width(Fill).max_width(900.0).into()
-}
-
-fn half_column(
-    cursor: Cursor,
-    rows: &'static [[char; dual::COLS]; dual::ROWS],
-) -> Element<'static, OskMessage> {
-    let mut col = column![].spacing(4).width(Fill);
-    for (r, keys) in rows.iter().enumerate() {
-        let mut line = row![].spacing(4).width(Fill);
-        for (c, label) in keys.iter().enumerate() {
-            let active = cursor.row == r && cursor.col == c;
-            line = line.push(keycap(&label.to_string(), active, Length::Fill));
-        }
-        col = col.push(line);
-    }
-    col.into()
-}
-
-fn grid_body(state: &OskState) -> Element<'static, OskMessage> {
+fn qwerty_body(state: &OskState) -> Element<'static, OskMessage> {
+    let mut rows = column![].spacing(4).width(Fill);
     let mut flat = 0;
-    let mut rows: Vec<Element<'static, OskMessage>> = Vec::new();
-    for key_row in state.grid.rows() {
-        let mut line = row![].spacing(4);
+    for key_row in state.qwerty.rows() {
+        let mut line = row![].spacing(4).width(Fill);
         for key in *key_row {
-            let focused = flat == state.grid.focus;
-            let label = key.label(state.grid.layer);
-            let width = match key {
-                GridKey::Char(_) => 54.0,
-                _ => 74.0,
-            };
-            line = line.push(keycap(&label, focused, Length::Fixed(width)));
+            let focused = flat == state.qwerty.focus;
+            let label = key.label(state.qwerty.layer);
+            line = line.push(keycap(&label, focused, Length::Fill));
             flat += 1;
         }
-        rows.push(line.into());
+        rows = rows.push(line);
     }
-    let mut col = column![].spacing(4).width(Fill);
-    for line in rows {
-        col = col.push(line);
-    }
-    col.into()
+    container(rows).width(Fill).max_width(900.0).into()
 }
 
 fn keycap(label: &str, active: bool, width: impl Into<Length>) -> Element<'static, OskMessage> {
@@ -304,53 +217,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_close_resets_target_and_cursors() {
-        let mut state = OskState::new(OskMode::Dual);
+    fn open_close_resets_focus() {
+        let mut state = OskState::new();
         state.open(OskTarget::BrowserPage);
         assert!(state.open);
         assert_eq!(state.target, Some(OskTarget::BrowserPage));
-        state.dual_move(Half::Left, Dir::Right);
-        assert_eq!(state.dual_key(Half::Left), 'f');
+        state.move_focus(Dir::Right);
+        assert_eq!(state.key(), OskKey::Char('w'));
         state.close();
         assert!(!state.open);
         assert_eq!(state.target, None);
-        assert_eq!(state.dual_key(Half::Left), 'd');
-        assert_eq!(state.dual_key(Half::Right), 'k');
+        assert_eq!(state.key(), OskKey::Char('q'));
     }
 
     #[test]
-    fn mode_switch_resets_and_selects_layout() {
-        let mut state = OskState::new(OskMode::Dual);
+    fn layer_toggles_and_focus_stays_in_range() {
+        let mut state = OskState::new();
         state.open(OskTarget::BrowserPage);
+        state.move_focus(Dir::Down);
+        assert_eq!(state.key(), OskKey::Char('a'));
         state.toggle_layer();
         assert_eq!(state.layer(), Layer::Symbol);
-        state.set_mode(OskMode::Grid);
-        assert_eq!(state.mode, OskMode::Grid);
-        assert_eq!(state.layer(), Layer::Alpha);
-        state.grid_move(Dir::Down);
-        assert_eq!(state.grid_key(), GridKey::Char('a'));
-        assert_eq!(OskMode::parse("grid"), Some(OskMode::Grid));
-        assert_eq!(OskMode::parse("dual"), Some(OskMode::Dual));
+        assert_eq!(state.key(), OskKey::Char('-'));
+        assert!(state.qwerty.focus < state.qwerty.key_count());
     }
 
     #[test]
-    fn dual_mode_moves_only_the_addressed_half() {
-        let mut state = OskState::new(OskMode::Dual);
-        state.open(OskTarget::BrowserUrl);
-        state.dual_move(Half::Right, Dir::Left);
-        assert_eq!(state.dual_key(Half::Left), 'd');
-        assert_eq!(state.dual_key(Half::Right), 'j');
-        state.dual_move(Half::Left, Dir::Up);
-        assert_eq!(state.dual_key(Half::Left), 'e');
-        assert_eq!(state.dual_key(Half::Right), 'j');
-    }
-
-    #[test]
-    fn view_composes_in_both_modes() {
-        let mut state = OskState::new(OskMode::Dual);
+    fn view_composes() {
+        let mut state = OskState::new();
         state.open(OskTarget::BrowserPage);
-        let _ = view(&state);
-        state.set_mode(OskMode::Grid);
         let _ = view(&state);
     }
 }

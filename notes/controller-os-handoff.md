@@ -24,6 +24,12 @@ separate-app split was reverted in favour of the single-process Browser.
 > remain absent. The
 > "no address/Triangle→URL removed" lines below describe the original v0 and
 > are superseded by this row.
+>
+> **OSK update (2026-11-27):** Dual QWERTY and Grid were removed. The system
+> OSK is one simple QWERTY layout: D-pad focus, Cross type, Triangle
+> backspace, Square symbols, Options enter, Circle close. There is no OSK mode
+> setting or `SDSC_OSK_MODE` override; the DQ/Grid design sections below are
+> historical.
 
 Read this whole note before touching the Browser UI, the OSK, the pad routing,
 or the MSIX packaging.
@@ -36,8 +42,8 @@ or the MSIX packaging.
    `back`/`forward`/`reload` actions mapped to L1/R1/Options (tap only).
 2. **Make the OSK a system service.** Move it out of `ui/browser`/
    `app/browser.rs` into system-owned modules and a topmost no-activate
-   overlay. Dual QWERTY default, Grid fallback; Cross-only open; real input
-   closes; first Cross on a page field opens.
+   overlay. One simple QWERTY (D-pad focus, Cross type); Cross-only open;
+   real input closes; first Cross on a page field opens.
 3. **Prove reuse** with Launcher Settings Title/Arguments using the same OSK.
 4. **Define contract v0**: manifest + surface + actions + text session +
    lifecycle. The Browser spec is tiny. Do not build a general UI toolkit or
@@ -76,7 +82,7 @@ The main app is a **virtual OS / shell for controllers**.
 |---|---|
 | Input driver / service | HID worker, pad input routing |
 | Shell / launcher | Home/PS overlay, Launcher |
-| System settings | Settings, OSK mode |
+| System settings | Settings |
 | Input method | **OSK** |
 | Notifications | Toasts |
 | App catalog / package manager | Home apps, DLC install, Browser tile |
@@ -145,8 +151,8 @@ Do not re-litigate these unless the user explicitly changes them.
   the v0.1 header row (Triangle edits the URL well through the system OSK).
 - OSK keys and its control bar are **not mouse-clickable**; real mouse input
   dismisses the OSK.
-- The OSK mode is a **system setting**: Dual QWERTY default, Grid fallback.
-  No per-app mode.
+- The OSK has one simple QWERTY layout: D-pad focus, Cross type. There is no
+  mode setting.
 - The OSK renders as a **topmost, no-activate system overlay window** owned by
   the main app. It must not steal focus from the Browser/app. Controller input
   comes from the main app's HID path, not window focus.
@@ -369,19 +375,14 @@ Future additions (not now):
 > pull-model OSK, menu-grade navigation gate, all-live-pad feedback, and
 > per-window refresh. This section describes the current shipped behavior.
 
-### Modes and settings
+### Layout and controls
 
-- `OskMode::{Dual, Grid}`, global system pref.
-- Default **Dual QWERTY** (Microsoft Research's DQ interaction).
-- Grid is the fallback/accessibility mode.
-- Existing prefs/env `quadrant` load as `Dual` (serde + parse alias).
-- Settings → **System** section, one row: **Controller keyboard** →
-  Dual QWERTY / Grid.
-- Debug/QA override: `SDSC_OSK_MODE=dual|grid` (debug builds; `quadrant` also
-  maps to dual).
-- Mode changes while the OSK is open reset both layouts.
+- One simple QWERTY layout: D-pad focus, Cross type.
+- Triangle backspace, Square symbols, Options enter, Circle close.
+- There is no OSK mode setting and no debug mode override.
+- The DQ/Grid sections below are historical.
 
-### Dual QWERTY layout
+### Historical: Dual QWERTY layout
 
 Split QWERTY. Each half keeps a persistent cursor; the left stick moves the
 left cursor and the right stick moves the right cursor.
@@ -704,16 +705,17 @@ Replay/pixel QA:
   uniform-render guard.
 - New action QA — L1/R1/Options fire back/forward/reload; enabled state
   respected; no hold/hints.
-- System OSK QA — first Cross on a page field opens; DQ types from both halves;
-  Grid fallback via `SDSC_OSK_MODE=grid`; mouse/keyboard close + hand-off;
-  `qa_osk_visual.py` screenshots the overlay and asserts both halves/cursors.
+- System OSK QA — first Cross on a page field opens; D-pad focus + Cross
+  typing; Triangle/Square/Options/Circle; mouse/keyboard close + hand-off;
+  `qa_osk_visual.py` screenshots the overlay and asserts the full-width card
+  and focused-key highlight.
 - Idle-redraw QA — `qa_idle_redraw.py` opens Browser+OSK / toast / Launcher /
   Browser with `SDSC_DEBUG_REDRAW=1` and asserts no pad-driven global traffic
   or OSK repaint at rest, no resting `ToastFrame`, no idle `LauncherFrame`, and
   no idle `BrowserFrame`.
 - Non-browser OSK QA — Launcher Settings Title/Args editing; save/add path.
-- Manual controller playtest for DQ cursor feel, overlay z-order, no-activate
-  focus, Home/OSK interaction.
+- Manual controller playtest for QWERTY focus feel, overlay z-order,
+  no-activate focus, Home/OSK interaction.
 
 ---
 
@@ -742,7 +744,7 @@ Current touch points:
 
 Likely new modules:
 
-- `src/ui/osk/` — system OSK state/layout/view (Dual QWERTY + Grid), no Browser
+- `src/ui/osk/` — system OSK state/layout/view (simple QWERTY), no Browser
   imports.
 - `src/app/osk.rs` — system OSK session/input/output/overlay lifecycle.
 - `src/app/actions.rs` or equivalent — semantic action manifest/mapping.
@@ -816,8 +818,8 @@ Phases A–C are complete when:
   hold/hints.
 - The OSK is system-owned and rendered as a topmost no-activate overlay, not a
   Browser component.
-- Dual QWERTY is the default mode; Grid fallback; System settings row; debug
-  override; mode persists; legacy `quadrant` prefs load as dual.
+- One simple QWERTY layout: D-pad focus, Cross type; Triangle backspace,
+  Square symbols, Options enter, Circle close. No mode setting.
 - Cross-only open, first Cross on a page field; real input closes; keyboard
   hand-off; F6/Square/Triangle→URL removed; static keys.
 - Page text sessions use the system OSK; no address prompt.

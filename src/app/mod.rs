@@ -1075,19 +1075,6 @@ impl App {
         #[cfg(debug_assertions)]
         let debug_tune = crate::ui::configure::DebugAmbientTune::default();
         let session = crate::session::DeviceSession::new(prefs, known, analytics);
-        #[cfg(debug_assertions)]
-        let session = {
-            let mut session = session;
-            if let Some(mode) = std::env::var("SDSC_OSK_MODE")
-                .ok()
-                .and_then(|value| crate::persist::prefs::OskMode::parse(&value))
-            {
-                // Debug/QA override only; never persisted.
-                session.prefs.osk_mode = mode;
-            }
-            session
-        };
-        let osk_mode = session.prefs.osk_mode;
         // Boot-only renderer prefs (iced Settings); a later change auto-restarts.
         let (renderer_boot_aa, renderer_boot_vsync) =
             (session.prefs.perf_antialiasing, session.prefs.perf_vsync);
@@ -1232,7 +1219,7 @@ impl App {
                 browser.dpad_stepper = NavStepper::with_profile(NavProfile::BROWSER_DPAD);
                 browser
             },
-            osk: osk::SystemOsk::new(osk_mode, osk_slot),
+            osk: osk::SystemOsk::new(osk_slot),
             install_policy: installs::AppInstallPolicy::new(install_limit),
             home_apps: home::HomeApps::new(),
             launcher_monitor_cover: None,

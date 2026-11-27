@@ -3,13 +3,9 @@
 
 #[cfg(debug_assertions)]
 use crate::domain::pad::PadSample;
-use crate::domain::pad::{
-    NavAction, NavHalf, NavProfile, OskInputSlot, PadAction, PadButton, PadButtonAction,
-};
-use crate::persist::prefs::OskMode;
+use crate::domain::pad::{NavAction, OskInputSlot, PadAction, PadButton, PadButtonAction};
 use crate::platform::ui_sound::UiSoundKind;
-use crate::ui::osk::dual::Half;
-use crate::ui::osk::grid::GridKey;
+use crate::ui::osk::qwerty::OskKey;
 use crate::ui::osk::{Dir, OskMessage, OskState, OskTarget, Output};
 use iced::{Point, Size, Task, window};
 use std::sync::Arc;
@@ -30,10 +26,10 @@ pub struct SystemOsk {
 }
 
 impl SystemOsk {
-    pub fn new(mode: OskMode, slot: Arc<OskInputSlot>) -> Self {
+    pub fn new(slot: Arc<OskInputSlot>) -> Self {
         Self {
             window: None,
-            state: OskState::new(mode),
+            state: OskState::new(),
             pending_show: false,
             cover: None,
             slot,
@@ -56,7 +52,7 @@ impl App {
         self.osk.nav_epoch = self.osk.nav_epoch.wrapping_add(1);
         crate::platform::trace::event(crate::platform::trace::Lane::Platform, "osk.open")
             .field("target", target.label())
-            .field("mode", self.osk.state.mode.label())
+            .field("mode", "qwerty")
             .emit();
         if self.osk.window.is_some() {
             return self.show_osk_window();
@@ -161,17 +157,6 @@ impl App {
         }
     }
 
-    pub(crate) fn set_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
-        if self.osk.state.mode == mode {
-            return Task::none();
-        }
-        self.osk.state.set_mode(mode);
-        if let Some(id) = self.osk.window {
-            return crate::ui::layout::invalidate_window(id);
-        }
-        Task::none()
-    }
-
     pub(crate) fn on_osk_window_closed(&mut self, id: window::Id) -> Task<Message> {
         if self.osk.window == Some(id) {
             self.osk.window = None;
@@ -255,51 +240,19 @@ impl App {
         close.chain(self.on_browser_raw_key(id, raw))
     }
 
-    /// Discrete step/commit from the pull-model OSK surface.
+    /// Discrete move from the pull-model OSK surface.
     pub(crate) fn on_osk_message(&mut self, message: OskMessage) -> Task<Message> {
+        let OskMessage::Move { pad, direction } = message;
         let previous_haptic = self.haptic_pad_serial.take();
-        let task = match message {
-            OskMessage::Step {
-                pad,
-                half,
-                direction,
-                phase,
-            } => {
-                let Some(direction) = nav_dir(direction) else {
-                    self.haptic_pad_serial = previous_haptic;
-                    return Task::none();
-                };
-                self.set_haptic_pad_from_id(Some(&pad));
-                self.osk.state.dual_move(to_half(half), direction);
-                let feedback = match phase {
-                    crate::domain::pad::NavPhase::First => NavProfile::MENU.step_feedback,
-                    crate::domain::pad::NavPhase::Repeat => NavProfile::MENU.repeat_feedback,
-                    crate::domain::pad::NavPhase::Release => false,
-                };
-                if feedback {
-                    self.play_ui_cue(UiSoundKind::Nav);
-                }
-                Task::none()
-            }
-            OskMessage::Commit { pad, half } => {
-                self.set_haptic_pad_from_id(Some(&pad));
-                self.play_ui_cue(UiSoundKind::Action);
-                let key = self.osk.state.dual_key(to_half(half));
-                self.apply_osk_output(Output::Text(key))
-            }
-            OskMessage::GridStep { pad, direction } => {
-                let Some(direction) = nav_dir(direction) else {
-                    self.haptic_pad_serial = previous_haptic;
-                    return Task::none();
-                };
-                self.set_haptic_pad_from_id(Some(&pad));
-                self.osk.state.grid_move(direction);
-                self.play_ui_cue(UiSoundKind::Nav);
-                Task::none()
-            }
+        let Some(direction) = nav_dir(direction) else {
+            self.haptic_pad_serial = previous_haptic;
+            return Task::none();
         };
+        self.set_haptic_pad_from_id(Some(&pad));
+        self.osk.state.move_focus(direction);
+        self.play_ui_cue(UiSoundKind::Nav);
         self.haptic_pad_serial = previous_haptic;
-        task
+        Task::none()
     }
 
     /// Source-side taps while the OSK owns the pad. Analog movement is handled
@@ -317,16 +270,13 @@ impl App {
         let mut outputs: Vec<Output> = Vec::new();
         let mut close = false;
         match action.button {
-            PadButton::Cross => match self.osk.state.mode {
-                OskMode::Dual => outputs.push(Output::Space),
-                OskMode::Grid => match self.osk.state.grid_key() {
-                    GridKey::Char(ch) => outputs.push(Output::Text(ch)),
-                    GridKey::Space => outputs.push(Output::Space),
-                    GridKey::Backspace => outputs.push(Output::Backspace),
-                    GridKey::Enter => outputs.push(Output::Enter),
-                    GridKey::Layer => self.osk.state.toggle_layer(),
-                    GridKey::Close => close = true,
-                },
+            PadButton::Cross => match self.osk.state.key() {
+                OskKey::Char(ch) => outputs.push(Output::Text(ch)),
+                OskKey::Space => outputs.push(Output::Space),
+                OskKey::Backspace => outputs.push(Output::Backspace),
+                OskKey::Enter => outputs.push(Output::Enter),
+                OskKey::Layer => self.osk.state.toggle_layer(),
+                OskKey::Close => close = true,
             },
             PadButton::Triangle => outputs.push(Output::Backspace),
             PadButton::Square => self.osk.state.toggle_layer(),
@@ -429,10 +379,13 @@ impl App {
     /// else the Browser cursor stepper (one complete press/release).
     #[cfg(debug_assertions)]
     pub(crate) fn replay_pad_dir(&mut self, action: NavAction) -> Task<Message> {
+        if self.osk.state.open {
+            return self.replay_osk_dir(action);
+        }
         if self.launcher_state.manual_add.is_some() {
             return self.on_manual_add_pad_action(action);
         }
-        if self.home_visible || self.osk.state.open || !self.browser_visible {
+        if self.home_visible || !self.browser_visible {
             return Task::none();
         }
         let (up, down, left, right) = match action {
@@ -466,55 +419,19 @@ impl App {
         jump.chain(reset)
     }
 
-    /// Debug replay: feed one split-stick sample through the live DQ path.
-    /// Send a neutral step between same-direction moves so the stepper's
-    /// release grace can reset, exactly like a real stick.
+    /// Debug replay: one D-pad press/release through the pull-model OSK slot.
+    /// A neutral frame first arms the nav bank, then the press moves focus and
+    /// the release resets the stepper for the next step.
     #[cfg(debug_assertions)]
-    pub(crate) fn replay_osk_stick(
-        &mut self,
-        left: (f32, f32),
-        right: (f32, f32),
-    ) -> Task<Message> {
+    fn replay_osk_dir(&mut self, action: NavAction) -> Task<Message> {
         if !self.osk.state.open {
             return Task::none();
         }
-        let mut sample = PadSample {
-            lstick_x: left.0,
-            lstick_y: left.1,
-            rstick_x: right.0,
-            rstick_y: right.1,
-            ..PadSample::default()
-        };
-        sample.stick_x = sample.lstick_x;
-        sample.stick_y = sample.lstick_y;
-        let pad = crate::domain::pad::PadId("replay".into());
-        let neutral = crate::ui::launcher::input::NavReading {
-            id: pad.clone(),
-            sample: PadSample::default(),
-            source: "replay",
-        };
-        let reading = crate::ui::launcher::input::NavReading {
-            id: pad,
-            sample,
-            source: "replay",
-        };
-        self.osk.slot.push_replay(vec![neutral]);
-        self.osk.slot.push_replay(vec![reading]);
-        Task::none()
-    }
-
-    /// Debug replay: press/release one trigger (or both) so DQ commits through
-    /// the real edge latch. Release in the same step keeps the next synthetic
-    /// press independent.
-    #[cfg(debug_assertions)]
-    pub(crate) fn replay_osk_trigger(&mut self, side: &str) -> Task<Message> {
-        if !self.osk.state.open {
-            return Task::none();
-        }
-        let (l2, r2) = match side {
-            "left" => (true, false),
-            "right" => (false, true),
-            "both" => (true, true),
+        let (up, down, left, right) = match action {
+            NavAction::Up => (true, false, false, false),
+            NavAction::Down => (false, true, false, false),
+            NavAction::Left => (false, false, true, false),
+            NavAction::Right => (false, false, false, true),
             _ => return Task::none(),
         };
         let pad = crate::domain::pad::PadId("replay".into());
@@ -526,8 +443,10 @@ impl App {
         let press = crate::ui::launcher::input::NavReading {
             id: pad.clone(),
             sample: PadSample {
-                l2,
-                r2,
+                dpad_up: up,
+                dpad_down: down,
+                dpad_left: left,
+                dpad_right: right,
                 ..PadSample::default()
             },
             source: "replay",
@@ -540,7 +459,10 @@ impl App {
         self.osk.slot.push_replay(vec![neutral]);
         self.osk.slot.push_replay(vec![press]);
         self.osk.slot.push_replay(vec![release]);
-        Task::none()
+        self.osk
+            .window
+            .map(crate::ui::layout::invalidate_window)
+            .unwrap_or_else(Task::none)
     }
 
     /// Debug replay: inject one source-side tap through the live owner (OSK
@@ -587,14 +509,7 @@ impl App {
     }
 }
 
-/// Map a shared nav half to the DQ layout half.
-fn to_half(nav: NavHalf) -> Half {
-    match nav {
-        NavHalf::Left => Half::Left,
-        NavHalf::Right => Half::Right,
-    }
-}
-
+/// Map a shared nav action to an OSK direction.
 fn nav_dir(action: NavAction) -> Option<Dir> {
     match action {
         NavAction::Up => Some(Dir::Up),

@@ -21,7 +21,7 @@ use crate::games::process_match::RunningSession;
 use crate::games::steam::SteamGame;
 use crate::games::{self, GamesCatalog, launch, process_match, steam};
 use crate::persist::prefs::{
-    HomeAutoOpen, LauncherSelectionMode, NavbarVisibility, OskMode, ReducedMotion,
+    HomeAutoOpen, LauncherSelectionMode, NavbarVisibility, ReducedMotion,
     clamp_launcher_idle_timeouts, clamp_launcher_inactive_dim_percent, renderer_restart_needed,
 };
 use crate::platform::app_log;
@@ -1705,34 +1705,11 @@ impl App {
                 let action = match step.params.get("dir").and_then(serde_json::Value::as_str) {
                     Some("up") => NavAction::Up,
                     Some("down") => NavAction::Down,
+                    Some("left") => NavAction::Left,
+                    Some("right") => NavAction::Right,
                     _ => return Task::none(),
                 };
                 self.replay_pad_dir(action)
-            }
-            "osk.stick" => {
-                let x = step
-                    .params
-                    .get("x")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                let y = step
-                    .params
-                    .get("y")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                let pair = (x, y);
-                match step.params.get("side").and_then(serde_json::Value::as_str) {
-                    Some("right") => self.replay_osk_stick((0.0, 0.0), pair),
-                    _ => self.replay_osk_stick(pair, (0.0, 0.0)),
-                }
-            }
-            "osk.trigger" => {
-                let side = step
-                    .params
-                    .get("side")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("left");
-                self.replay_osk_trigger(side)
             }
             "key" => {
                 let key = step
@@ -3200,15 +3177,6 @@ impl App {
         };
         let effects = self.session.reevaluate_start_presence(ctx);
         self.apply_session_effects(effects)
-    }
-
-    pub(crate) fn apply_osk_mode(&mut self, mode: OskMode) -> Task<Message> {
-        if self.session.prefs.osk_mode == mode {
-            return Task::none();
-        }
-        self.session.prefs.osk_mode = mode;
-        self.save_prefs();
-        self.set_osk_mode(mode)
     }
 
     /// Game-axis selection persistence master switch (drawer toggle +

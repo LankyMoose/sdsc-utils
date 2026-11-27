@@ -3,13 +3,12 @@
 
 The OSK is a separate window, so this asks the debug build for an overlay
 screenshot through replay and checks the actual rendered pixels. It catches
-the class of bug where the keyboard card is too narrow and only one half is
-visible; behavioural typing tests cannot see that.
+the class of bug where the keyboard card is too narrow and clips keys.
 
 Checks:
 - the opaque card spans the window width (not a one-third card);
-- the right half contains key ink, not just the left half;
-- both DQ cursors have accent highlights (alpha and symbol layers).
+- key ink is present on both the left and right sides of the QWERTY block;
+- the focused key has an accent highlight on the alpha and symbol layers.
 """
 
 from __future__ import annotations
@@ -150,8 +149,8 @@ def inspect(shot: Path, label: str) -> None:
     )
     if left_ink < 200 or right_ink < 200:
         raise ValueError(f"{label}: key ink missing from a keyboard half")
-    if left_accent < 20 or right_accent < 20:
-        raise ValueError(f"{label}: cursor highlight missing from a keyboard half")
+    if left_accent + right_accent < 20:
+        raise ValueError(f"{label}: focused-key highlight missing")
 
 
 def main() -> int:

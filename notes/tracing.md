@@ -129,17 +129,12 @@ synthetic input steps for automation:
   the live owner (OSK first, then Browser/Launcher manual form).
 - `pad.dir` — `{"dir": "down"}` moves pad focus in a form/OSK (no tap), or
   fires one complete Browser D-pad cursor nudge (press + release) when the
-  Browser owns the pad.
-- `osk.stick` — `{"side": "left", "x": 0.65, "y": 0}` feeds the live Dual
-  QWERTY stick path and moves that half's cursor. Send a zero sample before a
-  same-direction move so the stepper's release grace can reset.
-- `osk.trigger` — `{"side": "left"|"right"|"both"}` presses and releases L2/R2
-  through the real trigger latch; `scripts/qa_browser_osk.py` types from both
-  halves this way.
+  Browser owns the pad. While the system OSK is open it queues a synthetic
+  D-pad press/release for the pull-model keyboard.
 - `osk.open` / `osk.close` — debug-only direct system-OSK open/close for QA.
 - `osk.screenshot` — debug-only one-shot capture of the OSK overlay window to
   `<data>/shots/osk-shot-*.png`; the screenshot keeps window alpha so pixel QA
-  can prove the full card and both cursor highlights are rendered.
+  can prove the full card and focused-key highlight are rendered.
 - `wait` — debug-only no-op settle step; invalidates the Browser so a
   just-committed navigation/URL edit presents before the next screenshot.
 - `screenshot` — debug-only one-shot capture to `<data>/shots` (no auto
@@ -184,10 +179,10 @@ session (Google-like search → result click → L1 back → Triangle URL edit �
 Circle close) with a screenshot and trace-state assertion at every step.
 `python scripts/qa_browser_actions.py` fires L1/R1/Options and checks
 `app.action` enabled-state/back/forward/reload. `python
-scripts/qa_browser_osk.py` exercises the system OSK in Dual QWERTY and Grid
-modes (first Cross open, both-half typing, symbols, Options enter,
-keyboard/mouse close). `python scripts/qa_osk_visual.py` captures the actual
-overlay window and asserts the full-width card plus both cursor highlights.
+scripts/qa_browser_osk.py` exercises the system OSK (first Cross open, D-pad
+focus movement, typing, symbols, Options enter, keyboard/mouse close).
+`python scripts/qa_osk_visual.py` captures the actual
+overlay window and asserts the full-width card plus the focused-key highlight.
 `python scripts/qa_launcher_osk.py` is the non-browser proof: Add shortcut
 Title/Arguments editing and the Options/Enter save path.
 
