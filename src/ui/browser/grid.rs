@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::browser::cursor::JumpDir;
 use crate::browser::engine::TabId;
 use crate::browser::frame_slot::FrameSlot;
 use crate::ui::browser::view::BrowserMessage;
@@ -201,6 +202,11 @@ pub struct GridState {
     pub row_focus: GridFocus,
     pub anim: Option<GridAnim>,
     pub anim_generation: u64,
+    /// A stick is deflected (or a release is still inside its neutral grace):
+    /// the view ticker keeps presenting frames and publishes `GridTick` so the
+    /// app pulls focus repeat / right-stick scroll from the latest snapshot.
+    /// D-pad only stays on the edge stream.
+    pub nav_ticking: bool,
 }
 
 impl Default for GridState {
@@ -214,6 +220,7 @@ impl Default for GridState {
             row_focus: GridFocus::Plus,
             anim: None,
             anim_generation: 0,
+            nav_ticking: false,
         }
     }
 }
@@ -258,6 +265,7 @@ impl GridState {
         self.bookmark_scroll_x = 0.0;
         self.row_focus = self.focus;
         self.anim = None;
+        self.nav_ticking = false;
     }
 }
 
@@ -290,6 +298,92 @@ pub fn focus_after_close(visual: &[TabId], focus: GridFocus, closed: TabId) -> G
         }
     } else {
         focus
+    }
+}
+
+/// Result of one tabs-view focus move. `Rejected` means the direction cannot
+/// move focus from here (strip edge, bookmark-row edge, or empty bookmarks);
+/// callers cue only on `Moved`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridFocusOutcome {
+    Moved {
+        focus: GridFocus,
+        /// Row focus to store, or `None` when it does not change.
+        row_focus: Option<GridFocus>,
+    },
+    Rejected,
+}
+
+impl GridFocusOutcome {
+    pub fn moved(self) -> bool {
+        matches!(self, Self::Moved { .. })
+    }
+}
+
+/// Resolve one D-pad / left-stick focus move. `strip` is the frozen card order
+/// (`grid_tabs` ids); `visual` is the tracked strip used to restore row focus
+/// from the bookmark row. Pure: the caller applies focus/row focus and cues.
+pub fn move_focus(
+    dir: JumpDir,
+    focus: GridFocus,
+    row_focus: GridFocus,
+    visual: &[TabId],
+    strip: &[TabId],
+    bookmark_count: usize,
+) -> GridFocusOutcome {
+    let count = strip.len() + 1;
+    let slot = match focus {
+        GridFocus::Plus | GridFocus::Bookmark(_) => 0,
+        GridFocus::Tab(id) => strip
+            .iter()
+            .position(|tab| *tab == id)
+            .map(|index| index + 1)
+            .unwrap_or(0),
+    };
+    let next = match focus {
+        GridFocus::Bookmark(current) => match dir {
+            JumpDir::Left if current > 0 => GridFocus::Bookmark(current - 1),
+            JumpDir::Right if current + 1 < bookmark_count => GridFocus::Bookmark(current + 1),
+            JumpDir::Up => match row_focus {
+                GridFocus::Tab(id) if visual.contains(&id) => GridFocus::Tab(id),
+                GridFocus::Plus => GridFocus::Plus,
+                _ => visual
+                    .first()
+                    .copied()
+                    .map(GridFocus::Tab)
+                    .unwrap_or(GridFocus::Plus),
+            },
+            _ => focus,
+        },
+        GridFocus::Plus | GridFocus::Tab(_) => match dir {
+            JumpDir::Left if slot > 0 => {
+                if slot == 1 {
+                    GridFocus::Plus
+                } else {
+                    GridFocus::Tab(strip[slot - 2])
+                }
+            }
+            JumpDir::Right if slot + 1 < count => GridFocus::Tab(strip[slot]),
+            JumpDir::Down if bookmark_count > 0 => GridFocus::Bookmark(0),
+            _ => focus,
+        },
+    };
+    if next == focus {
+        return GridFocusOutcome::Rejected;
+    }
+    let row_focus = if matches!(next, GridFocus::Bookmark(_)) {
+        // Entering the bookmark row remembers the card to restore on Up.
+        if matches!(focus, GridFocus::Bookmark(_)) {
+            None
+        } else {
+            Some(focus)
+        }
+    } else {
+        Some(next)
+    };
+    GridFocusOutcome::Moved {
+        focus: next,
+        row_focus,
     }
 }
 
@@ -574,7 +668,7 @@ pub fn page_view<'a>(
         .height(Length::Fixed(layout.area_h))
         .clip(true)
         .into();
-    ticker(body, state.anim.is_some())
+    ticker(body, state.anim.is_some(), state.nav_ticking)
 }
 
 fn tabs_scroll_style(theme: &iced::Theme, status: scrollable::Status) -> scrollable::Style {
@@ -1609,16 +1703,26 @@ impl From<CardShell> for Element<'static, BrowserMessage> {
     }
 }
 
-/// App-level ticker wrapper: while a transition is live, ask for the next
-/// display frame after each present. No global subscription, no other windows
-/// rebuilt.
-fn ticker<'a>(content: Element<'a, BrowserMessage>, active: bool) -> Element<'a, BrowserMessage> {
-    GridTicker { content, active }.into()
+/// App-level ticker wrapper: while a transition is live, or a held stick keeps
+/// the tabs view navigating, ask for the next display frame after each
+/// present. No global subscription, no other windows rebuilt.
+fn ticker<'a>(
+    content: Element<'a, BrowserMessage>,
+    animating: bool,
+    nav: bool,
+) -> Element<'a, BrowserMessage> {
+    GridTicker {
+        content,
+        animating,
+        nav,
+    }
+    .into()
 }
 
 struct GridTicker<'a> {
     content: Element<'a, BrowserMessage>,
-    active: bool,
+    animating: bool,
+    nav: bool,
 }
 
 impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for GridTicker<'_> {
@@ -1664,16 +1768,25 @@ impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for GridTicker<'_> {
         shell: &mut iced::advanced::Shell<'_, BrowserMessage>,
         viewport: &Rectangle,
     ) {
-        if self.active && matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
-            #[cfg(debug_assertions)]
-            {
-                GRID_TICK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                note_grid_frame(Instant::now());
+        if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+            if self.animating {
+                #[cfg(debug_assertions)]
+                {
+                    GRID_TICK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_grid_frame(Instant::now());
+                }
+                // Present immediately on the next vsync. A fixed +16ms request
+                // lands just past the refresh often enough to alternate 16/32ms
+                // frames, which reads as a choppy FLIP.
+                crate::ui::pull::FrameDemand::Now.request(shell);
+            } else if self.nav {
+                // One pull-model nav step per presented frame. The handler
+                // reads the latest pad snapshot and returns another demanded
+                // frame while the stick stays deflected, so held repeats never
+                // depend on PadInput edges.
+                shell.publish(BrowserMessage::GridTick);
+                crate::ui::pull::FrameDemand::Now.request(shell);
             }
-            // Present immediately on the next vsync. A fixed +16ms request
-            // lands just past the refresh often enough to alternate 16/32ms
-            // frames, which reads as a choppy FLIP.
-            crate::ui::pull::FrameDemand::Now.request(shell);
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -1900,6 +2013,166 @@ mod tests {
         assert_eq!(
             focus_after_close(&ids, GridFocus::Plus, TabId(2)),
             GridFocus::Plus
+        );
+    }
+
+    #[test]
+    fn focus_moves_report_moved_or_rejected() {
+        let visual = [TabId(3), TabId(2)];
+        let strip = [TabId(3), TabId(2)];
+        assert_eq!(
+            move_focus(
+                JumpDir::Left,
+                GridFocus::Plus,
+                GridFocus::Plus,
+                &visual,
+                &strip,
+                0
+            ),
+            GridFocusOutcome::Rejected,
+            "the plus card is the strip start"
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Right,
+                GridFocus::Tab(TabId(2)),
+                GridFocus::Tab(TabId(2)),
+                &visual,
+                &strip,
+                0
+            ),
+            GridFocusOutcome::Rejected,
+            "the last card is the strip end"
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Right,
+                GridFocus::Plus,
+                GridFocus::Plus,
+                &visual,
+                &strip,
+                0
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Tab(TabId(3)),
+                row_focus: Some(GridFocus::Tab(TabId(3))),
+            }
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Left,
+                GridFocus::Tab(TabId(3)),
+                GridFocus::Tab(TabId(3)),
+                &visual,
+                &strip,
+                0
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Plus,
+                row_focus: Some(GridFocus::Plus),
+            }
+        );
+    }
+
+    #[test]
+    fn bookmark_left_right_share_the_focus_outcome() {
+        let visual = [TabId(1)];
+        let strip = [TabId(1)];
+        assert_eq!(
+            move_focus(
+                JumpDir::Left,
+                GridFocus::Bookmark(0),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                2
+            ),
+            GridFocusOutcome::Rejected
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Right,
+                GridFocus::Bookmark(0),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                2
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Bookmark(1),
+                row_focus: None,
+            }
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Right,
+                GridFocus::Bookmark(1),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                2
+            ),
+            GridFocusOutcome::Rejected
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Left,
+                GridFocus::Bookmark(1),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                2
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Bookmark(0),
+                row_focus: None,
+            }
+        );
+    }
+
+    #[test]
+    fn bookmark_row_remembers_the_card_to_restore() {
+        let visual = [TabId(1)];
+        let strip = [TabId(1)];
+        assert_eq!(
+            move_focus(
+                JumpDir::Down,
+                GridFocus::Tab(TabId(1)),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                1
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Bookmark(0),
+                row_focus: Some(GridFocus::Tab(TabId(1))),
+            }
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Up,
+                GridFocus::Bookmark(0),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                1
+            ),
+            GridFocusOutcome::Moved {
+                focus: GridFocus::Tab(TabId(1)),
+                row_focus: Some(GridFocus::Tab(TabId(1))),
+            }
+        );
+        assert_eq!(
+            move_focus(
+                JumpDir::Down,
+                GridFocus::Tab(TabId(1)),
+                GridFocus::Tab(TabId(1)),
+                &visual,
+                &strip,
+                0
+            ),
+            GridFocusOutcome::Rejected,
+            "an empty bookmark row rejects Down"
         );
     }
 

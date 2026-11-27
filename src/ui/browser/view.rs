@@ -62,6 +62,8 @@ pub enum BrowserMessage {
     GridAnimDone(u64),
     /// One frame of the cards-view FLIP; also applies a pending strip offset.
     GridLayoutFrame,
+    /// Pull-model tabs-view nav tick (held stick focus repeat / scroll).
+    GridTick,
     /// Horizontal tab-strip offset changed.
     TabsScrolled(f32),
     /// Track the bookmark strip offset for focus chasing.
@@ -90,6 +92,7 @@ impl BrowserMessage {
             Self::Scrolled(_)
             | Self::GridAnimDone(_)
             | Self::GridLayoutFrame
+            | Self::GridTick
             | Self::TabsScrolled(_)
             | Self::BookmarksScrolled(_) => None,
             Self::ToggleGrid => Some("browser.grid.toggle"),

@@ -10,6 +10,11 @@ use crate::persist::prefs::{clamp_ui_haptics_strength, clamp_ui_sound_volume};
 use crate::platform::ui_sound::UiSoundKind;
 use iced::Task;
 
+/// Debug-only tally of cues actually emitted, read by replay QA to prove a
+/// single action cannot double-sound.
+#[cfg(debug_assertions)]
+static UI_CUE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl App {
     pub(crate) fn play_ui_sound(&self, kind: UiSoundKind) {
         if !self.session.prefs.ui_sounds_enabled {
@@ -21,8 +26,16 @@ impl App {
 
     /// Sound + optional pad haptic for a UI cue.
     pub(crate) fn play_ui_cue(&self, kind: UiSoundKind) {
+        #[cfg(debug_assertions)]
+        UI_CUE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.play_ui_sound(kind);
         self.play_ui_haptic(kind);
+    }
+
+    /// Monotonic count of emitted cues (debug QA only).
+    #[cfg(debug_assertions)]
+    pub(crate) fn ui_cue_count() -> u64 {
+        UI_CUE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn play_ui_haptic(&self, kind: UiSoundKind) {

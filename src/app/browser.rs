@@ -188,6 +188,8 @@ pub struct BrowserAppState {
     /// repeat, neutral grace, arming) so the grid moves exactly like
     /// Launcher/Home/OSK.
     pub grid_nav: NavBank,
+    /// Frame pull + release grace for held tabs-view sticks.
+    pub grid_nav_clock: GridNavClock,
     /// First fresh Browser surface attempted the persisted-strip restore.
     /// The engine preloads the saved active URL at boot, so "session URL is
     /// empty" is not a usable freshness test on later opens.
@@ -206,6 +208,49 @@ use iced::Task;
 use std::time::Instant;
 
 use super::Message;
+
+/// Snapshot freshness for the tabs-view pull clock. A stale worker counts as
+/// neutral so a dropped pad cannot steer focus or scroll.
+const GRID_NAV_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Frame-demand clock for held tabs-view sticks.
+///
+/// A held stick keeps the grid ticker running; after release it keeps pulling
+/// neutral frames through the shared `NavBank` neutral grace so the next press
+/// starts as `First` instead of inheriting the old repeat schedule.
+#[derive(Debug, Default)]
+pub(crate) struct GridNavClock {
+    active: bool,
+    neutral_since: Option<Instant>,
+}
+
+impl GridNavClock {
+    /// Returns whether the grid ticker should keep presenting frames.
+    pub(crate) fn demand(&mut self, active: bool, now: Instant) -> bool {
+        if active {
+            self.active = true;
+            self.neutral_since = None;
+            return true;
+        }
+        if !self.active {
+            return false;
+        }
+        let since = *self.neutral_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < crate::domain::pad::NavProfile::MENU.neutral_grace
+        {
+            true
+        } else {
+            self.active = false;
+            self.neutral_since = None;
+            false
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.active = false;
+        self.neutral_since = None;
+    }
+}
 
 /// Silent result of closing the tabs view. The transition and its cue are
 /// separate: the caller emits the one cue when a close actually started.
@@ -297,6 +342,68 @@ fn grid_direction(
         return Some((dir, reading.id.clone()));
     }
     None
+}
+
+/// Whether a held stick should keep the tabs view pulling frames. Left stick
+/// must pass the shared MENU deadzone; right stick is already soft-scroll
+/// shaped upstream, so any nonzero deflection scrolls. D-pad only stays on the
+/// edge stream, so it never starts this clock.
+fn grid_stick_active(readings: &[crate::ui::launcher::input::NavReading]) -> bool {
+    use crate::domain::pad::NavProfile;
+    readings.iter().any(|reading| {
+        let (x, y) = NavProfile::MENU.shape_stick(reading.sample.lstick_x, reading.sample.lstick_y);
+        x != 0.0 || y != 0.0 || reading.sample.rstick_x != 0.0 || reading.sample.rstick_y != 0.0
+    })
+}
+
+/// One tabs-view nav bank advance from an absolute snapshot. Time owns the
+/// repeat schedule; no edge sequence is consulted, so a steady held stick
+/// keeps firing First then Repeat at the shared 280/90 cadence.
+fn grid_nav_move(
+    bank: &mut NavBank,
+    readings: &[crate::ui::launcher::input::NavReading],
+    now: Instant,
+) -> Option<(crate::browser::cursor::JumpDir, PadId)> {
+    use crate::browser::cursor::JumpDir;
+    let grid_readings = grid_nav_readings(readings);
+    let tick = bank.tick(
+        &grid_readings,
+        now,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let jump = match tick.action {
+        Some(NavAction::Up) => Some(JumpDir::Up),
+        Some(NavAction::Down) => Some(JumpDir::Down),
+        Some(NavAction::Left) => Some(JumpDir::Left),
+        Some(NavAction::Right) => Some(JumpDir::Right),
+        _ => None,
+    };
+    match (jump, tick.action_pad) {
+        (Some(jump), Some(pad)) => Some((jump, pad)),
+        _ => None,
+    }
+}
+
+/// Horizontal right-stick scroll delta for one frame, or `None` inside the
+/// scroll deadzone. Pure so the pull tick and edge path share one threshold.
+fn grid_scroll_dx(reading: &crate::ui::launcher::input::NavReading) -> Option<f32> {
+    if reading.sample.rstick_x.abs() <= 0.2 {
+        None
+    } else {
+        Some(reading.sample.rstick_x * 42.0)
+    }
+}
+
+/// The one cue a tabs-view focus move owns: accepted moves play `Nav`, edges
+/// reject silently.
+fn grid_move_cue(outcome: crate::ui::browser::grid::GridFocusOutcome) -> Option<UiSoundKind> {
+    outcome.moved().then_some(UiSoundKind::Nav)
 }
 
 const REPLAY_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -935,7 +1042,8 @@ impl super::App {
                     Some("right") => crate::browser::cursor::JumpDir::Right,
                     _ => return Task::none(),
                 };
-                self.browser_grid_move_focus(dir)
+                let (_outcome, task) = self.browser_grid_move_focus(dir);
+                task
             }
             "click" => {
                 let x = step.params.get("x").and_then(serde_json::Value::as_f64);
@@ -1032,9 +1140,17 @@ impl super::App {
                     && reading.sample.rstick_y == 0.0;
                 self.input_hub
                     .set_replay_reading((!neutral).then(|| reading.clone()));
-                self.input_hub
-                    .publish(vec![reading], crate::domain::pad::SnapshotReason::Sample);
-                self.invalidate_browser_window()
+                let meta = self.input_hub.publish(
+                    vec![reading.clone()],
+                    crate::domain::pad::SnapshotReason::Sample,
+                );
+                // Synthetic replay bypasses the quiet-mode PadInput gate (it
+                // is not OS input) but still runs the real edge reducer, so
+                // held-stick QA exercises the same frame-demand path as a pad.
+                let edge =
+                    crate::domain::pad::InputEdge::from_snapshot(vec![reading], Vec::new(), &meta);
+                self.on_pad_input(edge)
+                    .chain(self.invalidate_browser_window())
             }
             #[cfg(debug_assertions)]
             "pad.tap" => {
@@ -1812,6 +1928,18 @@ impl super::App {
         };
         self.browser.panel.cancel_url_edit();
         self.browser.panel.refresh_grid_visual();
+        // A stick already held when the grid opens must start the pull clock
+        // now; steady analog edges are filtered while the deflection holds.
+        let held = self.input_hub.latest_reading(GRID_NAV_MAX_AGE);
+        let stick_active = held
+            .as_ref()
+            .is_some_and(|reading| grid_stick_active(std::slice::from_ref(reading)));
+        self.browser.grid_nav_clock.reset();
+        let demand = self
+            .browser
+            .grid_nav_clock
+            .demand(stick_active, Instant::now());
+        self.browser.panel.grid.nav_ticking = demand;
         let tabs_count = self.browser.panel.grid.visual.len();
         let active = self.browser.panel.active_tab;
         let offset = self.reveal_grid_focus(GridFocus::Tab(active));
@@ -1909,8 +2037,10 @@ impl super::App {
                 let panel = &mut self.browser.panel;
                 panel.grid.mode = GridMode::Page;
                 panel.grid.anim = None;
+                panel.grid.nav_ticking = false;
                 pending = select.filter(|id| *id != panel.active_tab);
             }
+            self.browser.grid_nav_clock.reset();
             crate::platform::trace::event(
                 crate::platform::trace::Lane::Browser,
                 "browser.grid.close",
@@ -1998,15 +2128,34 @@ impl super::App {
                 crate::controller::hid::diag::diag_info("ui-diag: browser grid entered");
                 let scroll = self.apply_pending_grid_scroll();
                 if let Some((dir, pad)) = self.browser.pending_grid_move.take() {
+                    // Prime the bank with the still-held sample so the first
+                    // pull tick doesn't replay this buffered move as a second
+                    // First. A released stick falls back to the buffered move.
+                    let primed =
+                        self.input_hub
+                            .latest_reading(GRID_NAV_MAX_AGE)
+                            .and_then(|reading| {
+                                grid_nav_move(
+                                    &mut self.browser.grid_nav,
+                                    &[reading],
+                                    Instant::now(),
+                                )
+                            });
+                    let (dir, pad) = primed.unwrap_or((dir, pad));
                     self.set_haptic_pad_from_id(Some(&pad));
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    let (outcome, move_task) = self.browser_grid_move_focus(dir);
+                    if let Some(cue) = grid_move_cue(outcome) {
+                        self.play_ui_cue(cue);
+                    }
                     self.haptic_pad_serial = None;
-                    return scroll.chain(self.browser_grid_move_focus(dir));
+                    return scroll.chain(move_task);
                 }
                 scroll.chain(self.invalidate_browser_window())
             }
             GridMode::Leaving => {
                 self.browser.panel.grid.mode = GridMode::Page;
+                self.browser.panel.grid.nav_ticking = false;
+                self.browser.grid_nav_clock.reset();
                 self.browser.dpad_stepper.reset();
                 self.browser.grid_nav.reset();
                 self.browser.pending_grid_move = None;
@@ -2023,6 +2172,8 @@ impl super::App {
     pub(crate) fn settle_browser_grid_for_close(&mut self) {
         let panel = &mut self.browser.panel;
         panel.grid.anim = None;
+        panel.grid.nav_ticking = false;
+        self.browser.grid_nav_clock.reset();
         self.browser.dpad_stepper.reset();
         self.browser.grid_nav.reset();
         self.browser.pending_grid_move = None;
@@ -2104,11 +2255,19 @@ impl super::App {
         let focus = self.browser.panel.grid.focus;
         let next_focus =
             crate::ui::browser::grid::focus_after_close(&self.browser.panel.grid.visual, focus, id);
-        // The close is silent; the outcome owns the single cue.
+        // The close is silent; the outcome owns the single cue. Measure the
+        // cue delta so replay QA can prove a close cannot double-sound.
+        #[cfg(debug_assertions)]
+        let cues_before = Self::ui_cue_count();
         let outcome = self.close_browser_tab(id);
         if let Some(kind) = Self::close_tab_cue(outcome) {
             self.play_ui_cue(kind);
         }
+        #[cfg(debug_assertions)]
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: browser tab close cues={}",
+            Self::ui_cue_count().saturating_sub(cues_before)
+        ));
         let panel = &mut self.browser.panel;
         panel.sync_grid_visual();
         panel.grid.focus = next_focus;
@@ -2252,84 +2411,43 @@ impl super::App {
     pub(crate) fn browser_grid_move_focus(
         &mut self,
         dir: crate::browser::cursor::JumpDir,
-    ) -> Task<Message> {
-        use crate::browser::cursor::JumpDir;
-        use crate::ui::browser::grid::{self, GridFocus};
+    ) -> (crate::ui::browser::grid::GridFocusOutcome, Task<Message>) {
+        use crate::ui::browser::grid::{self, GridFocus, GridFocusOutcome};
 
         if !self.browser.panel.grid.is_grid() || self.browser.panel.grid.animating() {
-            return Task::none();
+            return (GridFocusOutcome::Rejected, Task::none());
         }
         let panel = &self.browser.panel;
         let focus = panel.grid.focus;
-        let bookmark_count = panel.bookmarks.len();
         let visual = panel.grid.visual.clone();
         let tabs = grid::grid_tabs(panel, &visual);
-        let count = tabs.len() + 1;
-        let slot = match focus {
-            GridFocus::Plus | GridFocus::Bookmark(_) => 0,
-            GridFocus::Tab(id) => tabs
-                .iter()
-                .position(|tab| tab.id == id)
-                .map(|index| index + 1)
-                .unwrap_or(0),
+        let strip: Vec<crate::browser::engine::TabId> = tabs.iter().map(|tab| tab.id).collect();
+        let outcome = grid::move_focus(
+            dir,
+            focus,
+            panel.grid.row_focus,
+            &visual,
+            &strip,
+            panel.bookmarks.len(),
+        );
+        let GridFocusOutcome::Moved {
+            focus: next,
+            row_focus,
+        } = outcome
+        else {
+            return (outcome, Task::none());
         };
-        let mut next = focus;
-        match focus {
-            GridFocus::Bookmark(current) => match dir {
-                JumpDir::Left if current > 0 => {
-                    next = GridFocus::Bookmark(current - 1);
-                }
-                JumpDir::Right if current + 1 < bookmark_count => {
-                    next = GridFocus::Bookmark(current + 1);
-                }
-                JumpDir::Up => {
-                    next = match panel.grid.row_focus {
-                        GridFocus::Tab(id) if visual.contains(&id) => GridFocus::Tab(id),
-                        GridFocus::Plus => GridFocus::Plus,
-                        _ => visual
-                            .first()
-                            .copied()
-                            .map(GridFocus::Tab)
-                            .unwrap_or(GridFocus::Plus),
-                    };
-                }
-                _ => {}
-            },
-            GridFocus::Plus | GridFocus::Tab(_) => match dir {
-                JumpDir::Left if slot > 0 => {
-                    next = if slot == 1 {
-                        GridFocus::Plus
-                    } else {
-                        GridFocus::Tab(tabs[slot - 2].id)
-                    };
-                }
-                JumpDir::Right if slot + 1 < count => {
-                    next = GridFocus::Tab(tabs[slot].id);
-                }
-                JumpDir::Down if bookmark_count > 0 => {
-                    next = GridFocus::Bookmark(0);
-                }
-                _ => {}
-            },
-        }
-        if next == focus {
-            return Task::none();
-        }
-        let entering_bookmarks =
-            matches!(next, GridFocus::Bookmark(_)) && !matches!(focus, GridFocus::Bookmark(_));
         self.browser.panel.grid.focus = next;
-        if entering_bookmarks {
-            self.browser.panel.grid.row_focus = focus;
-        } else if !matches!(next, GridFocus::Bookmark(_)) {
-            self.browser.panel.grid.row_focus = next;
+        if let Some(row_focus) = row_focus {
+            self.browser.panel.grid.row_focus = row_focus;
         }
-        // The pad path owns the cue (`on_browser_grid_pad`); keeping one here
-        // too made every D-pad focus move play sound/haptics twice.
+        // Callers own the one cue and emit it only for `Moved`
+        // (`grid_move_cue`); rejected edges stay silent.
         let scroll = match next {
             GridFocus::Bookmark(index) => self.grid_scroll_to_bookmark(index),
             _ => self.scroll_grid_focus_into_view(),
         };
-        scroll.chain(self.invalidate_browser_window())
+        (outcome, scroll.chain(self.invalidate_browser_window()))
     }
 
     fn grid_scroll_to_bookmark(&mut self, index: usize) -> Task<Message> {
@@ -2358,6 +2476,37 @@ impl super::App {
         )
     }
 
+    /// One pull-model tabs-view tick while a stick is held. The latest HID
+    /// snapshot drives both the focus bank (First/Repeat on wall clock) and
+    /// the right-stick scroll; PadInput edges never infer repeats.
+    pub(crate) fn browser_grid_tick(&mut self) -> Task<Message> {
+        if !self.browser.panel.grid.is_grid() || self.browser.panel.grid.animating() {
+            return Task::none();
+        }
+        let now = Instant::now();
+        let latest = self.input_hub.latest_reading(GRID_NAV_MAX_AGE);
+        let active = latest
+            .as_ref()
+            .is_some_and(|reading| grid_stick_active(std::slice::from_ref(reading)));
+        self.sync_grid_nav_demand(active);
+        let readings = latest.as_slice();
+        let previous_haptic = self.haptic_pad_serial.take();
+        let mut task = Task::none();
+        // Always advance the bank, including the release frame that turns the
+        // ticker off, so its neutral grace resets repeat gating.
+        if let Some((jump, pad)) = grid_nav_move(&mut self.browser.grid_nav, readings, now) {
+            self.set_haptic_pad_from_id(Some(&pad));
+            let (outcome, move_task) = self.browser_grid_move_focus(jump);
+            if let Some(cue) = grid_move_cue(outcome) {
+                self.play_ui_cue(cue);
+            }
+            task = task.chain(move_task);
+        }
+        task = task.chain(self.browser_grid_scroll_from_pad(readings));
+        self.haptic_pad_serial = previous_haptic;
+        task
+    }
+
     pub(crate) fn browser_grid_scroll_from_pad(
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
@@ -2368,9 +2517,9 @@ impl super::App {
         let Some(reading) = crate::domain::pad::preferred_reading(readings) else {
             return Task::none();
         };
-        if reading.sample.rstick_x.abs() <= 0.2 {
+        let Some(dx) = grid_scroll_dx(reading) else {
             return Task::none();
-        }
+        };
         let target = match self.browser.panel.grid.focus {
             crate::ui::browser::grid::GridFocus::Bookmark(_) => {
                 crate::ui::browser::grid::bookmark_scroll_id()
@@ -2379,10 +2528,7 @@ impl super::App {
         };
         iced::widget::operation::scroll_by(
             target,
-            iced::widget::operation::AbsoluteOffset {
-                x: reading.sample.rstick_x * 42.0,
-                y: 0.0,
-            },
+            iced::widget::operation::AbsoluteOffset { x: dx, y: 0.0 },
         )
     }
 
@@ -2418,6 +2564,7 @@ impl super::App {
             BrowserMessage::GridLayoutFrame => self
                 .apply_pending_grid_scroll()
                 .chain(self.invalidate_browser_window()),
+            BrowserMessage::GridTick => self.browser_grid_tick(),
             BrowserMessage::TabsScrolled(x) => {
                 self.browser.panel.grid.tab_scroll_x = x.max(0.0);
                 Task::none()
@@ -3068,15 +3215,27 @@ impl super::App {
         }
     }
 
-    /// Grid-mode pad routing. D-pad moves card focus, right stick scrolls the
-    /// grid / bookmark strip, and face taps map to card actions. Page input is
-    /// fully parked while the grid owns the surface.
+    /// Update the tabs-view frame pull for the current stick state. Returns
+    /// true when the pull just started, so the caller can kick one redraw
+    /// before the ticker owns the loop.
+    fn sync_grid_nav_demand(&mut self, active: bool) -> bool {
+        let now = Instant::now();
+        let was = self.browser.panel.grid.nav_ticking;
+        let keep = self.browser.grid_nav_clock.demand(active, now);
+        self.browser.panel.grid.nav_ticking = keep;
+        keep && !was
+    }
+
+    /// Grid-mode pad routing. D-pad edges move card focus; face taps map to
+    /// card actions. Held sticks are pulled by `browser_grid_tick`, not
+    /// inferred from these edges. Page input is fully parked while the grid
+    /// owns the surface.
     pub(crate) fn on_browser_grid_pad(
         &mut self,
         readings: &[crate::ui::launcher::input::NavReading],
         tap_actions: &[PadAction],
     ) -> Task<Message> {
-        use crate::browser::cursor::JumpDir;
+        let pull_started = self.sync_grid_nav_demand(grid_stick_active(readings));
         if self.browser.panel.grid.animating() {
             if self.browser.panel.grid.mode == crate::ui::browser::grid::GridMode::Entering
                 && let Some(mv) = grid_direction(readings)
@@ -3089,32 +3248,18 @@ impl super::App {
         let mut task = Task::none();
         if !readings.is_empty() {
             // Run the shared per-pad bank, not a bare stepper: it supplies the
-            // MENU arming/neutral grace and per-pad repeat.
-            let grid_readings = grid_nav_readings(readings);
-            let tick = self.browser.grid_nav.tick(
-                &grid_readings,
-                std::time::Instant::now(),
-                true,
-                true,
-                false,
-                false,
-                false,
-                false,
-                false,
-            );
-            if let Some(pad) = tick.action_pad.as_ref() {
-                self.set_haptic_pad_from_id(Some(pad));
-            }
-            let jump = match tick.action {
-                Some(NavAction::Up) => Some(JumpDir::Up),
-                Some(NavAction::Down) => Some(JumpDir::Down),
-                Some(NavAction::Left) => Some(JumpDir::Left),
-                Some(NavAction::Right) => Some(JumpDir::Right),
-                _ => None,
-            };
-            if let Some(jump) = jump {
-                self.play_ui_cue(UiSoundKind::Nav);
-                task = task.chain(self.browser_grid_move_focus(jump));
+            // MENU arming/neutral grace and per-pad repeat. Digital D-pad
+            // frames stay on this edge path; held sticks also continue here
+            // until the pull tick takes over.
+            if let Some((jump, pad)) =
+                grid_nav_move(&mut self.browser.grid_nav, readings, Instant::now())
+            {
+                self.set_haptic_pad_from_id(Some(&pad));
+                let (outcome, move_task) = self.browser_grid_move_focus(jump);
+                if let Some(cue) = grid_move_cue(outcome) {
+                    self.play_ui_cue(cue);
+                }
+                task = task.chain(move_task);
             }
         }
         let button = tap_actions
@@ -3133,7 +3278,11 @@ impl super::App {
             };
             task = task.chain(action);
         }
-        task = task.chain(self.browser_grid_scroll_from_pad(readings));
+        if pull_started {
+            // The first held-stick edge only flips the pull flag; present once
+            // so the ticker can publish its first `GridTick`.
+            task = task.chain(self.invalidate_browser_window());
+        }
         self.haptic_pad_serial = previous_haptic;
         task
     }
@@ -4155,6 +4304,179 @@ mod tests {
             "the right stick scrolls bookmarks, never card focus"
         );
         assert!(shaped[0].sample.dpad_left, "D-pad still drives focus");
+    }
+
+    #[test]
+    fn held_stick_first_and_repeat_come_from_snapshot_ticks() {
+        use crate::browser::cursor::JumpDir;
+        use crate::domain::pad::{PadSample, hid_nav_reading};
+        let firm = hid_nav_reading(
+            "hid:a",
+            PadSample {
+                lstick_x: 0.95,
+                ..PadSample::default()
+            },
+        );
+        let mut bank = NavBank::default();
+        bank.prepare_on_open(true);
+        let t0 = Instant::now();
+        assert_eq!(
+            grid_nav_move(&mut bank, std::slice::from_ref(&firm), t0).map(|(dir, _)| dir),
+            Some(JumpDir::Right),
+            "the first presented frame moves once"
+        );
+        assert_eq!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&firm),
+                t0 + std::time::Duration::from_millis(100)
+            ),
+            None,
+            "inside the initial delay a held stick repeats nothing"
+        );
+        assert_eq!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&firm),
+                t0 + std::time::Duration::from_millis(280)
+            )
+            .map(|(dir, _)| dir),
+            Some(JumpDir::Right),
+            "the held stick repeats at 280ms"
+        );
+        assert_eq!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&firm),
+                t0 + std::time::Duration::from_millis(370)
+            )
+            .map(|(dir, _)| dir),
+            Some(JumpDir::Right),
+            "then every 90ms"
+        );
+    }
+
+    #[test]
+    fn released_stick_stops_after_the_neutral_grace() {
+        use crate::domain::pad::{PadSample, hid_nav_reading};
+        let firm = hid_nav_reading(
+            "hid:a",
+            PadSample {
+                lstick_x: 0.95,
+                ..PadSample::default()
+            },
+        );
+        let neutral = hid_nav_reading("hid:a", PadSample::default());
+        let t0 = Instant::now();
+        let mut clock = GridNavClock::default();
+        let mut bank = NavBank::default();
+        bank.prepare_on_open(true);
+        assert!(clock.demand(true, t0));
+        assert!(grid_nav_move(&mut bank, std::slice::from_ref(&firm), t0).is_some());
+        let mut at = t0;
+        while clock.demand(false, at) {
+            assert_eq!(
+                grid_nav_move(&mut bank, std::slice::from_ref(&neutral), at),
+                None,
+                "a neutral snapshot never moves focus"
+            );
+            at += std::time::Duration::from_millis(16);
+        }
+        // The app still ticks the release frame that turns the clock off.
+        assert_eq!(
+            grid_nav_move(&mut bank, std::slice::from_ref(&neutral), at),
+            None
+        );
+        assert!(!clock.demand(false, at + std::time::Duration::from_millis(16)));
+        assert!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&firm),
+                at + std::time::Duration::from_millis(16)
+            )
+            .is_some(),
+            "a fresh press after release starts with First again"
+        );
+    }
+
+    #[test]
+    fn held_right_stick_scrolls_without_new_edges() {
+        use crate::domain::pad::{PadSample, hid_nav_reading};
+        let right = hid_nav_reading(
+            "hid:a",
+            PadSample {
+                rstick_x: 0.8,
+                ..PadSample::default()
+            },
+        );
+        let neutral = hid_nav_reading("hid:a", PadSample::default());
+        let dx = grid_scroll_dx(&right).expect("a deflected right stick scrolls");
+        assert!(dx > 0.0);
+        for _ in 0..4 {
+            assert_eq!(
+                grid_scroll_dx(&right),
+                Some(dx),
+                "the same held snapshot scrolls on every tick"
+            );
+        }
+        assert_eq!(grid_scroll_dx(&neutral), None);
+        assert!(grid_stick_active(std::slice::from_ref(&right)));
+        assert!(!grid_stick_active(std::slice::from_ref(&neutral)));
+    }
+
+    #[test]
+    fn dpad_stays_on_the_edge_stream() {
+        use crate::browser::cursor::JumpDir;
+        use crate::domain::pad::{PadSample, hid_nav_reading};
+        let dpad = hid_nav_reading(
+            "hid:a",
+            PadSample {
+                dpad_right: true,
+                ..PadSample::default()
+            },
+        );
+        assert!(
+            !grid_stick_active(std::slice::from_ref(&dpad)),
+            "D-pad must not start the pull ticker"
+        );
+        let mut bank = NavBank::default();
+        bank.prepare_on_open(true);
+        let t0 = Instant::now();
+        assert_eq!(
+            grid_nav_move(&mut bank, std::slice::from_ref(&dpad), t0).map(|(dir, _)| dir),
+            Some(JumpDir::Right)
+        );
+        assert_eq!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&dpad),
+                t0 + std::time::Duration::from_millis(279)
+            ),
+            None
+        );
+        assert_eq!(
+            grid_nav_move(
+                &mut bank,
+                std::slice::from_ref(&dpad),
+                t0 + std::time::Duration::from_millis(280)
+            )
+            .map(|(dir, _)| dir),
+            Some(JumpDir::Right),
+            "D-pad keeps the shared 280ms repeat"
+        );
+    }
+
+    #[test]
+    fn rejected_grid_moves_do_not_cue() {
+        use crate::ui::browser::grid::{GridFocus, GridFocusOutcome};
+        assert_eq!(grid_move_cue(GridFocusOutcome::Rejected), None);
+        assert_eq!(
+            grid_move_cue(GridFocusOutcome::Moved {
+                focus: GridFocus::Plus,
+                row_focus: Some(GridFocus::Plus),
+            }),
+            Some(UiSoundKind::Nav)
+        );
     }
 
     #[test]
