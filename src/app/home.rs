@@ -782,7 +782,7 @@ impl App {
                 } else if self.home_state.settings_open {
                     if self.home_state.settings_menu_open() {
                         self.home_state.close_settings_menu();
-                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.apply_nav_cue(NavCue::Nav);
                     } else {
                         self.home_state.close_settings();
                     }

@@ -10,7 +10,6 @@ use crate::domain::navigation::{ActionOutcome, NavCue};
 use crate::domain::pad::{
     NavAction, NavBank, NavStepper, PadAction, PadButton, PadButtonAction, PadId,
 };
-use crate::platform::ui_sound::UiSoundKind;
 use crate::ui::browser::BrowserPanel;
 use std::path::PathBuf;
 
@@ -3165,7 +3164,7 @@ impl super::App {
         if engine_mode {
             if let Some((jump, pad)) = self.poll_browser_dpad_jump(readings, now) {
                 self.set_haptic_pad_from_id(Some(&pad));
-                self.play_ui_cue(UiSoundKind::Nav);
+                self.apply_nav_cue(NavCue::Nav);
                 self.browser.panel.jump_cursor(jump);
             }
             // R3 issue flag (R3 carries no NavAction).
@@ -3185,22 +3184,22 @@ impl super::App {
             } else {
                 match tick.action {
                     Some(NavAction::Up) => {
-                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.apply_nav_cue(NavCue::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Up);
                         self.invalidate_browser_window()
                     }
                     Some(NavAction::Down) => {
-                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.apply_nav_cue(NavCue::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Down);
                         self.invalidate_browser_window()
                     }
                     Some(NavAction::Left) => {
-                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.apply_nav_cue(NavCue::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Left);
                         self.invalidate_browser_window()
                     }
                     Some(NavAction::Right) => {
-                        self.play_ui_cue(UiSoundKind::Nav);
+                        self.apply_nav_cue(NavCue::Nav);
                         self.browser.panel.jump_cursor(JumpDir::Right);
                         self.invalidate_browser_window()
                     }
@@ -3212,7 +3211,9 @@ impl super::App {
                     // pad; in that case it cancels the edit first.
                     Some(NavAction::Cancel) => self.on_browser_circle(),
                     Some(NavAction::ToggleMagnetism) => {
-                        self.play_ui_cue(UiSoundKind::Action);
+                        self.apply_action_outcome(ActionOutcome::Accepted {
+                            cue: NavCue::Action,
+                        });
                         let magnet = !self.browser.panel.cursor.snapshot().magnet;
                         self.browser.panel.cursor.set_magnet(magnet);
                         crate::platform::app_log::info(format!(
@@ -3232,11 +3233,11 @@ impl super::App {
             }
             match tick.action {
                 Some(NavAction::Up) | Some(NavAction::Left) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     self.scroll_browser(-crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
                 Some(NavAction::Down) | Some(NavAction::Right) => {
-                    self.play_ui_cue(UiSoundKind::Nav);
+                    self.apply_nav_cue(NavCue::Nav);
                     self.scroll_browser(crate::ui::browser::view::BROWSER_SCROLL_STEP)
                 }
                 Some(NavAction::Confirm) => self.on_browser_go_default(),
@@ -4502,6 +4503,7 @@ mod tests {
     fn rejected_grid_moves_do_not_cue() {
         use crate::app::App;
         use crate::domain::navigation::{MoveOutcome, NavCue};
+        use crate::platform::ui_sound::UiSoundKind;
         assert_eq!(MoveOutcome::Rejected.cue(), None);
         assert_eq!(
             MoveOutcome::Moved { cue: NavCue::Nav }.cue(),
