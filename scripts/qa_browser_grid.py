@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -445,6 +446,26 @@ def main() -> int:
         if not cues_ok:
             print(
                 f"error: expected 2 tab-close cue tallies of 1, found {close_cues}",
+                file=sys.stderr,
+            )
+            return 1
+        # REV-1: every PS reveal must present the entrance pose, never the
+        # warmed window's final resting frame (alpha 1 / scale 1).
+        presents = [
+            line
+            for line in log_text.splitlines()
+            if "ui-diag: shell first present" in line
+        ]
+        alphas = [
+            float(match.group(1))
+            for line in presents
+            if (match := re.search(r"alpha=([0-9.]+)", line))
+        ]
+        pose_ok = bool(alphas) and all(alpha < 0.9 for alpha in alphas)
+        print(f"check first shell present is entrance pose: {'ok' if pose_ok else 'FAIL'}")
+        if not pose_ok:
+            print(
+                f"error: shell presented a resting pose first: {presents}",
                 file=sys.stderr,
             )
             return 1

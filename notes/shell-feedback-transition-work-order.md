@@ -1,7 +1,7 @@
 # Work order: shell feedback, transitions, backdrop, and reveal
 
-**Status:** landed — 2026-11-28. FB-1..4, TR-1, UI-1, UI-2, and REV-1 are in
-the source commit; this file is the follow-up docs commit.
+**Status:** landed — 2026-11-28. FB-1..4, TR-1, UI-1, UI-2, and REV-1 are
+implemented and validated; see the landed notes in §4.
 **Baseline:** `07ae2f3` (navigation dispatcher + outcome-based cues landed).
 **Scope:** feedback consistency for shell commits, Launcher→Home transition,
 Home settings dropdown overlay, shared-backdrop click semantics, and the PS
