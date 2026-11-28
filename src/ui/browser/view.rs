@@ -711,7 +711,6 @@ pub fn root_view(
                 anim,
                 header_rect.size(),
                 BROWSER_HEADER_TOTAL,
-                fade,
                 grid_mode,
                 page_card,
                 tabs.card,

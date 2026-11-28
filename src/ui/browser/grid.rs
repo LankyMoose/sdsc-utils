@@ -96,8 +96,6 @@ const BOOKMARK_GAP: f32 = 10.0;
 pub const BOOKMARK_CARD_W: f32 = 168.0;
 const BOOKMARK_CARD_H: f32 = 58.0;
 const CARD_TITLE_H: f32 = 34.0;
-/// Header enter/exit slide distance (positive = down from its resting row).
-const HEADER_SLIDE_PX: f32 = 22.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GridMode {
@@ -1113,28 +1111,23 @@ impl<'a> From<FlipPage<'a>> for Element<'a, BrowserMessage> {
 
 /// Draw-time header enter/exit curtain. The page header grows/shrinks with the
 /// page card on the same FLIP clock; leaving slides it up into place, entering
-/// reverses the slide as the page shrinks.
-///
-/// iced has no group-opacity primitive, so the fade is composited as a
-/// card-background quad at `1 - appear` over the header.
+/// reverses the slide as the page shrinks. The rest header row is the clip, so
+/// the slide reveals/hides the bar without a composited veil.
 struct HeaderCurtain<'a> {
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
     area: Size,
     header_h: f32,
-    fade: f32,
     mode: GridMode,
     page_card: Rectangle,
     tabs_card: Rectangle,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn header_curtain<'a>(
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
     area: Size,
     header_h: f32,
-    fade: f32,
     mode: GridMode,
     page_card: Rectangle,
     tabs_card: Rectangle,
@@ -1144,7 +1137,6 @@ pub fn header_curtain<'a>(
         anim,
         area,
         header_h,
-        fade: fade.clamp(0.0, 1.0),
         mode,
         page_card,
         tabs_card,
@@ -1154,8 +1146,8 @@ pub fn header_curtain<'a>(
 
 /// 0 = hidden, 1 = resting row. Leaving rises from below; entering drops back
 /// down on the reverse clock.
-fn header_offset(appear: f32) -> f32 {
-    (1.0 - appear.clamp(0.0, 1.0)) * HEADER_SLIDE_PX
+fn header_offset(appear: f32, distance: f32) -> f32 {
+    (1.0 - appear.clamp(0.0, 1.0)) * distance
 }
 
 impl HeaderCurtain<'_> {
@@ -1243,7 +1235,7 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         };
         let now = Instant::now();
         let appear = self.appear(now);
-        if appear <= 0.001 || self.fade <= 0.001 {
+        if appear <= 0.001 {
             return;
         }
         // The header rides the same card interpolation as the growing page.
@@ -1256,42 +1248,43 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         );
         let pad = crate::ui::browser::state::BROWSER_CARD_PAD;
         let target_w = (card.width - 2.0 * pad).max(1.0);
+        let target_h = self.header_h * target_w / self.area.width.max(1.0);
+        let rest = Rectangle::new(
+            iced::Point::new(card.x + pad, card.y + pad),
+            Size::new(target_w, target_h),
+        );
         let target = Rectangle::new(
-            iced::Point::new(card.x + pad, card.y + pad + header_offset(appear)),
-            Size::new(
-                target_w,
-                self.header_h * target_w / self.area.width.max(1.0),
-            ),
+            iced::Point::new(rest.x, rest.y + header_offset(appear, target_h)),
+            rest.size(),
         );
         let source = child_layout.bounds();
         let (scale, tx, ty) = flip_transform(source, target);
-        // Scale the whole header with the card instead of clipping it: nested
-        // widget layers would ignore a parent clip.
-        renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
-            renderer.with_transformation(Transformation::scale(scale), |renderer| {
-                self.content.as_widget().draw(
-                    &tree.children[0],
-                    renderer,
-                    theme,
-                    style,
-                    child_layout,
-                    cursor,
-                    viewport,
-                );
-            });
-        });
-        if appear < 0.999 {
+        // Clip to the resting header row: the bar translates within it, so the
+        // slide reveals/hides the real content without an overlay veil.
+        renderer.with_layer(rest, |renderer| {
+            // The bar carries its own opaque fill so the moving header never
+            // shows the grid through its URL row.
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: target,
                     ..renderer::Quad::default()
                 },
-                Background::Color(theme::alpha(
-                    theme::SHELL_PANEL,
-                    (1.0 - appear * appear) * self.fade,
-                )),
+                Background::Color(theme::SHELL_PANEL),
             );
-        }
+            renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
+                renderer.with_transformation(Transformation::scale(scale), |renderer| {
+                    self.content.as_widget().draw(
+                        &tree.children[0],
+                        renderer,
+                        theme,
+                        style,
+                        child_layout,
+                        cursor,
+                        viewport,
+                    );
+                });
+            });
+        });
     }
 
     fn mouse_interaction(
@@ -1940,13 +1933,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_slides_up_while_fading_in() {
-        assert_eq!(header_offset(1.0), 0.0);
+    fn header_slides_into_its_clip() {
+        let distance = 45.0;
+        assert_eq!(header_offset(1.0, distance), 0.0);
         assert!(
-            (header_offset(0.0) - HEADER_SLIDE_PX).abs() < 0.01,
-            "hidden header sits below its row"
+            (header_offset(0.0, distance) - distance).abs() < 0.01,
+            "hidden header sits fully below its resting row"
         );
-        assert!(header_offset(0.5) > header_offset(1.0));
+        assert!(header_offset(0.5, distance) > 0.0);
     }
 
     #[test]
