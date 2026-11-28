@@ -479,14 +479,10 @@ impl App {
     }
 
     /// A screen is now visible. If the backdrop is already up (a swap, or an
-    /// exit still in flight) hold it at full so the dim never dips; otherwise
-    /// start the delayed entrance fade.
+    /// exit still in flight) rise from the current alpha so the dim never
+    /// dips or snaps; otherwise start the delayed entrance fade.
     pub(crate) fn claim_shell_backdrop(&mut self, now: Instant) {
-        if self.shell_backdrop.alpha(now) > 0.01 {
-            self.shell_backdrop.hold_full();
-        } else {
-            self.shell_backdrop.enter(now);
-        }
+        self.shell_backdrop.raise(now);
     }
 
     /// Begin fading the shared backdrop for a hide-to-desktop transition.
@@ -585,10 +581,13 @@ impl App {
         };
         crate::controller::hid::diag::diag_info("ui-diag: home close");
         self.home_visible = false;
-        if !self.shell_opening && self.pending_shell_mode.is_none() {
+        // Only a pending in-place swap keeps the dim up. A dismiss (including
+        // one during the opening transition) fades it out so hide cannot snap
+        // a visible scrim to zero.
+        if self.pending_shell_mode.is_none() {
             self.begin_shell_backdrop_exit(now);
         } else {
-            self.shell_backdrop.hold_full();
+            self.shell_backdrop.raise(now);
         }
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);

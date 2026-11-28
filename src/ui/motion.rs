@@ -152,6 +152,12 @@ pub enum ShellBackdrop {
     Entering {
         started: Instant,
     },
+    /// The dim is already partly visible and a screen is claiming it again
+    /// (swap/resume). Rise to full from the current alpha; never snap.
+    Rising {
+        started: Instant,
+        from: f32,
+    },
     Full,
     Exiting {
         started: Instant,
@@ -165,6 +171,14 @@ impl ShellBackdrop {
             Self::Hidden => 0.0,
             Self::Entering { started } => {
                 shell_backdrop_alpha(started, now, crate::ui::theme::BACKDROP_ALPHA)
+            }
+            Self::Rising { started, from } => {
+                let t = progress_linear(
+                    now.saturating_duration_since(started).as_millis() as u64,
+                    BASE_MS,
+                );
+                let target = crate::ui::theme::BACKDROP_ALPHA;
+                from + (target - from) * ease_out_cubic(t)
             }
             Self::Full => crate::ui::theme::BACKDROP_ALPHA,
             Self::Exiting { started, from } => {
@@ -181,8 +195,19 @@ impl ShellBackdrop {
         *self = Self::Entering { started: now };
     }
 
-    pub fn hold_full(&mut self) {
-        *self = Self::Full;
+    /// Claim the shared dim for a new screen without a discontinuity. Hidden
+    /// starts the delayed entrance; a partial dim rises to full; full stays
+    /// full. This replaces the old hold-full snap (0 → target in one update).
+    pub fn raise(&mut self, now: Instant) {
+        let target = crate::ui::theme::BACKDROP_ALPHA;
+        let from = self.alpha(now);
+        if from >= target - 0.001 {
+            *self = Self::Full;
+        } else if from <= 0.01 {
+            self.enter(now);
+        } else {
+            *self = Self::Rising { started: now, from };
+        }
     }
 
     pub fn exit(&mut self, now: Instant) {
@@ -198,6 +223,9 @@ impl ShellBackdrop {
         match *self {
             Self::Hidden | Self::Full => false,
             Self::Entering { started } => !shell_backdrop_done(started, now),
+            Self::Rising { started, .. } => {
+                (now.saturating_duration_since(started).as_millis() as u64) < BASE_MS
+            }
             Self::Exiting { started, .. } => {
                 (now.saturating_duration_since(started).as_millis() as u64) < BASE_MS
             }
@@ -208,6 +236,9 @@ impl ShellBackdrop {
         match *self {
             Self::Hidden | Self::Full => true,
             Self::Entering { started } => shell_backdrop_done(started, now),
+            Self::Rising { started, .. } => {
+                now.saturating_duration_since(started).as_millis() as u64 >= BASE_MS
+            }
             Self::Exiting { started, .. } => {
                 now.saturating_duration_since(started).as_millis() as u64 >= BASE_MS
             }
@@ -438,6 +469,40 @@ mod shell_fade_tests {
     }
 
     #[test]
+    fn backdrop_raise_never_snaps() {
+        let t0 = Instant::now();
+        let claim_at = t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE / 2;
+        let mut backdrop = ShellBackdrop::Hidden;
+        backdrop.enter(t0);
+        let before = backdrop.alpha(claim_at);
+        assert!(before > 0.0 && before < crate::ui::theme::BACKDROP_ALPHA);
+        backdrop.raise(claim_at);
+        assert!(
+            (backdrop.alpha(claim_at) - before).abs() < 0.0001,
+            "raise must start at the current alpha, not snap to full"
+        );
+        let mid = backdrop.alpha(claim_at + Duration::from_millis(BASE_MS / 2));
+        assert!(
+            mid > before && mid < crate::ui::theme::BACKDROP_ALPHA,
+            "midpoint should keep rising smoothly: {mid}"
+        );
+        assert!(backdrop.animating(claim_at + Duration::from_millis(BASE_MS / 2)));
+        assert!(
+            (backdrop.alpha(claim_at + Duration::from_millis(BASE_MS))
+                - crate::ui::theme::BACKDROP_ALPHA)
+                .abs()
+                < 0.0001
+        );
+        // Hidden still starts the delayed entrance; Full stays settled.
+        let mut hidden = ShellBackdrop::Hidden;
+        hidden.raise(t0);
+        assert!(matches!(hidden, ShellBackdrop::Entering { .. }));
+        let mut full = ShellBackdrop::Full;
+        full.raise(t0);
+        assert_eq!(full, ShellBackdrop::Full);
+    }
+
+    #[test]
     fn shared_backdrop_holds_through_swaps_and_fades_only_for_desktop() {
         let t0 = Instant::now();
         let mut backdrop = ShellBackdrop::Hidden;
@@ -447,7 +512,7 @@ mod shell_fade_tests {
         assert!(mid > 0.0 && mid < crate::ui::theme::BACKDROP_ALPHA);
         assert!(backdrop.animating(t0 + SHELL_BACKDROP_DELAY));
         assert!(!backdrop.animating(t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE));
-        backdrop.hold_full();
+        backdrop.raise(t0 + SHELL_BACKDROP_DELAY + SHELL_BACKDROP_FADE / 2);
         assert_eq!(
             backdrop.alpha(t0 + Duration::from_secs(10)),
             crate::ui::theme::BACKDROP_ALPHA

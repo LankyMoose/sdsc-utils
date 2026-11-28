@@ -233,8 +233,8 @@ pub enum Message {
     WindowShowNow(window::Id),
     /// The shared shell HWND finished creating (renderer is up).
     ShellOpened(window::Id),
-    /// Shell is shown offscreen with the entrance pose; present it on the
-    /// monitor after one paint.
+    /// Shell is shown offscreen with the hidden/closed pose; present it on the
+    /// monitor after one post-arm paint, then start the entrance from zero.
     ShellPresent(window::Id, u64),
     /// Offscreen prime ran; arm the first-redraw reveal gate.
     ShellRevealArmed(window::Id, u64),
@@ -2402,7 +2402,8 @@ impl App {
                     }
                     if self.shell_backdrop.done(now) {
                         self.shell_backdrop = match self.shell_backdrop {
-                            crate::ui::motion::ShellBackdrop::Entering { .. } => {
+                            crate::ui::motion::ShellBackdrop::Entering { .. }
+                            | crate::ui::motion::ShellBackdrop::Rising { .. } => {
                                 crate::ui::motion::ShellBackdrop::Full
                             }
                             crate::ui::motion::ShellBackdrop::Exiting { .. } => {

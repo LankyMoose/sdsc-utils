@@ -122,17 +122,19 @@ impl App {
         }
         self.shell_reveal_armed = true;
         self.shell_reveal_started = Some(std::time::Instant::now());
-        // Only a view built after this point carries the entrance pose. The
-        // invalidation below builds one; the gate rejects every earlier draw.
+        // Only a view built after this point carries the hidden/entrance
+        // pose. The invalidation below builds one; the gate rejects every
+        // earlier draw. The entrance itself starts at first present, not here,
+        // so a slow first paint can never advance it to a settled pose.
         self.shell_reveal_arm_draw = self.shell_draw_epoch.get();
         crate::controller::hid::diag::diag_info(format!(
             "ui-diag: shell reveal armed generation={} draw_epoch={}",
             self.shell_reveal_generation, self.shell_reveal_arm_draw
         ));
-        self.start_shell_enter(self.shell_mode)
+        crate::ui::layout::invalidate_window(id)
     }
 
-    /// First redraw of the primed shell after arm: the entrance pose has been
+    /// First redraw of the primed shell after arm: a post-arm frame has been
     /// built and painted, so it is safe to reveal.
     pub(crate) fn on_shell_redraw(&mut self, id: window::Id, generation: u64) -> Task<Message> {
         if self.shell_window == Some(id) && self.reveal_frame_ready(generation) {
@@ -155,7 +157,8 @@ impl App {
         )
     }
 
-    /// Present the shell on the monitor after the offscreen entrance frame.
+    /// Present the shell on the monitor after the post-arm hidden frame, then
+    /// start the one entrance clock from zero.
     pub(crate) fn on_shell_present(
         &mut self,
         id: window::Id,
@@ -204,6 +207,10 @@ impl App {
             panel.alpha,
             1.0 - panel.alpha
         ));
+        // The visible window starts at the hidden/zero pose. Start the one
+        // entrance clock now so the fade always runs 0 → target on-screen,
+        // even when the offscreen prime took longer than the animation.
+        let enter = self.start_shell_enter(mode);
         let level = self.shell_level_task(mode);
         let toast = self.shell_toast_task(mode);
         let show = if crate::platform::debug_quiet::enabled() {
@@ -227,7 +234,7 @@ impl App {
         } else {
             Task::none()
         };
-        level.chain(show).chain(toast).chain(launcher)
+        level.chain(enter).chain(show).chain(toast).chain(launcher)
     }
 
     /// Resolve the shell pose for a view build. A hidden/closed shell holds
@@ -506,10 +513,6 @@ impl App {
         // state; a redraw between here and the raw hide must never fall back
         // to a settled full card.
         self.shell_render_hidden = true;
-        // A dismiss always ends the shared scrim timeline. Do this before the
-        // deferred-resume early return so a warm resume claims a fresh
-        // entrance instead of inheriting a settled/full backdrop.
-        self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
         self.home_shell_anim = None;
         self.browser_shell_anim = None;
         self.launcher_shell_anim = None;
@@ -520,7 +523,9 @@ impl App {
         self.shell_reveal_armed = false;
         self.shell_reveal_started = None;
         // A second PS during the exit asks to resume the same screen. Cancel
-        // the hide and let the normal resume path re-enter it in place.
+        // the hide and let the normal resume path re-enter it in place. Keep
+        // the current backdrop alpha: the window never left the screen, so
+        // resetting it here would be a visible 0/1 jump.
         if self.ps_resume_pending {
             self.shell_pending_show = false;
             self.shell_opening = false;
@@ -530,6 +535,7 @@ impl App {
         self.shell_presented = false;
         self.shell_pending_show = false;
         self.pending_shell_mode = None;
+        self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
         self.shell_opening = false;
         self.reset_shell_cursor_clock();
         self.set_shell_cursor_hidden(false);

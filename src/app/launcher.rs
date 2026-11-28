@@ -4654,10 +4654,13 @@ impl App {
             self.set_shell_cursor_hidden(false);
         }
         let now = Instant::now();
-        if !self.shell_opening && self.pending_shell_mode.is_none() {
+        // Only a pending in-place swap keeps the dim up. A dismiss (including
+        // one during the opening transition) fades it out so hide cannot snap
+        // a visible scrim to zero.
+        if self.pending_shell_mode.is_none() {
             self.begin_shell_backdrop_exit(now);
         } else {
-            self.shell_backdrop.hold_full();
+            self.shell_backdrop.raise(now);
         }
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);

@@ -3142,10 +3142,13 @@ impl super::App {
         self.browser_window_size = None;
         self.reset_shell_cursor_clock();
         let now = Instant::now();
-        if !self.shell_opening && self.pending_shell_mode.is_none() {
+        // Only a pending in-place swap keeps the dim up. A dismiss (including
+        // one during the opening transition) fades it out so hide cannot snap
+        // a visible scrim to zero.
+        if self.pending_shell_mode.is_none() {
             self.begin_shell_backdrop_exit(now);
         } else {
-            self.shell_backdrop.hold_full();
+            self.shell_backdrop.raise(now);
         }
         let close_osk = self.close_osk("browser_close");
         let Some(id) = self.shell_window else {
