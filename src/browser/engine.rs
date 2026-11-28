@@ -73,6 +73,19 @@ pub enum EngineCommand {
         url: String,
         generation: u64,
     },
+    /// Continue a cancelled cross-site/denylisted navigation after the user
+    /// explicitly chose Continue on the block card. The one-shot token is
+    /// consumed by `on_before_browse`.
+    AllowBlockedNavigation {
+        tab: TabId,
+        url: String,
+        token: u64,
+        remember: bool,
+    },
+    /// Remember a Stay decision for the destination's registrable domain.
+    RememberBlockedNavigation {
+        url: String,
+    },
     ScrollBy {
         tab: TabId,
         dx: f32,
@@ -248,6 +261,7 @@ impl EngineCommand {
         match self {
             Self::Traced { command, .. } => command.tab(),
             Self::Navigate { tab, .. }
+            | Self::AllowBlockedNavigation { tab, .. }
             | Self::ScrollBy { tab, .. }
             | Self::MouseMove { tab, .. }
             | Self::MouseButton { tab, .. }
@@ -275,6 +289,7 @@ impl EngineCommand {
             | Self::Suspend
             | Self::Resume
             | Self::Shutdown { .. }
+            | Self::RememberBlockedNavigation { .. }
             | Self::PrefetchFavicon { .. }
             | Self::Wake => None,
         }
@@ -392,6 +407,18 @@ pub enum EngineEvent {
         generation: u64,
         result: Result<(), String>,
     },
+    /// A main-frame navigation was cancelled by the security policy. The UI
+    /// shows the Stay/Continue card only for the active tab; background-tab
+    /// blocks are stored with their tab. `can_continue` is false for a
+    /// remembered block (silent).
+    NavigationBlocked {
+        tab: TabId,
+        source: String,
+        target: String,
+        reason: String,
+        can_continue: bool,
+        token: Option<u64>,
+    },
     /// A page requested `window.open` / `target=_blank`. The engine cancels
     /// the native popup; the shell opens the URL in a normal Browser tab.
     PopupRequested {
@@ -440,6 +467,7 @@ impl EngineEvent {
             | Self::HistoryJumpFailed { tab, .. }
             | Self::CursorChanged { tab, .. }
             | Self::LoadFinished { tab, .. } => Some(*tab),
+            Self::NavigationBlocked { tab, .. } => Some(*tab),
             Self::A11yTree { tab, .. } => Some(*tab),
             Self::PopupRequested { .. } | Self::TabOpened { .. } | Self::TabClosed { .. } => None,
         }

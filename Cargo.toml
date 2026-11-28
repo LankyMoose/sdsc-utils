@@ -31,7 +31,7 @@ path = "src/bin/gen_msix_logos.rs"
 # UI-only iteration build (Browser tile shows the engine install state); it
 # never falls back to a reader/text page.
 default = ["cef-engine"]
-cef-engine = ["dep:cef"]
+cef-engine = ["dep:cef", "dep:adblock", "dep:psl"]
 # QA builds may point the release-check and engine DLC at a local mock feed.
 # Never enabled in normal release/Store builds.
 qa-feed = []
@@ -65,6 +65,13 @@ winreg = "0.55"
 
 [dependencies]
 cef = { version = "156.7.0", optional = true, default-features = false }
+# Brave's filter engine. `single-thread` is off so the resource handler may
+# run on CEF's IO threads; the engine is Sync without it.
+adblock = { version = "0.13.6", optional = true, default-features = false, features = [
+    "embedded-domain-resolver",
+    "full-regex-handling",
+] }
+psl = { version = "2.1.265", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
 crc32fast = "1.5.0"

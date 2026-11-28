@@ -2582,6 +2582,10 @@ impl super::App {
                 Task::none()
             }
             BrowserMessage::ToggleGrid => self.toggle_browser_grid(),
+            BrowserMessage::NavStay => self.choose_browser_nav_block(true),
+            BrowserMessage::NavContinue => self.choose_browser_nav_block(false),
+            BrowserMessage::NavRemember => self.toggle_browser_nav_block_remember(),
+            BrowserMessage::NavCapture => Task::none(),
             BrowserMessage::Backdrop => self.screen_toggle("backdrop"),
             BrowserMessage::GridActivate(id) => self.browser_grid_select(id),
             BrowserMessage::GridOpenPlus => self.browser_grid_open_plus(),
@@ -2610,7 +2614,101 @@ impl super::App {
         }
     }
 
+    /// Stay/Continue card input: Left/Right focus, Cross confirms, Triangle
+    /// toggles Remember, Circle is Stay. Page input stays inert while shown.
+    fn on_browser_nav_block_pad(
+        &mut self,
+        readings: &[crate::ui::launcher::input::NavReading],
+        tap_actions: &[PadAction],
+    ) -> Task<Message> {
+        use crate::domain::pad::{NavAction, NavPhase};
+        let now = Instant::now();
+        let mut stay = None;
+        for reading in readings {
+            if let Some(step) = self
+                .browser
+                .dpad_stepper
+                .step(&reading.sample, now, true, false)
+                && step.phase == NavPhase::First
+            {
+                match step.direction {
+                    NavAction::Left => stay = Some(true),
+                    NavAction::Right => stay = Some(false),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(stay) = stay
+            && let Some(block) = &mut self.browser.panel.nav_block
+        {
+            block.stay_focused = stay;
+            return self.invalidate_browser_window();
+        }
+        let tapped = |button| {
+            tap_actions
+                .iter()
+                .any(|action| action.button == button && action.action == PadButtonAction::Tap)
+        };
+        if tapped(PadButton::Triangle) {
+            return self.toggle_browser_nav_block_remember();
+        }
+        if tapped(PadButton::Cross) {
+            let stay = self
+                .browser
+                .panel
+                .nav_block
+                .as_ref()
+                .is_none_or(|block| block.stay_focused);
+            return self.choose_browser_nav_block(stay);
+        }
+        if tapped(PadButton::Circle) {
+            return self.choose_browser_nav_block(true);
+        }
+        Task::none()
+    }
+
+    fn toggle_browser_nav_block_remember(&mut self) -> Task<Message> {
+        if let Some(block) = &mut self.browser.panel.nav_block {
+            block.remember = !block.remember;
+            return self.invalidate_browser_window();
+        }
+        Task::none()
+    }
+
+    /// Resolve the active card. Trace the explicit choice, persist an optional
+    /// remembered decision, and only then clear the card.
+    fn choose_browser_nav_block(&mut self, stay: bool) -> Task<Message> {
+        let Some(block) = self.browser.panel.nav_block.take() else {
+            return Task::none();
+        };
+        let remember = block.remember;
+        crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.nav.choice")
+            .field("tab", self.browser.panel.active_tab.0)
+            .field("choice", if stay { "stay" } else { "continue" })
+            .field("remember", remember)
+            .field("destination", &block.target)
+            .emit();
+        if let Some(engine) = &self.browser.engine {
+            if stay {
+                if remember {
+                    engine.send(EngineCommand::RememberBlockedNavigation { url: block.target });
+                }
+            } else if let Some(token) = block.token {
+                engine.send(EngineCommand::AllowBlockedNavigation {
+                    tab: self.browser.panel.active_tab,
+                    url: block.target,
+                    token,
+                    remember,
+                });
+            }
+        }
+        self.invalidate_browser_window()
+    }
+
     fn on_browser_page_pointer_moved(&mut self, x: f32, y: f32) -> Task<Message> {
+        if self.browser.panel.nav_block.is_some() {
+            return Task::none();
+        }
         if self.browser.panel.url_editing {
             return self.cancel_browser_url_edit();
         }
@@ -2621,6 +2719,9 @@ impl super::App {
     }
 
     fn on_browser_page_press(&mut self) -> Task<Message> {
+        if self.browser.panel.nav_block.is_some() {
+            return Task::none();
+        }
         if self.browser.panel.url_editing {
             return self.cancel_browser_url_edit();
         }
@@ -2633,6 +2734,9 @@ impl super::App {
     }
 
     fn on_browser_page_release(&mut self) -> Task<Message> {
+        if self.browser.panel.nav_block.is_some() {
+            return Task::none();
+        }
         if crate::platform::debug_quiet::input_dropped() {
             return Task::none();
         }
@@ -2642,6 +2746,9 @@ impl super::App {
     }
 
     fn on_browser_page_pointer_left(&mut self) -> Task<Message> {
+        if self.browser.panel.nav_block.is_some() {
+            return Task::none();
+        }
         if crate::platform::debug_quiet::input_dropped() {
             return Task::none();
         }
@@ -2651,6 +2758,9 @@ impl super::App {
     }
 
     fn on_browser_page_wheel(&mut self, dx: i32, dy: i32) -> Task<Message> {
+        if self.browser.panel.nav_block.is_some() {
+            return Task::none();
+        }
         if self.browser.panel.url_editing {
             return self.cancel_browser_url_edit();
         }
@@ -3130,6 +3240,9 @@ impl super::App {
         if self.ps_released(readings) {
             crate::controller::hid::diag::diag_info("ui-diag: PS dismisses Browser");
             return self.ps_screen_toggle();
+        }
+        if self.browser.panel.nav_block.is_some() {
+            return self.on_browser_nav_block_pad(readings, tap_actions);
         }
         if self.browser.panel.grid.is_grid() {
             return self.on_browser_grid_pad(readings, tap_actions);

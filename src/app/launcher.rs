@@ -1439,6 +1439,32 @@ impl App {
                 .emit();
                 return Task::none();
             }
+            EngineEvent::NavigationBlocked {
+                tab,
+                source,
+                target,
+                reason,
+                can_continue,
+                token,
+            } => {
+                let active = tab == self.browser.panel.active_tab;
+                self.browser.panel.note_navigation_blocked(
+                    tab,
+                    crate::ui::browser::state::BlockedNavigation {
+                        source,
+                        target,
+                        reason,
+                        can_continue,
+                        token,
+                        stay_focused: true,
+                        remember: false,
+                    },
+                );
+                if active && can_continue {
+                    return self.invalidate_browser_window();
+                }
+                return Task::none();
+            }
             _ => {}
         }
         let tab = event.tab().expect("tab-carrying event checked above");
@@ -1450,7 +1476,8 @@ impl App {
             EngineEvent::FrameSlot { .. }
             | EngineEvent::TabOpened { .. }
             | EngineEvent::TabClosed { .. }
-            | EngineEvent::PopupRequested { .. } => {}
+            | EngineEvent::PopupRequested { .. }
+            | EngineEvent::NavigationBlocked { .. } => {}
             EngineEvent::Frame(frame) => {
                 if !self.browser.panel.session.is_open() {
                     return Task::none();
@@ -1717,6 +1744,7 @@ impl App {
                 | EngineEvent::TabOpened { .. }
                 | EngineEvent::TabClosed { .. }
                 | EngineEvent::PopupRequested { .. }
+                | EngineEvent::NavigationBlocked { .. }
                 | EngineEvent::HistoryJumpFailed { .. }
                 | EngineEvent::CursorChanged { .. } => {}
             }

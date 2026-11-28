@@ -83,7 +83,8 @@ Status legend:
 | Downloads | `DownloadHandler::OnBeforeDownload/OnDownloadUpdated`; `BrowserHost::StartDownload` | download | **unhandled** | — |
 | File picker | `DialogHandler::OnFileDialog`; `BrowserHost::RunFileDialog` | dialog | **unhandled** | — |
 | JS dialogs | `JSDialogHandler::OnJSDialog/OnBeforeUnloadDialog` | JS dialog | **unhandled** | — |
-| Permissions | `PermissionHandler::OnRequestPermission` | permission | **unhandled** | — |
+| Permissions | `PermissionHandler::OnShowPermissionPrompt` + `OnRequestMediaAccessPermission` (CEF 156 split; older docs name `OnRequestPermission`) | permission | **wired deny-by-default**: prompt callbacks `DENY`, media `cancel()`; one `browser.permission.denied` trace line; no permission UI | `src/browser/cef_backend.rs:SdscPermissionHandler` |
+| Navigation guard | `RequestHandler::OnBeforeBrowse`; `RequestHandler::GetResourceRequestHandler` → `ResourceRequestHandler::OnBeforeResourceLoad` | request | **wired**: main-frame cross-site/denylist prompts over a pure policy; subresources go through the ad filter (`RV_CANCEL`) | `src/browser/security/`, `src/browser/cef_backend.rs:SdscRequestHandler` |
 | Auth / certs | `RequestHandler::GetAuthCredentials`, `OnCertificateError`, `OnSelectClientCertificate` | request | **unhandled** | — |
 | Renderer crash | `RequestHandler::OnRenderProcessTerminated`, `OnRenderProcessUnresponsive` | request | **unhandled** | `src/platform/crash_restart.rs` is app-process only |
 | Context menu | `ContextMenuHandler` | context menu | **unhandled** | — |

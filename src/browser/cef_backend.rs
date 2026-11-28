@@ -386,6 +386,8 @@ struct TabContext {
     /// Causal flow of the last traced navigation/history command. CEF
     /// callbacks join engine log lines to the UI action that caused them.
     trace_flow: Arc<Mutex<Option<crate::platform::trace::FlowId>>>,
+    /// Process-shared permission/navigation/filter policy.
+    security: Arc<crate::browser::security::BrowserSecurity>,
 }
 
 impl TabContext {
@@ -995,6 +997,237 @@ cef::wrap_life_span_handler! {
     }
 }
 
+cef::wrap_permission_handler! {
+    struct SdscPermissionHandler {
+        ctx: TabContext,
+    }
+    impl PermissionHandler {
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> std::os::raw::c_int {
+            // Deny by default: no permission UI exists in v1.
+            let origin = requesting_origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_default();
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.permission.denied",
+            )
+            .field("tab", self.ctx.tab.0)
+            .field("origin", &origin)
+            .field("permissions", requested_permissions)
+            .field("prompt", prompt_id)
+            .emit();
+            if let Some(callback) = callback {
+                callback.cont(PermissionRequestResult::DENY);
+            }
+            1
+        }
+
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> std::os::raw::c_int {
+            let origin = requesting_origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_default();
+            crate::platform::trace::event(
+                crate::platform::trace::Lane::Browser,
+                "browser.permission.denied",
+            )
+            .field("tab", self.ctx.tab.0)
+            .field("origin", &origin)
+            .field("permissions", requested_permissions)
+            .field("media", true)
+            .emit();
+            if let Some(callback) = callback {
+                callback.cancel();
+            }
+            1
+        }
+    }
+}
+
+cef::wrap_request_handler! {
+    struct SdscRequestHandler {
+        ctx: TabContext,
+    }
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            user_gesture: std::os::raw::c_int,
+            _is_redirect: std::os::raw::c_int,
+        ) -> std::os::raw::c_int {
+            let (Some(frame), Some(request)) = (frame, request) else {
+                return 0;
+            };
+            if frame.is_main() == 0 {
+                return 0;
+            }
+            let source = CefString::from(&frame.url()).to_string();
+            let target = CefString::from(&request.url()).to_string();
+            let eval = self.ctx.security.evaluate(
+                self.ctx.tab,
+                &source,
+                &target,
+                user_gesture != 0,
+            );
+            use crate::browser::security::navigation::NavOutcome;
+            match eval.outcome {
+                NavOutcome::Allow => 0,
+                NavOutcome::Prompt(reason) => {
+                    emit_nav_blocked(&self.ctx, &source, &target, reason, true, eval.token);
+                    1
+                }
+                NavOutcome::Block(reason) => {
+                    emit_nav_blocked(&self.ctx, &source, &target, reason, false, None);
+                    1
+                }
+            }
+        }
+
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            is_navigation: std::os::raw::c_int,
+            _is_download: std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            // Main-frame navigations belong to `on_before_browse` (gesture
+            // context + interstitial); the network filter handles everything
+            // else, including subframe documents.
+            let main_frame = frame.as_ref().is_some_and(|frame| frame.is_main() != 0);
+            if is_navigation != 0 && main_frame {
+                return None;
+            }
+            Some(SdscResourceRequestHandler::new(self.ctx.clone()))
+        }
+    }
+}
+
+cef::wrap_resource_request_handler! {
+    struct SdscResourceRequestHandler {
+        ctx: TabContext,
+    }
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            let Some(request) = request else {
+                return ReturnValue::CONTINUE;
+            };
+            let url = CefString::from(&request.url()).to_string();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return ReturnValue::CONTINUE;
+            }
+            let source = frame
+                .map(|frame| CefString::from(&frame.url()).to_string())
+                .unwrap_or_default();
+            let resource_type = adblock_resource_type(request.resource_type());
+            let Some(rule) = self.ctx.security.blocked_resource(&url, &source, resource_type)
+            else {
+                return ReturnValue::CONTINUE;
+            };
+            if self.ctx.security.should_trace_blocked() {
+                crate::platform::trace::event(
+                    crate::platform::trace::Lane::Browser,
+                    "browser.resource.blocked",
+                )
+                .field("tab", self.ctx.tab.0)
+                .field("host", host_of(&url))
+                .field("type", resource_type)
+                .field("rule", &rule)
+                .emit();
+            }
+            ReturnValue::CANCEL
+        }
+    }
+}
+
+fn emit_nav_blocked(
+    ctx: &TabContext,
+    source: &str,
+    target: &str,
+    reason: crate::browser::security::navigation::NavReason,
+    can_continue: bool,
+    token: Option<u64>,
+) {
+    crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.nav.blocked")
+        .field("tab", ctx.tab.0)
+        .field("source", source)
+        .field("target", target)
+        .field("reason", reason.key())
+        .field("can_continue", can_continue)
+        .emit();
+    ctx.handle.emit(EngineEvent::NavigationBlocked {
+        tab: ctx.tab,
+        source: source.to_string(),
+        target: target.to_string(),
+        reason: reason.label().to_string(),
+        can_continue,
+        token,
+    });
+}
+
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn adblock_resource_type(resource_type: ResourceType) -> &'static str {
+    if resource_type == ResourceType::MAIN_FRAME {
+        "document"
+    } else if resource_type == ResourceType::SUB_FRAME {
+        "subdocument"
+    } else if resource_type == ResourceType::STYLESHEET {
+        "stylesheet"
+    } else if resource_type == ResourceType::SCRIPT {
+        "script"
+    } else if resource_type == ResourceType::IMAGE {
+        "image"
+    } else if resource_type == ResourceType::FONT_RESOURCE {
+        "font"
+    } else if resource_type == ResourceType::OBJECT {
+        "object"
+    } else if resource_type == ResourceType::MEDIA {
+        "media"
+    } else if resource_type == ResourceType::XHR {
+        "xhr"
+    } else if resource_type == ResourceType::PING {
+        "ping"
+    } else if resource_type == ResourceType::CSP_REPORT {
+        "csp_report"
+    } else if resource_type == ResourceType::WORKER
+        || resource_type == ResourceType::SHARED_WORKER
+        || resource_type == ResourceType::SERVICE_WORKER
+    {
+        "script"
+    } else {
+        "other"
+    }
+}
+
 cef::wrap_load_handler! {
     struct SdscLoadHandler {
         ctx: TabContext,
@@ -1477,6 +1710,8 @@ cef::wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         display_handler: DisplayHandler,
+        request_handler: RequestHandler,
+        permission_handler: PermissionHandler,
     }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
@@ -1490,6 +1725,12 @@ cef::wrap_client! {
         }
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
+        }
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.permission_handler.clone())
         }
 
         fn on_process_message_received(
@@ -1690,6 +1931,8 @@ struct Worker {
     visible_flag: Arc<AtomicBool>,
     /// Bookmark favicon origins already asked for this session.
     prefetched: std::collections::HashSet<String>,
+    /// One shared policy + filter engine for every tab.
+    security: Arc<crate::browser::security::BrowserSecurity>,
 }
 
 fn run(
@@ -1711,6 +1954,7 @@ fn run(
         active_tab,
         visible_flag,
         prefetched: std::collections::HashSet::new(),
+        security: Arc::new(crate::browser::security::BrowserSecurity::new()),
     };
     worker.create_tab(TabId::BOOT, &boot_url, Arc::new(FrameSlot::default()), 1);
     loop {
@@ -1763,6 +2007,7 @@ impl Worker {
             devtools: Arc::new(DevToolsState::default()),
             last_cursor: Arc::new(Mutex::new(crate::browser::engine::BrowserCursor::Default)),
             trace_flow: Arc::new(Mutex::new(None)),
+            security: self.security.clone(),
         };
         let mut client = SdscClient::new(
             ctx.clone(),
@@ -1770,6 +2015,8 @@ impl Worker {
             SdscLifeSpanHandler::new(ctx.clone()),
             SdscLoadHandler::new(ctx.clone()),
             SdscDisplayHandler::new(ctx.clone()),
+            SdscRequestHandler::new(ctx.clone()),
+            SdscPermissionHandler::new(ctx.clone()),
         );
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
@@ -1822,6 +2069,18 @@ impl Worker {
     }
 
     fn apply(&mut self, command: EngineCommand) -> bool {
+        if matches!(
+            command,
+            EngineCommand::Navigate { .. }
+                | EngineCommand::OpenTab { .. }
+                | EngineCommand::Reload { .. }
+                | EngineCommand::GoBack { .. }
+                | EngineCommand::GoForward { .. }
+                | EngineCommand::GoToHistoryIndex { .. }
+        ) && let Some(tab) = command.tab()
+        {
+            self.security.trust_next_navigation(tab);
+        }
         match command {
             EngineCommand::Traced { flow, command } => {
                 if let Some(tab) = command.tab()
@@ -1862,6 +2121,44 @@ impl Worker {
                 } else {
                     self.create_tab(tab, &url, Arc::new(FrameSlot::default()), generation);
                 }
+            }
+            EngineCommand::AllowBlockedNavigation {
+                tab,
+                url,
+                token,
+                remember,
+            } => {
+                if !self.security.authorize_continue(tab, &url, token) {
+                    crate::platform::app_log::warn(format!(
+                        "security: rejected Continue token for tab{}",
+                        tab.0
+                    ));
+                    return false;
+                }
+                if remember {
+                    self.security.remember_allow(&url);
+                }
+                if let Some(entry) = self.tab_mut(tab) {
+                    entry.url = url.clone();
+                    entry.dom_epoch = entry.dom_epoch.wrapping_add(1);
+                    let generation = *entry
+                        .ctx
+                        .generation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(browser) = entry.ctx.browser.get() {
+                        if let Some(frame) = browser.main_frame() {
+                            let url_c: CefString = url.as_str().into();
+                            frame.load_url(Some(&url_c));
+                        }
+                    } else {
+                        let frame = entry.ctx.frame.clone();
+                        self.create_tab(tab, &url, frame, generation);
+                    }
+                }
+            }
+            EngineCommand::RememberBlockedNavigation { url } => {
+                self.security.remember_block(&url);
             }
             EngineCommand::Reload {
                 tab,

@@ -117,6 +117,19 @@ pub enum TabCloseOutcome {
     Rejected,
 }
 
+/// A main-frame navigation cancelled by the security policy. The card is
+/// session state, never persisted; `stay_focused` defaults to Stay.
+#[derive(Debug, Clone)]
+pub struct BlockedNavigation {
+    pub source: String,
+    pub target: String,
+    pub reason: String,
+    pub can_continue: bool,
+    pub token: Option<u64>,
+    pub stay_focused: bool,
+    pub remember: bool,
+}
+
 /// Browser app panel. The page surface and cursor live here; load lifecycle
 /// (generation-guarded suspend/resume) lives in
 /// [`crate::browser::BrowserSession`]. The pad cursor roams in engine page
@@ -183,6 +196,11 @@ pub struct BrowserPanel {
     pub url_replace_on_type: bool,
     /// Tabs-view mode and FLIP transition.
     pub grid: crate::ui::browser::grid::GridState,
+    /// Stay/Continue card for the active tab.
+    pub nav_block: Option<BlockedNavigation>,
+    /// Pending cards for background tabs (per-tab, so a background redirect
+    /// never paints over the active page).
+    pub nav_blocks: HashMap<crate::browser::engine::TabId, BlockedNavigation>,
 }
 
 impl std::ops::Deref for BrowserPanel {
@@ -238,6 +256,8 @@ impl Default for BrowserPanel {
             url_draft: String::new(),
             url_replace_on_type: false,
             grid: crate::ui::browser::grid::GridState::default(),
+            nav_block: None,
+            nav_blocks: HashMap::new(),
         }
     }
 }
@@ -331,11 +351,37 @@ impl BrowserPanel {
         let Some(pos) = self.stored.iter().position(|t| t.id == id) else {
             return false;
         };
+        if let Some(block) = self.nav_block.take() {
+            self.nav_blocks.insert(self.active_tab, block);
+        }
         std::mem::swap(&mut self.page, &mut self.stored[pos].page);
         self.sync_live_cursor();
         self.stored[pos].id = self.active_tab;
         self.active_tab = id;
+        self.nav_block = self.nav_blocks.remove(&id);
         true
+    }
+
+    /// Store a blocked-navigation card with its tab. Remembered/silent
+    /// blocks never create a card.
+    pub fn note_navigation_blocked(
+        &mut self,
+        tab: crate::browser::engine::TabId,
+        block: BlockedNavigation,
+    ) {
+        if !block.can_continue {
+            return;
+        }
+        if tab == self.active_tab {
+            self.nav_block = Some(block);
+        } else {
+            self.nav_blocks.insert(tab, block);
+        }
+    }
+
+    /// Clear the active card, keeping background cards.
+    pub fn clear_nav_block(&mut self) {
+        self.nav_block = None;
     }
 
     /// Drop a background tab's stored state (the engine side closes via
@@ -349,6 +395,7 @@ impl BrowserPanel {
         };
         self.stored.remove(pos);
         self.order.retain(|o| *o != id);
+        self.nav_blocks.remove(&id);
         true
     }
 
@@ -489,6 +536,8 @@ impl BrowserPanel {
         self.order.clear();
         self.active_tab = crate::browser::engine::TabId::BOOT;
         self.next_tab_id = 2;
+        self.nav_block = None;
+        self.nav_blocks.clear();
         self.reset_live_page();
         if tabs.is_empty() {
             self.order.push(crate::browser::engine::TabId::BOOT);
@@ -530,6 +579,7 @@ impl BrowserPanel {
     /// Create a fresh live tab after stashing the current page. Returns the
     /// new id and the load generation the engine result must carry.
     pub fn create_tab(&mut self, url: String) -> (crate::browser::engine::TabId, u64) {
+        self.nav_block = None;
         self.stash_live();
         let id = crate::browser::engine::TabId(self.next_tab_id);
         self.next_tab_id += 1;
@@ -1047,6 +1097,32 @@ mod tests {
         assert_eq!(panel.stored.len(), 1);
         assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
         assert!(panel.tab_loaded(crate::browser::engine::TabId::BOOT));
+    }
+
+    #[test]
+    fn nav_block_is_per_tab_and_silent_blocks_never_paint() {
+        let mut panel = panel();
+        let block = BlockedNavigation {
+            source: "https://a.test/".into(),
+            target: "https://b.test/".into(),
+            reason: "cross-site navigation needs confirmation".into(),
+            can_continue: true,
+            token: Some(7),
+            stay_focused: true,
+            remember: false,
+        };
+        panel.note_navigation_blocked(crate::browser::engine::TabId(2), block.clone());
+        assert!(panel.nav_block.is_none());
+        assert!(
+            panel
+                .nav_blocks
+                .contains_key(&crate::browser::engine::TabId(2))
+        );
+
+        let mut silent = block;
+        silent.can_continue = false;
+        panel.note_navigation_blocked(crate::browser::engine::TabId::BOOT, silent);
+        assert!(panel.nav_block.is_none());
     }
 
     #[test]

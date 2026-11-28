@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod atomic;
+pub mod browser_prefs;
 pub mod json;
 pub mod paths;
 pub mod prefs;

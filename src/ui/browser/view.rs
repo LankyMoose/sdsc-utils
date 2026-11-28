@@ -10,14 +10,16 @@ use crate::ui::browser::cursor_surface::{CursorSurfaceSpec, cursor_surface};
 use crate::ui::browser::state::{
     BROWSER_HEADER_GROUP_GAP, BROWSER_HEADER_H, BROWSER_HEADER_PAD, BROWSER_HEADER_RULE,
     BROWSER_HEADER_TOTAL, BROWSER_HEADER_V_PAD, BROWSER_URL_BAR_H, BROWSER_URL_BAR_PAD,
-    BROWSER_URL_GAP, BROWSER_URL_ICON, BrowserPanel, browser_header_layout,
+    BROWSER_URL_GAP, BROWSER_URL_ICON, BlockedNavigation, BrowserPanel, browser_header_layout,
     browser_url_text_budget, display_url,
 };
 use crate::ui::face::{FaceButton, RingStyle, face_glyph};
 use crate::ui::scale::Scale;
 use crate::ui::{svg_icon, text_fit, theme};
 use iced::widget::text::Wrapping;
-use iced::widget::{column, container, mouse_area, row, scrollable, space, stack, svg, text};
+use iced::widget::{
+    button, column, container, mouse_area, row, scrollable, space, stack, svg, text,
+};
 use iced::{Alignment, Color, Element, Fill, Font, Length, Padding, Vector};
 
 /// Everything the standalone Browser window can ask the shell/engine to do.
@@ -48,6 +50,14 @@ pub enum BrowserMessage {
     Scrolled(f32),
     /// Circle-style toggle for the tab grid.
     ToggleGrid,
+    /// Security card: Stay selected / clicked.
+    NavStay,
+    /// Security card: Continue clicked.
+    NavContinue,
+    /// Security card: toggle "Remember my decision".
+    NavRemember,
+    /// Consume page clicks behind the security card.
+    NavCapture,
     /// Click outside the active card: same as PS (dismiss to desktop).
     Backdrop,
     /// Mouse/card activation (visual card identity, never an index).
@@ -98,6 +108,7 @@ impl BrowserMessage {
             | Self::TabsScrolled(_)
             | Self::BookmarksScrolled(_) => None,
             Self::ToggleGrid => Some("browser.grid.toggle"),
+            Self::NavStay | Self::NavContinue | Self::NavRemember | Self::NavCapture => None,
             Self::Backdrop => Some("browser.backdrop"),
             Self::GridActivate(_) => Some("browser.tab.switch"),
             Self::GridOpenPlus => Some("browser.tab.open"),
@@ -489,6 +500,99 @@ pub fn browser_page_view(
     .into()
 }
 
+/// Stay/Continue card over the live page. Same card language as the tabs
+/// view; no new window and no second shell.
+fn nav_block_overlay<'a>(
+    block: &'a BlockedNavigation,
+    page_w: f32,
+    page_h: f32,
+) -> Element<'a, BrowserMessage> {
+    let card_w = (page_w - 64.0).clamp(320.0, 640.0);
+    let scrim = mouse_area(container(space()).width(Fill).height(Fill))
+        .on_press(BrowserMessage::NavCapture);
+    let choice = |label: &'static str, selected: bool, message: BrowserMessage| {
+        button(text(label).size(theme::type_scale::BODY))
+            .style(theme::chip(selected))
+            .padding([8, 20])
+            .on_press(message)
+    };
+    let card = container(
+        column![
+            text("Navigation blocked")
+                .size(theme::type_scale::HEADING)
+                .color(theme::INK),
+            text(&block.reason)
+                .size(theme::type_scale::BODY)
+                .color(theme::MUTED)
+                .wrapping(Wrapping::Word),
+            text("From")
+                .size(theme::type_scale::CAPTION)
+                .color(theme::DIM),
+            text(&block.source)
+                .size(theme::type_scale::META)
+                .color(theme::MUTED)
+                .wrapping(Wrapping::Word),
+            text("To")
+                .size(theme::type_scale::CAPTION)
+                .color(theme::DIM),
+            text(&block.target)
+                .size(theme::type_scale::BODY)
+                .color(theme::INK)
+                .wrapping(Wrapping::Word),
+            row![
+                choice("Stay", block.stay_focused, BrowserMessage::NavStay),
+                choice("Continue", !block.stay_focused, BrowserMessage::NavContinue),
+            ]
+            .spacing(12),
+            button(
+                text(if block.remember {
+                    "[x] Remember my decision"
+                } else {
+                    "[ ] Remember my decision"
+                })
+                .size(theme::type_scale::META)
+                .color(theme::MUTED),
+            )
+            .style(theme::chip(block.remember))
+            .padding([6, 12])
+            .on_press(BrowserMessage::NavRemember),
+            text("←/→ choose · Cross confirm · Triangle remember · Circle stay")
+                .size(theme::type_scale::CAPTION)
+                .color(theme::DIM),
+        ]
+        .spacing(10)
+        .width(Fill),
+    )
+    .padding(24)
+    .width(Length::Fixed(card_w))
+    .style(|_theme: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(theme::PANEL)),
+        border: iced::Border {
+            color: theme::LINE,
+            width: 1.0,
+            radius: theme::radius::LG.into(),
+        },
+        ..container::Style::default()
+    });
+    stack![
+        container(scrim)
+            .width(Fill)
+            .height(Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::alpha(theme::BASE_BG, 0.78))),
+                ..container::Style::default()
+            }),
+        container(card)
+            .width(Length::Fixed(page_w))
+            .height(Length::Fixed(page_h))
+            .center_x(Fill)
+            .center_y(Fill),
+    ]
+    .width(Length::Fixed(page_w))
+    .height(Length::Fixed(page_h))
+    .into()
+}
+
 /// Browser surface: one header row above the 1:1 page card. The caller sizes
 /// the page to the engine viewport; cursor coordinates remain page-local.
 pub fn browser_view<'a>(
@@ -506,6 +610,9 @@ pub fn browser_view<'a>(
     .width(Length::Fixed(page_w))
     .height(Length::Fixed(page_h))
     .clip(true);
+    if let Some(block) = &panel.nav_block {
+        page = page.push(nav_block_overlay(block, page_w, page_h));
+    }
     if let Some(debug) = browser_cursor_debug_overlay(panel, page_w, page_h) {
         page = page.push(debug);
     }

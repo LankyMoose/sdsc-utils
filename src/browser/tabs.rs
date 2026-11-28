@@ -59,7 +59,38 @@ pub fn load() -> SavedTabs {
 }
 
 fn load_from(path: &Path) -> SavedTabs {
-    crate::persist::store::load_or_default(path)
+    let saved: SavedTabs = crate::persist::store::load_or_default(path);
+    #[cfg(feature = "cef-engine")]
+    return filter_blocked(saved);
+    #[cfg(not(feature = "cef-engine"))]
+    saved
+}
+
+/// Blocked/remembered-block destinations never come back from `tabs.json`.
+#[cfg(feature = "cef-engine")]
+fn filter_blocked(mut saved: SavedTabs) -> SavedTabs {
+    let old_active = saved.active;
+    let mut kept: Vec<SavedTab> = Vec::with_capacity(saved.tabs.len());
+    let mut active = None;
+    for (index, tab) in saved.tabs.drain(..).enumerate() {
+        if crate::browser::security::BrowserSecurity::drop_on_restore(&tab.url) {
+            crate::platform::app_log::info(format!(
+                "security: dropped blocked saved tab {}",
+                tab.url
+            ));
+            if index == old_active {
+                active = Some(kept.len());
+            }
+            continue;
+        }
+        if index == old_active {
+            active = Some(kept.len());
+        }
+        kept.push(tab);
+    }
+    saved.tabs = kept;
+    saved.active = active.unwrap_or(0).min(saved.tabs.len().saturating_sub(1));
+    saved
 }
 
 /// Overwrite the file with the current strip.
