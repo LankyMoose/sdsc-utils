@@ -240,7 +240,8 @@ pub enum Message {
     ShellRevealArmed(window::Id, u64),
     /// First shell redraw after the offscreen prime (`listen_raw`; the
     /// filtered window-event listener intentionally drops RedrawRequested).
-    ShellRedraw(window::Id),
+    /// Carries the reveal generation captured at subscription time.
+    ShellRedraw(window::Id, u64),
     /// Safety net: re-present/re-focus the shell if the first present was lost.
     ShellFocusFallback(window::Id, u64),
     /// 60Hz redraw while a Home/Browser backdrop fade is running.
@@ -415,7 +416,7 @@ impl Message {
             | Message::ShellOpened(_)
             | Message::ShellPresent(_, _)
             | Message::ShellRevealArmed(_, _)
-            | Message::ShellRedraw(_)
+            | Message::ShellRedraw(_, _)
             | Message::ShellFocusFallback(_, _)
             | Message::ShellFadeTick
             | Message::LauncherOpened(_)
@@ -563,7 +564,7 @@ impl Message {
             | Message::ShellOpened(_)
             | Message::ShellPresent(_, _)
             | Message::ShellRevealArmed(_, _)
-            | Message::ShellRedraw(_)
+            | Message::ShellRedraw(_, _)
             | Message::ShellFocusFallback(_, _)
             | Message::ShellFadeTick
             | Message::LauncherArtEvent(_) => false,
@@ -851,6 +852,19 @@ pub struct App {
     /// Generation guard for delayed reveal timers: a fallback from an older
     /// show must never present the next one before its prime paints.
     shell_reveal_generation: u64,
+    /// Shell draw epoch at the moment the current show armed. A present needs
+    /// a view built strictly after this (pre-arm/queued redraws are rejected).
+    shell_reveal_arm_draw: u64,
+    /// Incremented per shell view build (`Cell`: `view()` only gets `&self`).
+    shell_draw_epoch: std::cell::Cell<u64>,
+    /// Reveal generation captured by the last shell view build.
+    shell_drawn_generation: std::cell::Cell<u64>,
+    /// Pose of the last shell view build (logged at first present).
+    shell_drawn_frame: std::cell::Cell<crate::ui::home::ShellFrame>,
+    /// The warm shell holds the hidden/closed pose. Set before animation state
+    /// is cleared and cleared only when an entrance starts; `None` animation
+    /// must never fall back to `full` while this is true.
+    shell_render_hidden: bool,
     /// Entrance clock for the first-present diagnostic.
     shell_reveal_started: Option<Instant>,
     /// True while an rfd picker is open from the launcher (suppress unfocus-close).
@@ -1285,6 +1299,11 @@ impl App {
             shell_presented: false,
             shell_reveal_armed: false,
             shell_reveal_generation: 0,
+            shell_reveal_arm_draw: 0,
+            shell_draw_epoch: std::cell::Cell::new(0),
+            shell_drawn_generation: std::cell::Cell::new(0),
+            shell_drawn_frame: std::cell::Cell::new(crate::ui::home::ShellFrame::hidden()),
+            shell_render_hidden: true,
             shell_reveal_started: None,
             launcher_file_dialog_open: false,
             ps_release: ChordReleaseDetector::default(),
@@ -1700,15 +1719,15 @@ impl App {
         // reveal gate needs, so this never stays subscribed.
         if self.shell_reveal_armed && !self.shell_presented {
             // `window::events` uses the filtered listener, which deliberately
-            // drops RedrawRequested. The raw listener is the only way to know
-            // the primed frame painted.
-            subscriptions.push(iced::event::listen_raw(|event, _status, id| {
-                matches!(
-                    event,
-                    iced::Event::Window(iced::window::Event::RedrawRequested(_))
-                )
-                .then_some(Message::ShellRedraw(id))
-            }));
+            // drops RedrawRequested. This raw listener is the only way to know
+            // the primed frame painted. A plain `listen_raw` fn pointer cannot
+            // capture state, so a tiny recipe carries this show's generation
+            // in its identity: a redraw from an older show is ignored.
+            subscriptions.push(iced::advanced::subscription::from_recipe(
+                ShellRedrawWatch {
+                    generation: self.shell_reveal_generation,
+                },
+            ));
         }
 
         if self.toast_message.is_some() && !self.toast_machine.is_resting() {
@@ -1943,15 +1962,11 @@ impl App {
                 .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
                 .unwrap_or((1920.0, 1080.0));
             let now = Instant::now();
-            let reduced =
-                crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
-            let panel = self
-                .browser_shell_anim
-                .map(|anim| anim.frame(now, reduced).panel)
-                .unwrap_or_else(crate::ui::home::PanelVisual::full);
+            let shell = self.resolved_shell_frame(self.browser_shell_anim, now);
+            self.note_shell_draw(shell);
             let backdrop_alpha = self.shell_backdrop_alpha(now);
             let shell = crate::ui::home::ShellFrame {
-                panel,
+                panel: shell.panel,
                 backdrop_alpha,
             };
             let draws = crate::ui::browser::view::cursor_draws(&self.browser.panel)
@@ -1981,12 +1996,8 @@ impl App {
 
         if Some(window) == self.home_window {
             let now = Instant::now();
-            let reduced =
-                crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
-            let shell = self
-                .home_shell_anim
-                .map(|anim| anim.frame(now, reduced))
-                .unwrap_or_else(crate::ui::home::ShellFrame::full);
+            let shell = self.resolved_shell_frame(self.home_shell_anim, now);
+            self.note_shell_draw(shell);
             let backdrop_alpha = self.shell_backdrop_alpha(now);
             let home_panel = crate::ui::home::view(
                 &self.home_state,
@@ -2082,25 +2093,27 @@ impl App {
             // Shared shell transition: the Launcher is full-bleed. Never
             // scale or resize its view; only fade a black veil using the same
             // panel alpha Home and Browser animate.
-            let start: Element<'_, Message> = if let Some(anim) = self.launcher_shell_anim {
-                let now = Instant::now();
-                let reduced =
-                    crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
-                let frame = anim.frame(now, reduced);
-                let veil = 1.0 - frame.panel.alpha.clamp(0.0, 1.0);
-                if veil > 0.001 {
-                    let scrim = container(space())
-                        .width(Fill)
-                        .height(Fill)
-                        .style(crate::ui::theme::scrim(veil));
-                    stack![start, scrim].width(Fill).height(Fill).into()
-                } else {
-                    start
-                }
+            let shell = self.resolved_shell_frame(self.launcher_shell_anim, Instant::now());
+            self.note_shell_draw(shell);
+            let veil = 1.0 - shell.panel.alpha.clamp(0.0, 1.0);
+            let start: Element<'_, Message> = if veil > 0.001 {
+                let scrim = container(space())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(crate::ui::theme::scrim(veil));
+                stack![start, scrim].width(Fill).height(Fill).into()
             } else {
                 start
             };
             return cursor_hide::force_cursor(start, self.shell_cursor_hidden).into();
+        }
+
+        if Some(window) == self.shell_window {
+            // Warm hidden/closed shell: hold the hidden pose, never a settled
+            // full card. The window is normally invisible; this only matters
+            // for the redraw between exit completion and the raw hide.
+            self.note_shell_draw(crate::ui::home::ShellFrame::hidden());
+            return self.hidden_shell_view();
         }
 
         if Some(window) == self.toast_window {
@@ -2334,7 +2347,7 @@ impl App {
                     Task::none()
                 }
             }
-            Message::ShellRedraw(id) => self.on_shell_redraw(id),
+            Message::ShellRedraw(id, generation) => self.on_shell_redraw(id, generation),
             Message::ShellFocusFallback(id, generation) => {
                 if generation == self.shell_reveal_generation {
                     self.on_shell_focus_fallback(id)
@@ -2601,6 +2614,7 @@ impl App {
             let resume_ps = self.ps_resume_pending;
             self.shell_window = None;
             self.shell_hidden = true;
+            self.shell_render_hidden = true;
             self.shell_pending_show = false;
             self.shell_reveal_armed = false;
             self.shell_reveal_started = None;
@@ -3879,6 +3893,45 @@ impl Drop for InputEdgeBindGuard {
         // Idempotent with the `Message::Exit` clear below (clearing an
         // unbound Home is a no-op).
         self.hub.clear();
+    }
+}
+
+/// Raw redraw listener for one reveal show.
+///
+/// `iced::event::listen_raw` only accepts a non-capturing fn pointer, so the
+/// reveal generation rides in a small recipe instead. Arming rebuilds the
+/// subscription with a new generation and any older show's redraw is ignored.
+struct ShellRedrawWatch {
+    generation: u64,
+}
+
+impl iced::advanced::subscription::Recipe for ShellRedrawWatch {
+    type Output = Message;
+
+    fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
+        use std::hash::Hash as _;
+        "shell-redraw".hash(state);
+        self.generation.hash(state);
+    }
+
+    fn stream(
+        self: Box<Self>,
+        input: iced::advanced::subscription::EventStream,
+    ) -> iced::futures::stream::BoxStream<'static, Message> {
+        use iced::futures::{StreamExt, future};
+        let generation = self.generation;
+        input
+            .filter_map(move |event| {
+                future::ready(match event {
+                    iced::advanced::subscription::Event::Interaction {
+                        window: id,
+                        event: iced::Event::Window(iced::window::Event::RedrawRequested(_)),
+                        ..
+                    } => Some(Message::ShellRedraw(id, generation)),
+                    _ => None,
+                })
+            })
+            .boxed()
     }
 }
 

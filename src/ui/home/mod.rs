@@ -87,7 +87,7 @@ impl PanelVisual {
         }
     }
 
-    const fn hidden() -> Self {
+    pub const fn hidden() -> Self {
         Self {
             alpha: 0.0,
             scale: PANEL_HIDDEN_SCALE,
@@ -111,7 +111,7 @@ impl ShellFrame {
         }
     }
 
-    const fn hidden() -> Self {
+    pub const fn hidden() -> Self {
         Self {
             panel: PanelVisual::hidden(),
             backdrop_alpha: 0.0,

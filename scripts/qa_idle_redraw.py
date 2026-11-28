@@ -7,13 +7,16 @@ Launches a debug build with ``SDSC_DEBUG_REDRAW=1`` and a chosen
 without touching the iced event loop, so a quiet delta is real.
 
 Scenarios:
-  osk       Browser + system OSK open (no pad connected: pad counters stay 0)
-  toast     resting toast card
-  launcher  idle immersive Launcher
-  browser   idle standalone Browser
+  osk          Browser + system OSK open (no pad connected: pad counters stay 0)
+  toast        resting toast card
+  launcher     idle immersive Launcher
+  browser      idle standalone Browser (static local page)
+  browser_anim standalone Browser on an animated local page (rAF counter)
 
 Exit status is 0 for a measurement run; pass ``--assert`` to enforce the
-post-migration idle budgets (no OSK/toast/Launcher/Browser frame traffic).
+post-migration idle budgets (no OSK/toast/Launcher/Browser frame traffic) and
+the BF-1 contract: an animated page must present at display rate with no input,
+while the static page stays silent.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ OPEN = {
     "toast": "toast",
     "launcher": "launcher",
     "browser": "browser",
+    "browser_anim": "browser",
 }
 
 # Cumulative counters that must not advance while the scenario is idle.
@@ -42,14 +46,39 @@ ASSERT_MSGS = {
     "osk": ("pad_input", "osk", "browser_frame", "toast_frame", "launcher_frame"),
     "toast": ("toast_frame",),
     "launcher": ("launcher_frame",),
-    "browser": ("browser_frame",),
+    # A static page must not wake the app from CEF paints.
+    "browser": ("browser_frame", "browser_engine"),
+    "browser_anim": (),
 }
 TARGET_VIEW = {
     "osk": "osk",
     "toast": "toast",
     "launcher": "launcher",
     "browser": "browser",
+    "browser_anim": "browser",
 }
+MIN_BROWSER_FPS = 45.0
+
+ANIMATED_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>anim</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#101820;font-family:Arial,sans-serif}
+#wash{position:absolute;inset:0;background:#102a43}
+#n{position:absolute;left:48px;top:48px;font-size:64px;color:#fff}
+</style></head><body><div id="wash"></div><div id="n">0</div>
+<script>
+const wash = document.getElementById('wash');
+const n = document.getElementById('n');
+let frame = 0;
+function tick(t) {
+  frame += 1;
+  n.textContent = String(frame);
+  const p = (Math.sin(t / 250) + 1) / 2;
+  wash.style.background = 'rgb(' + Math.round(20 + p * 110) + ','
+    + Math.round(40 + p * 60) + ',' + Math.round(80 + p * 90) + ')';
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script></body></html>"""
 
 TOKEN = re.compile(r"([a-z_]+)=(\d+)")
 
@@ -137,8 +166,13 @@ def main() -> int:
     # and a local blank page instead of the network default page.
     (data / "prefs.json").write_text('{"update_boot_check": false}', encoding="utf-8")
     page = data / "idle.html"
-    page.write_text("<!doctype html><title>idle</title>", encoding="utf-8")
-    tabs = {"tabs": [{"url": page.as_uri(), "title": "idle"}], "active": 0}
+    if args.scenario == "browser_anim":
+        page.write_text(ANIMATED_PAGE, encoding="utf-8")
+        title = "anim"
+    else:
+        page.write_text("<!doctype html><title>idle</title>", encoding="utf-8")
+        title = "idle"
+    tabs = {"tabs": [{"url": page.as_uri(), "title": title}], "active": 0}
     (data / "tabs.json").write_text(json.dumps(tabs), encoding="utf-8")
     log = data / "app.log"
     env = os.environ.copy()
@@ -195,6 +229,23 @@ def main() -> int:
                     failures.append(
                         f"redraw.{target}={target_redraws} > msgs={total_messages}"
                     )
+            if args.scenario == "browser":
+                # A static page must not generate redraws beyond the global
+                # messages (the 500ms cursor-hide tick is allowed).
+                target_redraws = delta.get("redraw.browser", 0)
+                if target_redraws > total_messages:
+                    failures.append(
+                        f"static redraw.browser={target_redraws} > msgs={total_messages}"
+                    )
+            if args.scenario == "browser_anim":
+                # BF-1: CEF paints wake the idle UI at display rate.
+                rate = delta.get("redraw.browser", 0) / max(window, 0.001)
+                engine_wakes = delta.get("msg.browser_engine", 0)
+                print(f"browser fps={rate:.1f} engine_wakes={engine_wakes}")
+                if rate < MIN_BROWSER_FPS:
+                    failures.append(f"animated redraw.browser={rate:.1f}/s < 45")
+                if engine_wakes <= 0:
+                    failures.append("animated page produced no engine wake events")
             if failures:
                 print("error: idle traffic: " + ", ".join(failures), file=sys.stderr)
                 return 1

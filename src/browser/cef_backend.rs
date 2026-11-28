@@ -902,6 +902,12 @@ cef::wrap_render_handler! {
             self.ctx
                 .frame
                 .write(width as u32, height as u32, rgba, &url);
+            // Pixels stay in the slot; the UI only needs the wake fact so a
+            // visible page repaints at CEF paint cadence while the pad is idle.
+            self.ctx.handle.emit(EngineEvent::FrameReady {
+                tab: self.ctx.tab,
+                generation: self.ctx.frame.generation(),
+            });
         }
 
         fn on_scroll_offset_changed(

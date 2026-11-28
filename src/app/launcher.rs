@@ -1501,6 +1501,21 @@ impl App {
                 #[cfg(debug_assertions)]
                 return shot;
             }
+            EngineEvent::FrameReady {
+                tab: _,
+                generation: _,
+            } => {
+                if !frame_ready_should_wake(
+                    self.browser.panel.active_tab,
+                    tab,
+                    self.browser.panel.session.is_open(),
+                ) {
+                    return Task::none();
+                }
+                // Lightweight wake only: the shader uploads the slot's newer
+                // generation on this redraw; no pixels crossed the channel.
+                return self.invalidate_browser_window();
+            }
             EngineEvent::TitleChanged { tab: _, title } => {
                 self.browser.panel.title_generation =
                     self.browser.panel.title_generation.wrapping_add(1);
@@ -1744,6 +1759,7 @@ impl App {
                 },
                 EngineEvent::Frame(_)
                 | EngineEvent::FrameSlot { .. }
+                | EngineEvent::FrameReady { .. }
                 | EngineEvent::TabOpened { .. }
                 | EngineEvent::TabClosed { .. }
                 | EngineEvent::PopupRequested { .. }
@@ -4916,13 +4932,38 @@ pub(crate) fn launcher_focus_move_frozen(message: &LauncherMessage) -> bool {
     matches!(message, LauncherMessage::MoveUp | LauncherMessage::MoveDown)
 }
 
+/// A CEF paint wakes the standalone Browser only for the active tab while the
+/// page surface is open. Background tabs and a closed surface stay silent.
+pub(crate) fn frame_ready_should_wake(
+    active_tab: crate::browser::engine::TabId,
+    event_tab: crate::browser::engine::TabId,
+    session_open: bool,
+) -> bool {
+    session_open && event_tab == active_tab
+}
+
 #[cfg(test)]
 mod tests {
     use super::{launcher_cold_allows, launcher_focus_move_frozen, launcher_tap_action};
+    use crate::browser::engine::TabId;
     use crate::domain::pad::{PadAction, PadButton, PadButtonAction, PadId};
     use crate::ui::launcher::input::NavAction;
     use crate::ui::launcher::settings::{SettingsPanel, SettingsRow};
     use crate::ui::launcher::view::LauncherMessage;
+
+    #[test]
+    fn frame_ready_wakes_only_the_open_active_page() {
+        let active = TabId(7);
+        assert!(super::frame_ready_should_wake(active, active, true));
+        assert!(
+            !super::frame_ready_should_wake(active, TabId(8), true),
+            "a background tab paint must not wake the page"
+        );
+        assert!(
+            !super::frame_ready_should_wake(active, active, false),
+            "a closed Browser surface must not wake"
+        );
+    }
 
     #[test]
     fn launcher_taps_map_to_semantic_actions() {

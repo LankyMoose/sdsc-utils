@@ -434,6 +434,12 @@ pub enum EngineEvent {
         tab: TabId,
         slot: Arc<FrameSlot>,
     },
+    /// CEF painted a new frame into the tab's [`FrameSlot`]. Pixels stay in
+    /// the slot; this is only the wake fact so the visible page redraws.
+    FrameReady {
+        tab: TabId,
+        generation: u64,
+    },
     /// Engine-opened tab (`window.open`): carries the slot the worker
     /// writes into, so the UI adopts both in one event.
     TabOpened {
@@ -454,6 +460,7 @@ impl EngineEvent {
         match self {
             Self::Frame(f) => Some(f.tab),
             Self::FrameSlot { tab, .. } => Some(*tab),
+            Self::FrameReady { tab, .. } => Some(*tab),
             Self::TitleChanged { tab, .. }
             | Self::UrlChanged { tab, .. }
             | Self::FaviconChanged { tab, .. }

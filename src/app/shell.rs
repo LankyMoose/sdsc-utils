@@ -49,7 +49,6 @@ impl App {
         self.shell_presented = false;
         self.shell_reveal_armed = false;
         self.shell_reveal_generation = self.shell_reveal_generation.wrapping_add(1);
-        self.shell_reveal_started = Some(std::time::Instant::now());
         let generation = self.shell_reveal_generation;
         // Invalidate any hide task still queued from the previous dismiss:
         // the raw offscreen show below bypasses `shell_visibility_task`, so
@@ -57,23 +56,18 @@ impl App {
         self.shell_visibility_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mode = self.shell_mode;
-        let enter = self.start_shell_enter(mode);
         if mode == ShellScreen::Browser {
             self.sync_browser_viewport();
         }
-        // Prime an offscreen frame with the entrance pose, then move the warm
-        // surface onscreen. The arming message is produced only after the
-        // window action returns, so it cannot arm before the prime exists.
-        // A redraw already queued from the old surface is ignored; arming
-        // invalidates again so the gate sees a frame drawn after the prime.
+        // Prime the warm surface with the hidden/closed pose offscreen, then
+        // arm. The entrance clock starts at arm, never here: the prime is not
+        // visible and must not consume the entrance. Arming invalidates again
+        // so the gate can only accept a frame drawn after it.
         // The timer is only a lost-event fallback. Quiet QA runs the same
         // gate (its present step stays offscreen), so automation exercises
         // the real PS reveal path.
-        enter
-            .chain(
-                layout::show_shell_offscreen(id)
-                    .map(move |_| Message::ShellRevealArmed(id, generation)),
-            )
+        layout::show_shell_offscreen(id)
+            .map(move |_| Message::ShellRevealArmed(id, generation))
             .chain(Task::perform(
                 super::delay(std::time::Duration::from_millis(250)),
                 move |_| Message::ShellPresent(id, generation),
@@ -109,29 +103,45 @@ impl App {
             .chain(layout::force_shell_foreground(id))
     }
 
-    /// The offscreen prime ran; wait for that window's first redraw before
-    /// moving it onscreen.
+    /// The offscreen prime ran; arm the drawn-frame gate and start the one
+    /// entrance clock for this show.
     pub(crate) fn on_shell_reveal_armed(&mut self, id: window::Id) -> Task<Message> {
         if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
             return Task::none();
         }
         self.shell_reveal_armed = true;
-        // Restart the entrance at the arm point. Preparing the offscreen
-        // prime (and any CEF/session work) can take 100ms+, so an entrance
-        // clock started in `on_shell_show_now` would already be near the
-        // resting pose. The gate then waits for this fresh t=0 redraw.
         self.shell_reveal_started = Some(std::time::Instant::now());
-        crate::controller::hid::diag::diag_info("ui-diag: shell reveal armed");
+        // Only a view built after this point carries the entrance pose. The
+        // invalidation below builds one; the gate rejects every earlier draw.
+        self.shell_reveal_arm_draw = self.shell_draw_epoch.get();
+        crate::controller::hid::diag::diag_info(format!(
+            "ui-diag: shell reveal armed generation={} draw_epoch={}",
+            self.shell_reveal_generation, self.shell_reveal_arm_draw
+        ));
         self.start_shell_enter(self.shell_mode)
     }
 
-    /// First redraw of the primed shell: the entrance pose has painted (the
-    /// event is broadcast after draw/present), so it is safe to reveal.
-    pub(crate) fn on_shell_redraw(&mut self, id: window::Id) -> Task<Message> {
-        if self.shell_reveal_armed && self.shell_window == Some(id) {
+    /// First redraw of the primed shell after arm: the entrance pose has been
+    /// built and painted, so it is safe to reveal.
+    pub(crate) fn on_shell_redraw(&mut self, id: window::Id, generation: u64) -> Task<Message> {
+        if self.shell_window == Some(id) && self.reveal_frame_ready(generation) {
             return self.on_shell_present(id, "redraw");
         }
         Task::none()
+    }
+
+    /// The gate: armed for this show, matching generation, and the shell view
+    /// has been rebuilt after arm (a pre-arm/queued redraw can never pass).
+    fn reveal_frame_ready(&self, generation: u64) -> bool {
+        reveal_frame_ready(
+            self.shell_reveal_armed,
+            self.shell_presented,
+            self.shell_hidden,
+            generation,
+            self.shell_reveal_generation,
+            self.shell_draw_epoch.get(),
+            self.shell_reveal_arm_draw,
+        )
     }
 
     /// Present the shell on the monitor after the offscreen entrance frame.
@@ -140,29 +150,27 @@ impl App {
         id: window::Id,
         source: &'static str,
     ) -> Task<Message> {
-        if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
+        if self.shell_window != Some(id)
+            || self.shell_hidden
+            || self.shell_presented
+            || !self.reveal_frame_ready(self.shell_reveal_generation)
+            || self.shell_drawn_generation.get() != self.shell_reveal_generation
+        {
             return Task::none();
         }
         let mode = self.shell_mode;
         self.shell_reveal_armed = false;
         self.shell_presented = true;
         let now = std::time::Instant::now();
-        let reduced =
-            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
-        let anim = match mode {
-            ShellScreen::Home => self.home_shell_anim,
-            ShellScreen::Browser => self.browser_shell_anim,
-            ShellScreen::Launcher => self.launcher_shell_anim,
-        };
-        let panel = anim
-            .map(|anim| anim.frame(now, reduced).panel)
-            .unwrap_or_else(crate::ui::home::PanelVisual::full);
-        let elapsed_ms = anim
-            .map(|anim| now.saturating_duration_since(anim.started()).as_millis())
-            .or_else(|| {
-                self.shell_reveal_started
-                    .map(|started| now.saturating_duration_since(started).as_millis())
-            })
+        // Report the pose of the frame the view actually built (already drawn
+        // by the time this message runs), never a recomputed wall-clock pose.
+        let drawn = self.shell_drawn_frame.get();
+        let panel = drawn.panel;
+        let draw_epoch = self.shell_draw_epoch.get();
+        let arm_draw = self.shell_reveal_arm_draw;
+        let elapsed_ms = self
+            .shell_reveal_started
+            .map(|started| now.saturating_duration_since(started).as_millis())
             .unwrap_or(0);
         self.shell_reveal_started = None;
         // Launcher never applies scale/offset (fade only); report the pose
@@ -178,7 +186,9 @@ impl App {
             panel.offset_y
         };
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: shell first present mode={mode:?} source={source} elapsed_ms={elapsed_ms} scale={applied_scale:.3} offset_y={applied_y:.1} alpha={:.3} veil={:.3}",
+            "ui-diag: shell first present mode={mode:?} source={source} generation={} draw_generation={} draw_epoch={draw_epoch} arm_draw={arm_draw} elapsed_ms={elapsed_ms} scale={applied_scale:.3} offset_y={applied_y:.1} alpha={:.3} veil={:.3}",
+            self.shell_reveal_generation,
+            self.shell_drawn_generation.get(),
             panel.alpha,
             1.0 - panel.alpha
         ));
@@ -206,6 +216,46 @@ impl App {
             Task::none()
         };
         level.chain(show).chain(toast).chain(launcher)
+    }
+
+    /// Resolve the shell pose for a view build. A hidden/closed shell holds
+    /// its hidden pose even when no animation is live; `None` must never mean
+    /// the settled `full` pose while the warm window is hidden.
+    pub(crate) fn resolved_shell_frame(
+        &self,
+        anim: Option<crate::ui::home::ShellAnim>,
+        now: std::time::Instant,
+    ) -> crate::ui::home::ShellFrame {
+        let reduced =
+            crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
+        resolve_shell_frame(self.shell_render_hidden, anim, now, reduced)
+    }
+
+    /// Record the pose of the shell view currently being built. `view()` gets
+    /// `&self`; the epoch is diagnostic/reveal state only.
+    pub(crate) fn note_shell_draw(&self, frame: crate::ui::home::ShellFrame) {
+        let epoch = self.shell_draw_epoch.get().wrapping_add(1);
+        self.shell_draw_epoch.set(epoch);
+        self.shell_drawn_generation
+            .set(self.shell_reveal_generation);
+        self.shell_drawn_frame.set(frame);
+    }
+
+    /// Cheap hidden/closed shell surface: no card, no page, and no full pose
+    /// left in the warm surface while the HWND is hidden or mid-hide.
+    pub(crate) fn hidden_shell_view(&self) -> iced::Element<'_, Message> {
+        use iced::Length::Fill;
+        use iced::widget::{container, space};
+        let veil = if self.shell_mode == ShellScreen::Launcher {
+            1.0
+        } else {
+            0.0
+        };
+        container(space())
+            .width(Fill)
+            .height(Fill)
+            .style(crate::ui::theme::scrim(veil))
+            .into()
     }
 
     /// Point the per-screen aliases at the one shell HWND for `mode`.
@@ -407,6 +457,7 @@ impl App {
 
     pub(crate) fn start_shell_enter(&mut self, mode: ShellScreen) -> Task<Message> {
         let now = std::time::Instant::now();
+        self.shell_render_hidden = false;
         match mode {
             ShellScreen::Home => {
                 self.home_shell_anim = Some(crate::ui::home::ShellAnim::enter(now));
@@ -434,6 +485,10 @@ impl App {
 
     /// Hide the warm shell window after the exit animation settles.
     pub(crate) fn hide_shell_window(&mut self) -> Task<Message> {
+        // Hold the hidden pose in the warm surface before clearing animation
+        // state; a redraw between here and the raw hide must never fall back
+        // to a settled full card.
+        self.shell_render_hidden = true;
         self.home_shell_anim = None;
         self.browser_shell_anim = None;
         self.clear_shell_aliases();
@@ -459,5 +514,79 @@ impl App {
         };
         self.shell_visibility_task(id, false)
             .chain(self.rehost_toast_after_composite())
+    }
+}
+
+/// Resolve the shell pose for one view build. A hidden/closed shell keeps the
+/// hidden pose even when no animation is live; clearing an animation can never
+/// fall back to `full`.
+pub(crate) fn resolve_shell_frame(
+    hidden: bool,
+    anim: Option<crate::ui::home::ShellAnim>,
+    now: std::time::Instant,
+    reduced: bool,
+) -> crate::ui::home::ShellFrame {
+    if hidden {
+        return crate::ui::home::ShellFrame::hidden();
+    }
+    anim.map(|anim| anim.frame(now, reduced))
+        .unwrap_or_else(crate::ui::home::ShellFrame::full)
+}
+
+/// The reveal gate: only a frame drawn after this show's arm, for the current
+/// generation, may move the warm shell onscreen.
+pub(crate) fn reveal_frame_ready(
+    armed: bool,
+    presented: bool,
+    hidden: bool,
+    message_generation: u64,
+    current_generation: u64,
+    draw_epoch: u64,
+    arm_draw: u64,
+) -> bool {
+    armed
+        && !presented
+        && !hidden
+        && message_generation == current_generation
+        && draw_epoch > arm_draw
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_shell_frame, reveal_frame_ready};
+    use crate::ui::home::{PanelVisual, ShellAnim, ShellFrame};
+    use std::time::Instant;
+
+    #[test]
+    fn pre_arm_or_stale_generation_cannot_present() {
+        // Armed at epoch 10 and presented / stale message both fail.
+        assert!(!reveal_frame_ready(true, true, false, 3, 3, 11, 10));
+        assert!(!reveal_frame_ready(true, false, false, 2, 3, 11, 10));
+        assert!(!reveal_frame_ready(false, false, false, 3, 3, 11, 10));
+        // A redraw drawn before/at arm is not the entrance frame.
+        assert!(!reveal_frame_ready(true, false, false, 3, 3, 10, 10));
+        // A frame built after arm for this generation may present.
+        assert!(reveal_frame_ready(true, false, false, 3, 3, 11, 10));
+    }
+
+    #[test]
+    fn hidden_shell_never_falls_back_to_full() {
+        let now = Instant::now();
+        // Exit completion clears the animation; hidden must still win.
+        assert_eq!(
+            resolve_shell_frame(true, None, now, false),
+            ShellFrame::hidden()
+        );
+        // Even a live animation cannot make a hidden shell draw a full pose.
+        assert_eq!(
+            resolve_shell_frame(true, Some(ShellAnim::enter(now)), now, false),
+            ShellFrame::hidden()
+        );
+        assert_eq!(
+            resolve_shell_frame(false, None, now, false),
+            ShellFrame::full()
+        );
+        assert_eq!(ShellFrame::hidden().panel, PanelVisual::hidden());
+        assert!(ShellFrame::hidden().panel.alpha < 0.01);
     }
 }

@@ -473,33 +473,78 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        # REV-1: every PS reveal must present the entrance pose, never the
-        # warmed window's final resting frame (alpha 1 / scale 1).
+        # REV-2: every PS reveal must present the entrance pose from a frame
+        # drawn after that show's arm. The log carries the generation plus the
+        # shell draw epoch recorded by the view, not a handler-time pose.
+        arm_epochs: dict[int, int] = {}
+        for line in log_text.splitlines():
+            if "ui-diag: shell reveal armed" not in line:
+                continue
+            generation = re.search(r"\bgeneration=(\d+)", line)
+            epoch = re.search(r"\bdraw_epoch=(\d+)", line)
+            if generation and epoch:
+                arm_epochs[int(generation.group(1))] = int(epoch.group(1))
         presents = [
             line
             for line in log_text.splitlines()
             if "ui-diag: shell first present" in line
         ]
-        alphas = [
-            float(match.group(1))
-            for line in presents
-            if (match := re.search(r"alpha=([0-9.]+)", line))
-        ]
-        sources = [
-            match.group(1)
-            for line in presents
-            if (match := re.search(r"source=([a-z-]+)", line))
-        ]
+        parsed: list[dict[str, object]] = []
+        for line in presents:
+            fields = {
+                name: match.group(1)
+                for name, match in (
+                    (name, re.search(rf"\b{name}=([0-9]+)", line))
+                    for name in (
+                        "generation",
+                        "draw_generation",
+                        "draw_epoch",
+                        "arm_draw",
+                    )
+                )
+                if match
+            }
+            source = re.search(r"\bsource=([a-z-]+)", line)
+            alpha = re.search(r"\balpha=([0-9.]+)", line)
+            parsed.append(
+                {
+                    "source": source.group(1) if source else "",
+                    "alpha": float(alpha.group(1)) if alpha else 1.0,
+                    **{key: int(value) for key, value in fields.items()},
+                }
+            )
+        generations = [entry.get("generation") for entry in parsed]
+        required = ("generation", "draw_generation", "draw_epoch", "arm_draw")
         pose_ok = (
-            bool(alphas)
-            and all(alpha < 0.9 for alpha in alphas)
-            and all(source == "redraw" for source in sources)
+            bool(parsed)
+            and all(entry["source"] == "redraw" for entry in parsed)
+            and all(entry["alpha"] < 0.9 for entry in parsed)
+            and all(
+                all(isinstance(entry.get(key), int) for key in required)
+                for entry in parsed
+            )
+            and all(
+                entry.get("generation") == entry.get("draw_generation")
+                for entry in parsed
+            )
+            and all(
+                entry.get("draw_epoch", 0) > entry.get("arm_draw", 0)
+                and entry.get("arm_draw") == arm_epochs.get(entry.get("generation"))
+                for entry in parsed
+            )
+            and all(
+                later > earlier
+                for earlier, later in zip(generations, generations[1:])
+            )
         )
-        print(f"check first shell present is entrance pose: {'ok' if pose_ok else 'FAIL'}")
-        print(f"presents={len(presents)} sources={sources}")
+        print(f"check first shell present is drawn after arm: {'ok' if pose_ok else 'FAIL'}")
+        print(
+            f"presents={len(presents)} "
+            f"details={[(e.get('source'), e.get('generation'), e.get('draw_epoch'), e.get('arm_draw'), e.get('alpha')) for e in parsed]}"
+        )
         if not pose_ok:
             print(
-                f"error: shell presented a resting pose first: {presents}",
+                f"error: shell presented a stale/pre-arm/resting frame: {presents}",
                 file=sys.stderr,
             )
             return 1
