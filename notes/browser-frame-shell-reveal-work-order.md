@@ -59,12 +59,24 @@ filtering, tab-state refactors, and unrelated shell feedback are out of scope.
 - `on_shell_present` logs `anim.frame(now)` at message-handling time
   (`src/app/shell.rs:149-184`). That pose is not necessarily the pose in the
   pixels that were drawn, presented, or composited.
+- **The warm surface is left holding a settled frame, not the hidden exit
+  frame.** `finish_home_close` / `finish_browser_window_close` /
+  `finish_launcher_close` clear `*_shell_anim` before the raw hide runs
+  (`src/app/home.rs:593-608`, `src/app/browser.rs:3167-3183`,
+  `src/app/launcher.rs:4665-4680`). With the anim `None`, the view falls back
+  to `PanelVisual::full()` / `ShellFrame::full()`
+  (`src/app/mod.rs:1948-1951`, `1986-1989`; Launcher branch ~`2085-2100`).
+  Every message requests a redraw for every window, so the same update that
+  clears the animation can draw/present the full pose before or while the
+  hide task runs. That full frame becomes the warm surface contents.
 - `show_shell_offscreen` / `show_shell_at_cover` show and move the warm HWND,
-  invalidating after the move (`src/ui/layout.rs:293-315`, `324-360`). The
-  compositor can still hold the previous settled surface during the move.
+  invalidating after the move (`src/ui/layout.rs:293-315`, `324-360`). Even
+  though the offscreen prime draws an entrance pose, the previous settled
+  surface can be composited during/until the new frame is presented.
 - QA gap: `qa_browser_grid.py:476-502` only checks
   `source=redraw` and an alpha parsed from the handler log. It cannot detect a
-  pre-arm redraw or a stale composited surface.
+  pre-arm redraw, a full-pose frame left in the warm surface, or a stale
+  composited surface.
 
 ## 3. Locked rules
 
@@ -81,12 +93,15 @@ filtering, tab-state refactors, and unrelated shell feedback are out of scope.
    `on_shell_show_now` and restart it at arm. Start it once when the gate is
    armed; the offscreen prime may draw a non-entrance pose because it is not
    visible.
-6. **The trace/QA must describe the drawn frame**, not `anim.frame(now)` in a
+6. **The shell never renders a full pose while hidden or after exit.** Keep a
+   distinct closed/hidden render state (or hold the exit frame at hidden) until
+   the entrance takes over. Clearing an animation must not fall back to `full`.
+7. **The trace/QA must describe the drawn frame**, not `anim.frame(now)` in a
    later message handler.
-7. Preserve: one shell HWND, 300 ms focus fallback, topmost/foreground
+8. Preserve: one shell HWND, 300 ms focus fallback, topmost/foreground
    behavior, reduced motion, the 500 ms cursor-hide tick, and the existing PS
    release semantics.
-8. Smallest stable diff. No adjacent screen/animation refactors.
+9. Smallest stable diff. No adjacent screen/animation refactors.
 
 ## 4. Work items
 
@@ -116,6 +131,11 @@ filtering, tab-state refactors, and unrelated shell feedback are out of scope.
 - Add the reveal generation to `ShellRedraw(id, generation)`; the raw listener
   captures the generation current at subscription time, and
   `on_shell_redraw` ignores mismatches.
+- **Add a true hidden render state for the shell.** `finish_*_close` must not
+  clear the animation and let the view fall back to `full`. Hold the exit frame
+  at hidden (or add a `ShellRenderState::Hidden`) until the next entrance, and
+  make the offscreen prime draw that hidden/entrance pose. Clearing animation
+  state must never render a settled frame into the warm surface.
 - Remove `start_shell_enter` from `on_shell_show_now`. In
   `on_shell_reveal_armed`, reset the clock once and record
   `shell_reveal_arm_draw = current shell draw epoch`.
@@ -137,6 +157,8 @@ filtering, tab-state refactors, and unrelated shell feedback are out of scope.
   behavior. They remain subordinate to the one show epoch.
 - Unit test: a pre-arm redraw/generation cannot present; a post-arm drawn frame
   can; a stale generation cannot present a newer show.
+- Unit test: after an exit completes and the window is hidden, the last view
+  built for the shell uses the hidden pose, not `full`.
 
 ### QA-1 - prove the actual contracts
 
@@ -160,8 +182,8 @@ filtering, tab-state refactors, and unrelated shell feedback are out of scope.
 - Browser animation presents at display rate with no cursor movement or input,
   and the static idle page still does not spin.
 - Repeated PS open/close never presents a settled frame before the entrance;
-  every present is for a frame drawn after that show's arm and its generation
-  matches.
+  every present is for a frame drawn after that show's arm, its generation
+  matches, and the warm hidden surface holds the hidden pose.
 - No new global timer, subscription, window, or IPC process. One shell HWND
   and one backdrop owner preserved.
 - `cargo fmt --all -- --check`, debug/release clippy, all tests, debug/release
@@ -192,6 +214,8 @@ python scripts/qa_idle_redraw.py --scenario browser --assert
 - Do not let a background tab or hidden shell wake the visible page.
 - Do not present on fallback/stale generation; keep the 300 ms focus fallback
   as a safety net only.
+- Do not let `None` mean `full` for a hidden/closed shell; that is the stale
+  settled-frame bug.
 - Preserve the warm HWND, topmost/foreground fallback, reduced motion, and
   Launcher fade-only behavior.
 - Keep changes confined to the files above; no security, tab-model, or adblock
@@ -204,6 +228,9 @@ python scripts/qa_idle_redraw.py --scenario browser --assert
 - `src/ui/launcher/browser_frame.rs:420` - shader update depends on a redraw.
 - `src/app/mod.rs:1807` - 2 Hz `ShellCursorTick` while a shell screen is visible.
 - `src/app/shell.rs:42` / `114` / `130` / `138` - show, arm, redraw gate, present.
+- `src/app/home.rs:593`, `src/app/browser.rs:3167`,
+  `src/app/launcher.rs:4665` - exit completion clears the anim before hide.
+- `src/app/mod.rs:1948` / `1986` - view fallback from `None` is `full`.
 - `src/app/mod.rs:1701` - raw redraw listener without generation.
 - `src/ui/layout.rs:293` / `324` - offscreen prime and cover move.
 - `scripts/qa_browser_grid.py:476` - log-only reveal assertion.
