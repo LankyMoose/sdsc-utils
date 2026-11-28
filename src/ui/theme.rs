@@ -32,6 +32,9 @@ pub const SIDEBAR: Color = darken(BASE_BG, SIDEBAR_DARKEN);
 /// Raised interactive surfaces (chips, list surfaces, buttons).
 pub const PANEL: Color = lighten(BASE_BG, PANEL_LIFT);
 pub const PANEL_HOVER: Color = lighten(BASE_BG, PANEL_HOVER_LIFT);
+/// Opaque shell card fill shared by the Home panel/settings and the Browser
+/// card. Never translucent: the desktop must not tint the card.
+pub const SHELL_PANEL: Color = lighten(BASE_BG, 0.04);
 /// Window and widget hairlines.
 pub const LINE: Color = lighten(BASE_BG, LINE_LIFT);
 
@@ -319,7 +322,7 @@ pub fn menu_panel(_theme: &Theme) -> container::Style {
 pub fn menu_panel_fade(fade: f32) -> impl Fn(&Theme) -> container::Style {
     let fade = fade.clamp(0.0, 1.0);
     move |_theme: &Theme| container::Style {
-        background: Some(Background::Color(scale_alpha(lighten(BASE_BG, 0.04), fade))),
+        background: Some(Background::Color(scale_alpha(SHELL_PANEL, fade))),
         text_color: Some(scale_alpha(INK, fade)),
         border: Border {
             color: scale_alpha(GLASS_HAIRLINE, fade),

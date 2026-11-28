@@ -698,14 +698,14 @@ pub fn root_view(
             (card_rect, page_body)
         };
         let page = grid::transition_page(panel, engine_available, anim.tab, page_body, fade);
-        layers.push(grid::flip_page(
+        let flip = grid::flip_page(
             page, anim, page_body, source, target, grid_mode, page_card, tabs.card, stage,
-        ));
+        );
         let header_rect = iced::Rectangle::new(
             iced::Point::new(page_inner.x, page_inner.y),
             iced::Size::new(page_layout.page_w, BROWSER_HEADER_TOTAL),
         );
-        layers.push(grid::positioned(
+        let header = grid::positioned(
             grid::header_curtain(
                 browser_header(panel, page_layout.page_w, fade),
                 anim,
@@ -719,7 +719,16 @@ pub fn root_view(
             header_rect,
             stage_w,
             stage_h,
-        ));
+        );
+        if anim.entering {
+            layers.push(flip);
+            layers.push(header);
+        } else {
+            // Header first: the growing page covers it until it slides above
+            // the page body's top edge.
+            layers.push(header);
+            layers.push(flip);
+        }
     }
     let stage_stack = stack(layers)
         .width(Length::Fixed(stage_w))

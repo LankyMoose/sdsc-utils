@@ -120,7 +120,7 @@ fn decode_svg(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// `tiny-skia` pixmaps are premultiplied; iced image handles are not.
-fn unpremultiply(rgba: &mut [u8]) {
+pub(crate) fn unpremultiply(rgba: &mut [u8]) {
     for px in rgba.as_chunks_mut::<4>().0 {
         let alpha = px[3] as u32;
         if alpha == 0 {
@@ -219,6 +219,19 @@ mod tests {
         assert_eq!((w, h), (64, 64));
         assert_eq!(rgba.len(), 64 * 64 * 4);
         assert_eq!(&rgba[0..3], &[0x33, 0x66, 0x99]);
+    }
+
+    #[test]
+    fn decodes_generated_solid_png() {
+        // Same bytes the tab-grid QA fixture serves over HTTP.
+        let bytes = base64_decode(
+            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR42mM4YKn9nxLMMGrAqAGjBgwXAwAFqSMfJUtiTQAAAABJRU5ErkJggg==",
+        )
+        .unwrap();
+        let (w, h, rgba) = decode(&bytes).unwrap();
+        assert_eq!((w, h), (64, 64));
+        assert!(rgba[0] > 150 && rgba[1] < 100 && rgba[2] < 100);
+        assert_eq!(rgba[3], 255);
     }
 
     #[test]

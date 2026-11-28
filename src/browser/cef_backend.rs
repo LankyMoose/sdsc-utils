@@ -1541,6 +1541,8 @@ fn favicon_image_to_rgba(image: &mut Image) -> Option<(u32, u32, Vec<u8>)> {
         if len == expected {
             let mut rgba = vec![0u8; len];
             if bitmap.data(Some(&mut rgba), 0) == len {
+                // CEF/Skia bitmaps are premultiplied; image handles are not.
+                crate::browser::favicon::unpremultiply(&mut rgba);
                 return Some((width as u32, height as u32, rgba));
             }
         }

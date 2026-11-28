@@ -20,7 +20,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Renderer as _, Shell, overlay, renderer};
 use iced::widget::text::Wrapping;
-use iced::widget::{container, mouse_area, row, scrollable, space, stack, svg, text};
+use iced::widget::{container, image, mouse_area, row, scrollable, space, stack, svg, text};
 use iced::{
     Alignment, Background, Element, Event, Fill, Length, Padding, Point, Rectangle, Size,
     Transformation, Vector, mouse, window,
@@ -30,6 +30,9 @@ use iced::{
 /// of the way of the next input.
 pub const GRID_ANIM_MS: u64 = 320;
 const GRID_ANIM: Duration = Duration::from_millis(GRID_ANIM_MS);
+/// Fraction of a leaving FLIP spent growing the page. The remainder is the
+/// header slide-up after the page has settled.
+const GRID_PAGE_PHASE: f32 = 0.65;
 
 #[cfg(debug_assertions)]
 static GRID_TICK_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -140,6 +143,27 @@ impl GridAnim {
         }
     }
 
+    /// Page growth clock. Entering keeps the original full FLIP clock; leaving
+    /// settles the page before the header reveal begins.
+    pub fn page_progress(&self, now: Instant) -> f32 {
+        let progress = self.progress(now);
+        if self.entering {
+            progress
+        } else {
+            (progress / GRID_PAGE_PHASE).min(1.0)
+        }
+    }
+
+    /// Leaving-only header reveal, 0 while the page is still growing and
+    /// 0..1 once it has settled.
+    pub fn header_progress(&self, now: Instant) -> f32 {
+        if self.entering {
+            0.0
+        } else {
+            ((self.progress(now) - GRID_PAGE_PHASE) / (1.0 - GRID_PAGE_PHASE)).clamp(0.0, 1.0)
+        }
+    }
+
     pub fn done(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.started) >= GRID_ANIM
     }
@@ -168,11 +192,35 @@ pub fn card_rect_at(
         GridMode::Page => page,
         GridMode::Grid => tabs,
         GridMode::Entering => anim
-            .map(|anim| lerp_rect(page, tabs, anim.progress(now)))
+            .map(|anim| lerp_rect(page, tabs, anim.page_progress(now)))
             .unwrap_or(tabs),
         GridMode::Leaving => anim
-            .map(|anim| lerp_rect(tabs, page, anim.progress(now)))
+            .map(|anim| lerp_rect(tabs, page, anim.page_progress(now)))
             .unwrap_or(page),
+    }
+}
+
+/// Card-shell rect. Leaving the tabs view grows only the page; the compact
+/// shell stays put (covered as the page expands) until the header phase, when
+/// the full page card sits behind the settled page for the header slide.
+pub fn shell_rect_at(
+    mode: GridMode,
+    anim: Option<GridAnim>,
+    page: Rectangle,
+    tabs: Rectangle,
+    now: Instant,
+) -> Rectangle {
+    match mode {
+        GridMode::Leaving => anim
+            .map(|anim| {
+                if anim.header_progress(now) > 0.0 {
+                    page
+                } else {
+                    tabs
+                }
+            })
+            .unwrap_or(page),
+        _ => card_rect_at(mode, anim, page, tabs, now),
     }
 }
 
@@ -427,6 +475,7 @@ pub struct GridTab {
     pub loaded: bool,
     pub slot: Option<Arc<FrameSlot>>,
     pub has_frame: bool,
+    pub favicon: Option<iced::widget::image::Handle>,
 }
 
 /// Resolve the frozen visual order to card data. Unknown ids are skipped;
@@ -458,6 +507,7 @@ pub fn grid_tabs(panel: &BrowserPanel, order: &[TabId]) -> Vec<GridTab> {
                 loaded: panel.tab_loaded(id),
                 has_frame: page.session.has_frame(),
                 slot: Some(Arc::clone(page.session.frame_slot())),
+                favicon: panel.favicon_for(&url),
                 url,
             })
         })
@@ -1023,7 +1073,7 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for FlipPage<'a> {
             return;
         };
         let now = Instant::now();
-        let t = self.anim.progress(now);
+        let t = self.anim.page_progress(now);
         let current = lerp_rect(self.source, self.target, t);
         let clip = card_rect_at(
             self.mode,
@@ -1083,13 +1133,14 @@ impl<'a> From<FlipPage<'a>> for Element<'a, BrowserMessage> {
     }
 }
 
-/// Draw-time header enter/exit curtain. The header slides up into place and
-/// fades in while the page grows on a Leaving transition; entering reverses it
-/// (slide down + fade out) on the same clock as the page shrink.
+/// Draw-time header enter/exit curtain. Entering the tabs view lifts the
+/// header out of its row as it fades. Leaving the tabs view grows the page
+/// first, then slides the header up from under the settled page.
 ///
-/// iced has no group-opacity primitive, so the fade is composited as a
-/// card-background quad at `1 - appear` over the header. The header area sits
-/// above every grid card, so the curtain never masks grid content.
+/// iced has no group-opacity primitive, so the entering fade is composited as
+/// a card-background quad at `1 - appear` over the header. On leaving the page
+/// body is drawn after this layer and covers the header until it slides above
+/// the page's top edge.
 struct HeaderCurtain<'a> {
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
@@ -1125,19 +1176,23 @@ pub fn header_curtain<'a>(
     .into()
 }
 
-/// Entering the tabs view lifts the header out of its row as it fades; leaving
-/// drops it back in from above. 0 = fully hidden, 1 = resting row.
-fn header_offset(appear: f32) -> f32 {
-    (appear.clamp(0.0, 1.0) - 1.0) * HEADER_SLIDE_PX
+/// 0 = fully hidden (lifted above on enter, tucked under the page on leave);
+/// 1 = resting row.
+fn header_offset(appear: f32, distance: f32, leaving: bool) -> f32 {
+    let appear = appear.clamp(0.0, 1.0);
+    if leaving {
+        (1.0 - appear) * distance
+    } else {
+        (appear - 1.0) * distance
+    }
 }
 
 impl HeaderCurtain<'_> {
     fn appear(&self, now: Instant) -> f32 {
-        let progress = self.anim.progress(now);
         if self.anim.entering {
-            1.0 - progress
+            1.0 - self.anim.progress(now)
         } else {
-            progress
+            self.anim.header_progress(now)
         }
     }
 }
@@ -1219,17 +1274,29 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         if appear <= 0.001 || self.fade <= 0.001 {
             return;
         }
-        let card = card_rect_at(
-            self.mode,
-            Some(self.anim),
-            self.page_card,
-            self.tabs_card,
-            now,
-        );
+        // Entering follows the shrinking card; leaving waits for the settled
+        // page and uses the full page header rect so the bar rises into place.
+        let (card, slide) = if self.anim.entering {
+            (
+                card_rect_at(
+                    self.mode,
+                    Some(self.anim),
+                    self.page_card,
+                    self.tabs_card,
+                    now,
+                ),
+                HEADER_SLIDE_PX,
+            )
+        } else {
+            (self.page_card, self.header_h)
+        };
         let pad = crate::ui::browser::state::BROWSER_CARD_PAD;
         let target_w = (card.width - 2.0 * pad).max(1.0);
         let target = Rectangle::new(
-            iced::Point::new(card.x + pad, card.y + pad + header_offset(appear)),
+            iced::Point::new(
+                card.x + pad,
+                card.y + pad + header_offset(appear, slide, !self.anim.entering),
+            ),
             Size::new(
                 target_w,
                 self.header_h * target_w / self.area.width.max(1.0),
@@ -1237,6 +1304,17 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         );
         let source = child_layout.bounds();
         let (scale, tx, ty) = flip_transform(source, target);
+        // Leaving draws the header's own opaque bar so the whole bar (fill +
+        // content) rises together from under the page.
+        if !self.anim.entering {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: target,
+                    ..renderer::Quad::default()
+                },
+                Background::Color(theme::scale_alpha(theme::SHELL_PANEL, self.fade)),
+            );
+        }
         // Scale the whole header with the card instead of clipping it: nested
         // widget layers would ignore a parent clip.
         renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
@@ -1252,7 +1330,7 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
                 );
             });
         });
-        if appear < 0.999 {
+        if self.anim.entering && appear < 0.999 {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: target,
@@ -1398,41 +1476,59 @@ fn tab_card<'a>(
             },
             ..container::Style::default()
         });
-    let title_bar = container(
+    let favicon: Element<'a, BrowserMessage> = match &tab.favicon {
+        Some(handle) => image(handle.clone())
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0))
+            .into(),
+        None => svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
+            .width(Length::Fixed(14.0))
+            .height(Length::Fixed(14.0))
+            .opacity(fade)
+            .style(|_theme, _status| svg::Style {
+                color: Some(theme::MUTED),
+            })
+            .into(),
+    };
+    let title_row = row![
+        favicon,
         text(text_fit::ellipsize_to_width(
             &tab.title,
             theme::type_scale::CAPTION,
-            card_w - 20.0,
+            card_w - 40.0,
         ))
         .size(theme::type_scale::CAPTION)
         .color(theme::scale_alpha(theme::INK, fade))
         .wrapping(Wrapping::None),
-    )
-    .width(Length::Fixed(card_w))
-    .height(Length::Fixed(CARD_TITLE_H))
-    .padding(Padding {
-        top: 0.0,
-        right: 10.0,
-        bottom: 0.0,
-        left: 10.0,
-    })
-    .align_y(Alignment::Center)
-    .style(move |_theme| container::Style {
-        background: Some(iced::Background::Color(theme::scale_alpha(
-            theme::alpha(theme::BASE_BG, 0.82),
-            fade,
-        ))),
-        border: iced::Border {
-            radius: iced::border::Radius {
-                top_left: 0.0,
-                top_right: 0.0,
-                bottom_right: theme::radius::MD,
-                bottom_left: theme::radius::MD,
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let title_bar = container(title_row)
+        .width(Length::Fixed(card_w))
+        .height(Length::Fixed(CARD_TITLE_H))
+        .padding(Padding {
+            top: 0.0,
+            right: 10.0,
+            bottom: 0.0,
+            left: 10.0,
+        })
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(theme::scale_alpha(
+                theme::alpha(theme::BASE_BG, 0.82),
+                fade,
+            ))),
+            border: iced::Border {
+                radius: iced::border::Radius {
+                    top_left: 0.0,
+                    top_right: 0.0,
+                    bottom_right: theme::radius::MD,
+                    bottom_left: theme::radius::MD,
+                },
+                ..iced::Border::default()
             },
-            ..iced::Border::default()
-        },
-        ..container::Style::default()
-    });
+            ..container::Style::default()
+        });
     let title_layer = container(title_bar)
         .width(Length::Fixed(card_w))
         .height(Length::Fixed(card_h))
@@ -1516,14 +1612,22 @@ fn bookmark_strip<'a>(
             theme::type_scale::CAPTION,
             BOOKMARK_CARD_W - 36.0,
         );
-        let content = row![
-            svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
+        let icon: Element<'a, BrowserMessage> = match panel.favicon_for(&bookmark.url) {
+            Some(handle) => image(handle)
+                .width(Length::Fixed(16.0))
+                .height(Length::Fixed(16.0))
+                .into(),
+            None => svg(svg::Handle::from_memory(svg_icon::GLOBE_SVG.as_bytes()))
                 .width(Length::Fixed(16.0))
                 .height(Length::Fixed(16.0))
                 .opacity(fade)
                 .style(|_theme, _status| svg::Style {
                     color: Some(theme::MUTED),
-                }),
+                })
+                .into(),
+        };
+        let content = row![
+            icon,
             text(name)
                 .size(theme::type_scale::CAPTION)
                 .color(theme::scale_alpha(theme::INK, fade))
@@ -1679,7 +1783,7 @@ impl Widget<BrowserMessage, iced::Theme, iced::Renderer> for CardShell {
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
-        let rect = card_rect_at(self.mode, self.anim, self.page, self.tabs, Instant::now());
+        let rect = shell_rect_at(self.mode, self.anim, self.page, self.tabs, Instant::now());
         if rect.width < 1.0 || rect.height < 1.0 {
             return;
         }
@@ -1887,10 +1991,26 @@ mod tests {
 
     #[test]
     fn header_slides_up_while_fading_out() {
-        assert_eq!(header_offset(1.0), 0.0);
-        assert!(header_offset(0.0) < 0.0, "hidden header sits above its row");
-        assert!(header_offset(0.5) < header_offset(1.0));
-        assert!((header_offset(0.0) + HEADER_SLIDE_PX).abs() < 0.01);
+        assert_eq!(header_offset(1.0, HEADER_SLIDE_PX, false), 0.0);
+        assert!(
+            header_offset(0.0, HEADER_SLIDE_PX, false) < 0.0,
+            "hidden entering header sits above its row"
+        );
+        assert!(
+            header_offset(0.5, HEADER_SLIDE_PX, false) < header_offset(1.0, HEADER_SLIDE_PX, false)
+        );
+        assert!((header_offset(0.0, HEADER_SLIDE_PX, false) + HEADER_SLIDE_PX).abs() < 0.01);
+    }
+
+    #[test]
+    fn leaving_header_waits_under_the_page() {
+        let distance = 45.0;
+        assert!(
+            (header_offset(0.0, distance, true) - distance).abs() < 0.01,
+            "leaving header starts below the page body"
+        );
+        assert!(header_offset(0.5, distance, true) > 0.0);
+        assert_eq!(header_offset(1.0, distance, true), 0.0);
     }
 
     #[test]
@@ -2008,6 +2128,39 @@ mod tests {
         assert_eq!(
             card_rect_at(GridMode::Grid, Some(anim), page, tabs, now).width,
             tabs.width
+        );
+    }
+
+    #[test]
+    fn leaving_grows_page_before_sliding_header() {
+        let page = Rectangle::new(iced::Point::new(50.0, 50.0), Size::new(1800.0, 1000.0));
+        let tabs = Rectangle::new(iced::Point::new(400.0, 300.0), Size::new(1200.0, 340.0));
+        let now = Instant::now();
+        let anim = GridAnim {
+            generation: 2,
+            started: now,
+            tab: TabId::BOOT,
+            entering: false,
+            card: GridFocus::Tab(TabId::BOOT),
+        };
+        // The shell does not grow with the page.
+        let start_shell = shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, now);
+        assert_eq!(start_shell.width, tabs.width);
+        assert_eq!(anim.header_progress(now), 0.0);
+
+        // The page settles before the header reveal starts.
+        let page_settle = now + GRID_ANIM * 3 / 5;
+        assert_eq!(anim.page_progress(page_settle), 1.0);
+        assert!(anim.header_progress(page_settle) > 0.0);
+        let settled_page = card_rect_at(GridMode::Leaving, Some(anim), page, tabs, page_settle);
+        assert_eq!(settled_page.width, page.width);
+        // Once the header phase starts the full page card is behind the page.
+        let header_shell = shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, page_settle);
+        assert_eq!(header_shell.width, page.width);
+        assert_eq!(
+            anim.header_progress(now + GRID_ANIM),
+            1.0,
+            "header reaches rest when the transition completes"
         );
     }
 
@@ -2180,6 +2333,21 @@ mod tests {
             &strip,
             0,
         ));
+    }
+
+    #[test]
+    fn favicons_are_shared_by_site_origin() {
+        let mut panel = BrowserPanel::default();
+        panel.session.begin_load("https://a.test/page".to_string());
+        panel.cache_favicon(
+            "https://a.test/other",
+            iced::widget::image::Handle::from_rgba(1, 1, vec![255, 0, 0, 255]),
+        );
+        panel.refresh_grid_visual();
+        let tabs = grid_tabs(&panel, &panel.grid.visual);
+        assert!(tabs[0].favicon.is_some());
+        assert!(panel.favicon_for("https://a.test/page").is_some());
+        assert!(panel.favicon_for("https://b.test/page").is_none());
     }
 
     #[test]

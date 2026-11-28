@@ -2984,7 +2984,7 @@ fn tile_style(
 fn card_style(fade: f32, _theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(theme::scale_alpha(
-            theme::alpha(theme::BASE_BG, 0.94),
+            theme::SHELL_PANEL,
             fade,
         ))),
         text_color: Some(theme::scale_alpha(theme::INK, fade)),
@@ -3005,6 +3005,16 @@ fn card_style(fade: f32, _theme: &Theme) -> container::Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_card_uses_opaque_shell_fill() {
+        let style = card_style(1.0, &iced::Theme::Dark);
+        let Some(Background::Color(color)) = style.background else {
+            panic!("Home card must have a fill");
+        };
+        assert_eq!(color, theme::SHELL_PANEL);
+        assert_eq!(color.a, 1.0, "Home panel must be opaque");
+    }
 
     #[test]
     fn card_width_hits_nominal_on_wide_stages() {

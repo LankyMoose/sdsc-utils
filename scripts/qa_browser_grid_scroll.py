@@ -60,8 +60,12 @@ def main() -> int:
     session.mkdir(parents=True, exist_ok=True)
     page_a = session / "a.html"
     page_b = session / "b.html"
-    page_a.write_text(PAGE.format(name="row A", band="#c0392b"), encoding="utf-8")
-    page_b.write_text(PAGE.format(name="row B", band="#1f5fbf"), encoding="utf-8")
+    page_a.write_text(
+        PAGE.format(name="row A", band="#c0392b", favicon="data:,"), encoding="utf-8"
+    )
+    page_b.write_text(
+        PAGE.format(name="row B", band="#1f5fbf", favicon="data:,"), encoding="utf-8"
+    )
     red = page_a.as_uri()
     blue = page_b.as_uri()
 

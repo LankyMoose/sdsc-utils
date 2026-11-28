@@ -1936,9 +1936,25 @@ impl super::App {
         }
     }
 
+    /// Ask the engine for conventional `/favicon.ico` icons for bookmarks that
+    /// have not been cached this session. The worker dedupes per origin; tab
+    /// pages use their normal `on_favicon_urlchange` path.
+    fn prefetch_bookmark_favicons(&self) {
+        let Some(engine) = &self.browser.engine else {
+            return;
+        };
+        for bookmark in &self.browser.panel.bookmarks {
+            if self.browser.panel.favicon_for(&bookmark.url).is_some() {
+                continue;
+            }
+            engine.send(EngineCommand::PrefetchFavicon {
+                url: bookmark.url.clone(),
+            });
+        }
+    }
+
     pub(crate) fn open_browser_grid(&mut self) -> Task<Message> {
         use crate::ui::browser::grid::{GridFocus, GridMode};
-
         if self.browser.panel.grid.is_grid() {
             return Task::none();
         }
@@ -1948,6 +1964,7 @@ impl super::App {
             Task::none()
         };
         self.browser.panel.cancel_url_edit();
+        self.prefetch_bookmark_favicons();
         self.browser.panel.refresh_grid_visual();
         // A stick already held when the grid opens must start the pull clock
         // now; steady analog edges are filtered while the deflection holds.

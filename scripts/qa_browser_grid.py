@@ -18,14 +18,18 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import qa_offscreen
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{name}</title>
+<link rel="icon" href="{favicon}">
 <style>
   html, body {{ margin:0; width:100%; height:100%; background:#f5f0e6; }}
   #band {{ position:fixed; left:0; top:0; width:100%; height:55%;
@@ -35,6 +39,43 @@ PAGE = """<!doctype html>
 </style></head>
 <body><div id="band"></div><h1>{name}</h1></body></html>
 """
+
+
+def solid_png(rgb: tuple[int, int, int], size: int = 16) -> bytes:
+    """Tiny solid-colour PNG for the local fixture favicon."""
+    raw = b"".join(
+        b"\x00" + (bytes(rgb) + b"\xff") * size for _ in range(size)
+    )
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def fixture_server(session: Path) -> str:
+    """Serve the local fixture pages over HTTP (CEF ignores file favicons)."""
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    handler = partial(QuietHandler, directory=str(session))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -226,14 +267,22 @@ def main() -> int:
     session.mkdir(parents=True, exist_ok=True)
     page_a = session / "a.html"
     page_b = session / "b.html"
+    icon = solid_png((192, 57, 43))
+    (session / "favicon.png").write_bytes(icon)
+    (session / "favicon.ico").write_bytes(icon)
     page_a.write_text(
-        PAGE.format(name="grid A", band="#c0392b"), encoding="utf-8"
+        PAGE.format(name="grid A", band="#c0392b", favicon="/favicon.png"),
+        encoding="utf-8",
     )
     page_b.write_text(
-        PAGE.format(name="grid B", band="#1f5fbf"), encoding="utf-8"
+        PAGE.format(name="grid B", band="#1f5fbf", favicon="/favicon.png"),
+        encoding="utf-8",
     )
+    base = fixture_server(session)
+    page_a_url = f"{base}/a.html"
+    page_b_url = f"{base}/b.html"
     actions = [
-        {"app": "browser", "action": "navigate", "params": {"url": page_a.as_uri()}},
+        {"app": "browser", "action": "navigate", "params": {"url": page_a_url}},
         {"app": "browser", "action": "screenshot", "params": {}},
         # Share/Create must stay inert on the page; if it opens the grid the
         # trace count below is 5 instead of 4.
@@ -246,7 +295,7 @@ def main() -> int:
         {
             "app": "browser",
             "action": "grid.new_tab",
-            "params": {"url": page_b.as_uri()},
+            "params": {"url": page_b_url},
         },
         {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "screenshot", "params": {}},
@@ -264,7 +313,7 @@ def main() -> int:
         {
             "app": "browser",
             "action": "grid.new_tab",
-            "params": {"url": page_b.as_uri()},
+            "params": {"url": page_b_url},
         },
         {"app": "browser", "action": "wait", "params": {}},
         {"app": "browser", "action": "grid.open", "params": {}},
@@ -404,6 +453,11 @@ def main() -> int:
         new_active_tab = central_band_colors(images[8][2], width, height, cards[1])
         closed_active = central_band_colors(images[9][2], width, height, cards[1])
         resumed_grid = central_band_colors(images[10][2], width, height, cards[1])
+        favicon_colors = region_colors(
+            images[2][2],
+            width,
+            (cards[1][0] + 10, cards[1][1] + cards[1][3] - 34 + 9, 16, 16),
+        )
 
         plus_w, plus_h = cards[0][2], cards[0][3]
         tab_w, tab_h = cards[1][2], cards[1][3]
@@ -425,6 +479,7 @@ def main() -> int:
             ("new active tab opens newest first", has_color(new_active_tab, blue)),
             ("closing the active tab falls back to page A", has_color(closed_active, red)),
             ("PS resume restored the grid", has_color(resumed_grid, red) or has_color(resumed_grid, cream)),
+            ("tab favicon loaded", has_color(favicon_colors, red, 45, 2)),
         ]
         for label, ok in checks:
             print(f"check {label}: {'ok' if ok else 'FAIL'}")

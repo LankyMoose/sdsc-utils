@@ -1446,6 +1446,25 @@ impl App {
                 .emit();
                 return Task::none();
             }
+            EngineEvent::FaviconChanged {
+                tab: _,
+                url,
+                width,
+                height,
+                rgba,
+            } => {
+                // Favicons are per-site, not per-tab: cache even background
+                // tab events so the grid shows their icons immediately.
+                if width > 0 && height > 0 && rgba.len() == width as usize * height as usize * 4 {
+                    let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                    self.browser.panel.cache_favicon(&url, handle);
+                }
+                crate::platform::app_log::info(format!(
+                    "browser-dom: favicon {} {width}x{height}",
+                    crate::browser::bookmarks::origin_key(&url)
+                ));
+                return Task::none();
+            }
             EngineEvent::NavigationBlocked {
                 tab,
                 source,
@@ -1484,6 +1503,7 @@ impl App {
             | EngineEvent::TabOpened { .. }
             | EngineEvent::TabClosed { .. }
             | EngineEvent::PopupRequested { .. }
+            | EngineEvent::FaviconChanged { .. }
             | EngineEvent::NavigationBlocked { .. } => {}
             EngineEvent::Frame(frame) => {
                 if !self.browser.panel.session.is_open() {
@@ -1542,20 +1562,6 @@ impl App {
                     self.browser.panel.save_tabs();
                 }
                 self.settle_history_travel_on_url(tab);
-            }
-            EngineEvent::FaviconChanged {
-                tab: _,
-                url,
-                width,
-                height,
-                rgba: _,
-            } => {
-                // No settings/bookmark chrome in v0; keep the engine callback
-                // observable in the log without caching UI handles.
-                crate::platform::app_log::info(format!(
-                    "browser-dom: favicon {} {width}x{height}",
-                    crate::browser::bookmarks::origin_key(&url)
-                ));
             }
             EngineEvent::A11yTree { tab: _, url, items } => {
                 self.browser.panel.focusables = items;

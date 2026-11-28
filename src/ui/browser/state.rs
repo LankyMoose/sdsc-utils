@@ -180,6 +180,9 @@ pub struct BrowserPanel {
     /// Chrome-style bookmarks (disk-persisted). The Share grid renders the
     /// star state and the scrollable bookmark row.
     pub bookmarks: Vec<crate::browser::bookmarks::Bookmark>,
+    /// Favicon handles by site origin (`origin_key`). Shared by tab cards,
+    /// bookmark chips, and the active page chrome.
+    pub favicons: FaviconCache,
     /// Controller hint press state for the header row.
     pub l1_held: bool,
     pub r1_held: bool,
@@ -247,6 +250,7 @@ impl Default for BrowserPanel {
             ),
             debug_overlay: false,
             bookmarks: Vec::new(),
+            favicons: HashMap::new(),
             l1_held: false,
             r1_held: false,
             triangle_held: false,
@@ -804,12 +808,35 @@ pub const BROWSER_OUTER_MARGIN: f32 = 50.0;
 /// Card padding around the browser surface.
 pub const BROWSER_CARD_PAD: f32 = 4.0;
 
-/// Favicon handle cache cap kept for the dormant bookmark data (no v0 UI).
+/// Favicon handle cache cap (origin-keyed).
 pub const MAX_FAVICONS: usize = 64;
 
-/// Dormant favicon handles by origin; retained so bookmark data can regain
-/// icons without touching the engine event path.
+/// Favicon handles by origin, shared by tab cards, bookmark chips, and page
+/// chrome. Keyed by `bookmarks::origin_key` so redirects/fragments reuse one
+/// icon per site.
 pub type FaviconCache = HashMap<String, iced::widget::image::Handle>;
+
+impl BrowserPanel {
+    /// Cache one decoded favicon under its site origin. The cap keeps hostile
+    /// tab churn from growing the atlas without bound.
+    pub fn cache_favicon(&mut self, url: &str, handle: iced::widget::image::Handle) {
+        let key = crate::browser::bookmarks::origin_key(url);
+        if self.favicons.len() >= MAX_FAVICONS
+            && !self.favicons.contains_key(&key)
+            && let Some(oldest) = self.favicons.keys().next().cloned()
+        {
+            self.favicons.remove(&oldest);
+        }
+        self.favicons.insert(key, handle);
+    }
+
+    /// Favicon for a page or bookmark URL (per-site, not per-page).
+    pub fn favicon_for(&self, url: &str) -> Option<iced::widget::image::Handle> {
+        self.favicons
+            .get(&crate::browser::bookmarks::origin_key(url))
+            .cloned()
+    }
+}
 
 #[cfg(test)]
 mod tests {
