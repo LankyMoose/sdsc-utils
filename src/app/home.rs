@@ -52,6 +52,17 @@ pub(crate) fn resolve_shell_backdrop_alpha(
     if hidden { 0.0 } else { backdrop.alpha(now) }
 }
 
+/// A close that is part of an in-place shell swap keeps the shared dim up;
+/// only a hide-to-desktop dismiss fades it out. `shell_opening` is set by the
+/// Home/Browser/Launcher hand-off callers before the outgoing close starts,
+/// so the dim never hides and re-shows between screens.
+pub(crate) fn close_keeps_shell_backdrop(
+    shell_opening: bool,
+    pending_shell_mode: Option<ShellScreen>,
+) -> bool {
+    shell_opening || pending_shell_mode.is_some()
+}
+
 /// Shell work required after a Home transition. Order matters: unfocus/hide
 /// and suspend the outgoing app before showing/focusing/resuming the
 /// incoming one.
@@ -581,13 +592,13 @@ impl App {
         };
         crate::controller::hid::diag::diag_info("ui-diag: home close");
         self.home_visible = false;
-        // Only a pending in-place swap keeps the dim up. A dismiss (including
-        // one during the opening transition) fades it out so hide cannot snap
-        // a visible scrim to zero.
-        if self.pending_shell_mode.is_none() {
-            self.begin_shell_backdrop_exit(now);
-        } else {
+        // A Home/Browser/Launcher hand-off keeps the one shared dim up; only
+        // a hide-to-desktop dismiss fades it out. That prevents the backdrop
+        // from hiding and re-showing between screens.
+        if close_keeps_shell_backdrop(self.shell_opening, self.pending_shell_mode) {
             self.shell_backdrop.raise(now);
+        } else {
+            self.begin_shell_backdrop_exit(now);
         }
         let reduced =
             crate::ui::motion::reduced_motion_effective(self.session.prefs.reduced_motion);
@@ -1374,6 +1385,13 @@ mod tests {
             resolve_shell_backdrop_alpha(false, ShellBackdrop::Entering { started: now }, later)
                 > 0.5
         );
+    }
+
+    #[test]
+    fn shell_swaps_keep_the_backdrop_up() {
+        assert!(close_keeps_shell_backdrop(true, None));
+        assert!(close_keeps_shell_backdrop(false, Some(ShellScreen::Home)));
+        assert!(!close_keeps_shell_backdrop(false, None));
     }
 
     #[test]

@@ -3142,13 +3142,14 @@ impl super::App {
         self.browser_window_size = None;
         self.reset_shell_cursor_clock();
         let now = Instant::now();
-        // Only a pending in-place swap keeps the dim up. A dismiss (including
-        // one during the opening transition) fades it out so hide cannot snap
-        // a visible scrim to zero.
-        if self.pending_shell_mode.is_none() {
-            self.begin_shell_backdrop_exit(now);
-        } else {
+        // A Home/Browser/Launcher hand-off keeps the one shared dim up; only
+        // a hide-to-desktop dismiss fades it out. That prevents the backdrop
+        // from hiding and re-showing between screens.
+        if crate::app::home::close_keeps_shell_backdrop(self.shell_opening, self.pending_shell_mode)
+        {
             self.shell_backdrop.raise(now);
+        } else {
+            self.begin_shell_backdrop_exit(now);
         }
         let close_osk = self.close_osk("browser_close");
         let Some(id) = self.shell_window else {
