@@ -34,7 +34,7 @@ pub const PANEL: Color = lighten(BASE_BG, PANEL_LIFT);
 pub const PANEL_HOVER: Color = lighten(BASE_BG, PANEL_HOVER_LIFT);
 /// Opaque shell card fill shared by the Home panel/settings and the Browser
 /// card. Never translucent: the desktop must not tint the card.
-pub const SHELL_PANEL: Color = lighten(BASE_BG, 0.04);
+pub const SHELL_PANEL: Color = darken(lighten(BASE_BG, 0.04), 0.30);
 /// Window and widget hairlines.
 pub const LINE: Color = lighten(BASE_BG, LINE_LIFT);
 

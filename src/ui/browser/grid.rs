@@ -30,9 +30,6 @@ use iced::{
 /// of the way of the next input.
 pub const GRID_ANIM_MS: u64 = 320;
 const GRID_ANIM: Duration = Duration::from_millis(GRID_ANIM_MS);
-/// Fraction of a leaving FLIP spent growing the page. The remainder is the
-/// header slide-up after the page has settled.
-const GRID_PAGE_PHASE: f32 = 0.65;
 
 #[cfg(debug_assertions)]
 static GRID_TICK_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -143,27 +140,6 @@ impl GridAnim {
         }
     }
 
-    /// Page growth clock. Entering keeps the original full FLIP clock; leaving
-    /// settles the page before the header reveal begins.
-    pub fn page_progress(&self, now: Instant) -> f32 {
-        let progress = self.progress(now);
-        if self.entering {
-            progress
-        } else {
-            (progress / GRID_PAGE_PHASE).min(1.0)
-        }
-    }
-
-    /// Leaving-only header reveal, 0 while the page is still growing and
-    /// 0..1 once it has settled.
-    pub fn header_progress(&self, now: Instant) -> f32 {
-        if self.entering {
-            0.0
-        } else {
-            ((self.progress(now) - GRID_PAGE_PHASE) / (1.0 - GRID_PAGE_PHASE)).clamp(0.0, 1.0)
-        }
-    }
-
     pub fn done(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.started) >= GRID_ANIM
     }
@@ -192,17 +168,18 @@ pub fn card_rect_at(
         GridMode::Page => page,
         GridMode::Grid => tabs,
         GridMode::Entering => anim
-            .map(|anim| lerp_rect(page, tabs, anim.page_progress(now)))
+            .map(|anim| lerp_rect(page, tabs, anim.progress(now)))
             .unwrap_or(tabs),
         GridMode::Leaving => anim
-            .map(|anim| lerp_rect(tabs, page, anim.page_progress(now)))
+            .map(|anim| lerp_rect(tabs, page, anim.progress(now)))
             .unwrap_or(page),
     }
 }
 
-/// Card-shell rect. Leaving the tabs view grows only the page; the compact
-/// shell stays put (covered as the page expands) until the header phase, when
-/// the full page card sits behind the settled page for the header slide.
+/// Card-shell rect. The page/header FLIP runs independently: the compact grid
+/// shell stays in place while the page grows out of it, and is revealed again
+/// as the page shrinks back. Only the final leaving frame swaps to the page
+/// card, hidden behind the settled page.
 pub fn shell_rect_at(
     mode: GridMode,
     anim: Option<GridAnim>,
@@ -213,13 +190,14 @@ pub fn shell_rect_at(
     match mode {
         GridMode::Leaving => anim
             .map(|anim| {
-                if anim.header_progress(now) > 0.0 {
+                if anim.progress(now) >= 0.999 {
                     page
                 } else {
                     tabs
                 }
             })
             .unwrap_or(page),
+        GridMode::Entering => tabs,
         _ => card_rect_at(mode, anim, page, tabs, now),
     }
 }
@@ -1073,7 +1051,7 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for FlipPage<'a> {
             return;
         };
         let now = Instant::now();
-        let t = self.anim.page_progress(now);
+        let t = self.anim.progress(now);
         let current = lerp_rect(self.source, self.target, t);
         let clip = card_rect_at(
             self.mode,
@@ -1133,14 +1111,12 @@ impl<'a> From<FlipPage<'a>> for Element<'a, BrowserMessage> {
     }
 }
 
-/// Draw-time header enter/exit curtain. Entering the tabs view lifts the
-/// header out of its row as it fades. Leaving the tabs view grows the page
-/// first, then slides the header up from under the settled page.
+/// Draw-time header enter/exit curtain. The page header grows/shrinks with the
+/// page card on the same FLIP clock; leaving slides it up into place, entering
+/// reverses the slide as the page shrinks.
 ///
-/// iced has no group-opacity primitive, so the entering fade is composited as
-/// a card-background quad at `1 - appear` over the header. On leaving the page
-/// body is drawn after this layer and covers the header until it slides above
-/// the page's top edge.
+/// iced has no group-opacity primitive, so the fade is composited as a
+/// card-background quad at `1 - appear` over the header.
 struct HeaderCurtain<'a> {
     content: Element<'a, BrowserMessage>,
     anim: GridAnim,
@@ -1176,23 +1152,19 @@ pub fn header_curtain<'a>(
     .into()
 }
 
-/// 0 = fully hidden (lifted above on enter, tucked under the page on leave);
-/// 1 = resting row.
-fn header_offset(appear: f32, distance: f32, leaving: bool) -> f32 {
-    let appear = appear.clamp(0.0, 1.0);
-    if leaving {
-        (1.0 - appear) * distance
-    } else {
-        (appear - 1.0) * distance
-    }
+/// 0 = hidden, 1 = resting row. Leaving rises from below; entering drops back
+/// down on the reverse clock.
+fn header_offset(appear: f32) -> f32 {
+    (1.0 - appear.clamp(0.0, 1.0)) * HEADER_SLIDE_PX
 }
 
 impl HeaderCurtain<'_> {
     fn appear(&self, now: Instant) -> f32 {
+        let progress = self.anim.progress(now);
         if self.anim.entering {
-            1.0 - self.anim.progress(now)
+            1.0 - progress
         } else {
-            self.anim.header_progress(now)
+            progress
         }
     }
 }
@@ -1274,29 +1246,18 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         if appear <= 0.001 || self.fade <= 0.001 {
             return;
         }
-        // Entering follows the shrinking card; leaving waits for the settled
-        // page and uses the full page header rect so the bar rises into place.
-        let (card, slide) = if self.anim.entering {
-            (
-                card_rect_at(
-                    self.mode,
-                    Some(self.anim),
-                    self.page_card,
-                    self.tabs_card,
-                    now,
-                ),
-                HEADER_SLIDE_PX,
-            )
-        } else {
-            (self.page_card, self.header_h)
-        };
+        // The header rides the same card interpolation as the growing page.
+        let card = card_rect_at(
+            self.mode,
+            Some(self.anim),
+            self.page_card,
+            self.tabs_card,
+            now,
+        );
         let pad = crate::ui::browser::state::BROWSER_CARD_PAD;
         let target_w = (card.width - 2.0 * pad).max(1.0);
         let target = Rectangle::new(
-            iced::Point::new(
-                card.x + pad,
-                card.y + pad + header_offset(appear, slide, !self.anim.entering),
-            ),
+            iced::Point::new(card.x + pad, card.y + pad + header_offset(appear)),
             Size::new(
                 target_w,
                 self.header_h * target_w / self.area.width.max(1.0),
@@ -1304,17 +1265,6 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
         );
         let source = child_layout.bounds();
         let (scale, tx, ty) = flip_transform(source, target);
-        // Leaving draws the header's own opaque bar so the whole bar (fill +
-        // content) rises together from under the page.
-        if !self.anim.entering {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: target,
-                    ..renderer::Quad::default()
-                },
-                Background::Color(theme::scale_alpha(theme::SHELL_PANEL, self.fade)),
-            );
-        }
         // Scale the whole header with the card instead of clipping it: nested
         // widget layers would ignore a parent clip.
         renderer.with_transformation(Transformation::translate(tx, ty), |renderer| {
@@ -1330,14 +1280,14 @@ impl<'a> Widget<BrowserMessage, iced::Theme, iced::Renderer> for HeaderCurtain<'
                 );
             });
         });
-        if self.anim.entering && appear < 0.999 {
+        if appear < 0.999 {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: target,
                     ..renderer::Quad::default()
                 },
                 Background::Color(theme::alpha(
-                    theme::lighten(theme::BASE_BG, 0.04),
+                    theme::SHELL_PANEL,
                     (1.0 - appear * appear) * self.fade,
                 )),
             );
@@ -1990,27 +1940,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_slides_up_while_fading_out() {
-        assert_eq!(header_offset(1.0, HEADER_SLIDE_PX, false), 0.0);
+    fn header_slides_up_while_fading_in() {
+        assert_eq!(header_offset(1.0), 0.0);
         assert!(
-            header_offset(0.0, HEADER_SLIDE_PX, false) < 0.0,
-            "hidden entering header sits above its row"
+            (header_offset(0.0) - HEADER_SLIDE_PX).abs() < 0.01,
+            "hidden header sits below its row"
         );
-        assert!(
-            header_offset(0.5, HEADER_SLIDE_PX, false) < header_offset(1.0, HEADER_SLIDE_PX, false)
-        );
-        assert!((header_offset(0.0, HEADER_SLIDE_PX, false) + HEADER_SLIDE_PX).abs() < 0.01);
-    }
-
-    #[test]
-    fn leaving_header_waits_under_the_page() {
-        let distance = 45.0;
-        assert!(
-            (header_offset(0.0, distance, true) - distance).abs() < 0.01,
-            "leaving header starts below the page body"
-        );
-        assert!(header_offset(0.5, distance, true) > 0.0);
-        assert_eq!(header_offset(1.0, distance, true), 0.0);
+        assert!(header_offset(0.5) > header_offset(1.0));
     }
 
     #[test]
@@ -2132,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_grows_page_before_sliding_header() {
+    fn page_and_header_share_one_clock() {
         let page = Rectangle::new(iced::Point::new(50.0, 50.0), Size::new(1800.0, 1000.0));
         let tabs = Rectangle::new(iced::Point::new(400.0, 300.0), Size::new(1200.0, 340.0));
         let now = Instant::now();
@@ -2143,24 +2079,29 @@ mod tests {
             entering: false,
             card: GridFocus::Tab(TabId::BOOT),
         };
-        // The shell does not grow with the page.
-        let start_shell = shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, now);
-        assert_eq!(start_shell.width, tabs.width);
-        assert_eq!(anim.header_progress(now), 0.0);
-
-        // The page settles before the header reveal starts.
-        let page_settle = now + GRID_ANIM * 3 / 5;
-        assert_eq!(anim.page_progress(page_settle), 1.0);
-        assert!(anim.header_progress(page_settle) > 0.0);
-        let settled_page = card_rect_at(GridMode::Leaving, Some(anim), page, tabs, page_settle);
-        assert_eq!(settled_page.width, page.width);
-        // Once the header phase starts the full page card is behind the page.
-        let header_shell = shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, page_settle);
-        assert_eq!(header_shell.width, page.width);
+        // The page and header interpolate together; the compact shell does
+        // not grow with them.
+        let mid = now + GRID_ANIM / 2;
+        let mid_page = card_rect_at(GridMode::Leaving, Some(anim), page, tabs, mid);
+        assert!(mid_page.width > tabs.width && mid_page.width < page.width);
         assert_eq!(
-            anim.header_progress(now + GRID_ANIM),
-            1.0,
-            "header reaches rest when the transition completes"
+            shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, mid).width,
+            tabs.width
+        );
+        // Only the settled final frame swaps the shell to the page card.
+        let end = now + GRID_ANIM;
+        assert_eq!(
+            shell_rect_at(GridMode::Leaving, Some(anim), page, tabs, end).width,
+            page.width
+        );
+        // Reverse: entering starts on the compact shell while the page shrinks.
+        let entering = GridAnim {
+            entering: true,
+            ..anim
+        };
+        assert_eq!(
+            shell_rect_at(GridMode::Entering, Some(entering), page, tabs, now).width,
+            tabs.width
         );
     }
 

@@ -720,15 +720,9 @@ pub fn root_view(
             stage_w,
             stage_h,
         );
-        if anim.entering {
-            layers.push(flip);
-            layers.push(header);
-        } else {
-            // Header first: the growing page covers it until it slides above
-            // the page body's top edge.
-            layers.push(header);
-            layers.push(flip);
-        }
+        layers.push(flip);
+        // Header on top: it slides/scales with the page card on the same clock.
+        layers.push(header);
     }
     let stage_stack = stack(layers)
         .width(Length::Fixed(stage_w))
