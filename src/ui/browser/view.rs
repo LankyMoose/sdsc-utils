@@ -235,7 +235,20 @@ fn header_icon(
     size: f32,
     color: Color,
     opacity: f32,
+    plain_glyph: Option<&'static str>,
 ) -> Element<'static, BrowserMessage> {
+    if let Some(glyph) = plain_glyph {
+        return container(
+            text(glyph)
+                .size(size)
+                .color(theme::scale_alpha(color, opacity.clamp(0.0, 1.0))),
+        )
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into();
+    }
     svg(svg::Handle::from_memory(icon.as_bytes()))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
@@ -254,6 +267,7 @@ fn history_hint(
     pressed: bool,
     enabled: bool,
     fade: f32,
+    plain_glyphs: bool,
 ) -> Element<'static, BrowserMessage> {
     const CAPSULE_H: f32 = 28.0;
     const KEY_SIZE: f32 = 11.0;
@@ -264,8 +278,9 @@ fn history_hint(
     // rasterizer. Use the widget opacity (applied in the image shader) so the
     // chevron dims with the key.
     let icon_color = theme::DIM;
+    let plain_glyph = plain_glyphs.then_some(if icon_first { "‹" } else { "›" });
     if icon_first {
-        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha));
+        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha, plain_glyph));
     }
     let key_text = || {
         // The monospace key's cap reads one pixel high when only its line box
@@ -287,7 +302,7 @@ fn history_hint(
     };
     parts.push(key_text());
     if !icon_first {
-        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha));
+        parts.push(header_icon(icon, ICON_SIZE, icon_color, alpha, plain_glyph));
     }
     let border = if pressed {
         theme::ACCENT
@@ -318,7 +333,33 @@ fn history_hint(
 }
 
 /// Shared Triangle face glyph; lives inside the URL well, anchored right.
-fn triangle_prompt(panel: &BrowserPanel, fade: f32) -> Element<'_, BrowserMessage> {
+fn triangle_prompt(
+    panel: &BrowserPanel,
+    fade: f32,
+    plain_glyphs: bool,
+) -> Element<'_, BrowserMessage> {
+    if plain_glyphs {
+        // Transition headers avoid SVG: an SVG's own bounds are its clip, so
+        // it ignores the header-row layer clip. Text/borders clip normally.
+        return container(
+            text("△")
+                .size(14.0)
+                .color(theme::scale_alpha(theme::ACCENT, fade)),
+        )
+        .width(Length::Fixed(32.0))
+        .height(Length::Fixed(32.0))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            border: iced::Border {
+                color: theme::scale_alpha(theme::LINE, fade),
+                width: 1.5,
+                radius: 16.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into();
+    }
     let style = if panel.triangle_held {
         RingStyle::Pressed
     } else {
@@ -328,7 +369,12 @@ fn triangle_prompt(panel: &BrowserPanel, fade: f32) -> Element<'_, BrowserMessag
 }
 
 /// URL well: globe + single-line URL + right-anchored Triangle prompt.
-fn browser_url_bar(panel: &BrowserPanel, url_w: f32, fade: f32) -> Element<'_, BrowserMessage> {
+fn browser_url_bar(
+    panel: &BrowserPanel,
+    url_w: f32,
+    fade: f32,
+    plain_glyphs: bool,
+) -> Element<'_, BrowserMessage> {
     let fade = fade.clamp(0.0, 1.0);
     let editing = panel.url_editing;
     let budget = browser_url_text_budget(url_w, editing);
@@ -342,7 +388,13 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32, fade: f32) -> Element<'_, B
         text_fit::ellipsize_to_width(display_url(panel.session.url()), 14.0, budget)
     };
     let mut content = row![
-        header_icon(svg_icon::GLOBE_SVG, BROWSER_URL_ICON, theme::MUTED, fade),
+        header_icon(
+            svg_icon::GLOBE_SVG,
+            BROWSER_URL_ICON,
+            theme::MUTED,
+            fade,
+            plain_glyphs.then_some("◎"),
+        ),
         text(value)
             .size(14.0)
             .wrapping(Wrapping::None)
@@ -353,9 +405,10 @@ fn browser_url_bar(panel: &BrowserPanel, url_w: f32, fade: f32) -> Element<'_, B
     if editing {
         content = content.push(space().width(Fill));
     } else {
-        content = content
-            .push(space().width(Fill))
-            .push(triangle_prompt(panel, fade));
+        content =
+            content
+                .push(space().width(Fill))
+                .push(triangle_prompt(panel, fade, plain_glyphs));
     }
     container(content)
         .width(Length::Fixed(url_w))
@@ -376,6 +429,7 @@ pub(crate) fn browser_header(
     panel: &BrowserPanel,
     page_w: f32,
     fade: f32,
+    plain_glyphs: bool,
 ) -> Element<'_, BrowserMessage> {
     let fade = fade.clamp(0.0, 1.0);
     let content_w = (page_w - 2.0 * BROWSER_HEADER_PAD).max(1.0);
@@ -389,6 +443,7 @@ pub(crate) fn browser_header(
         panel.l1_held,
         back_enabled,
         fade,
+        plain_glyphs,
     );
     let forward = history_hint(
         "R1",
@@ -397,12 +452,13 @@ pub(crate) fn browser_header(
         panel.r1_held,
         forward_enabled,
         fade,
+        plain_glyphs,
     );
     let content = row![
         container(back)
             .width(Length::Fixed(layout.side_w))
             .align_x(Alignment::End),
-        browser_url_bar(panel, layout.url_w, fade),
+        browser_url_bar(panel, layout.url_w, fade, plain_glyphs),
         container(forward)
             .width(Length::Fixed(layout.side_w))
             .align_x(Alignment::Start),
@@ -616,7 +672,7 @@ pub fn browser_view<'a>(
     if let Some(debug) = browser_cursor_debug_overlay(panel, page_w, page_h) {
         page = page.push(debug);
     }
-    column![browser_header(panel, page_w, fade), page]
+    column![browser_header(panel, page_w, fade, false), page]
         .width(Length::Fixed(page_w))
         .height(Length::Fixed(BROWSER_HEADER_TOTAL + page_h))
         .clip(true)
@@ -707,7 +763,7 @@ pub fn root_view(
         );
         let header = grid::positioned(
             grid::header_curtain(
-                browser_header(panel, page_layout.page_w, fade),
+                browser_header(panel, page_layout.page_w, fade, true),
                 anim,
                 header_rect.size(),
                 BROWSER_HEADER_TOTAL,
