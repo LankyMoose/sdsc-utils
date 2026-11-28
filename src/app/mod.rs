@@ -1962,13 +1962,9 @@ impl App {
                 .or_else(|| self.browser_monitor_cover.map(|c| (c.width, c.height)))
                 .unwrap_or((1920.0, 1080.0));
             let now = Instant::now();
-            let shell = self.resolved_shell_frame(self.browser_shell_anim, now);
+            let mut shell = self.resolved_shell_frame(self.browser_shell_anim, now);
+            shell.backdrop_alpha = self.shell_backdrop_view_alpha(now);
             self.note_shell_draw(shell);
-            let backdrop_alpha = self.shell_backdrop_alpha(now);
-            let shell = crate::ui::home::ShellFrame {
-                panel: shell.panel,
-                backdrop_alpha,
-            };
             let draws = crate::ui::browser::view::cursor_draws(&self.browser.panel)
                 && self.browser_shell_anim.is_none();
             let cursor = crate::ui::browser::cursor_surface::CursorSurfaceSpec {
@@ -1996,15 +1992,15 @@ impl App {
 
         if Some(window) == self.home_window {
             let now = Instant::now();
-            let shell = self.resolved_shell_frame(self.home_shell_anim, now);
+            let mut shell = self.resolved_shell_frame(self.home_shell_anim, now);
+            shell.backdrop_alpha = self.shell_backdrop_view_alpha(now);
             self.note_shell_draw(shell);
-            let backdrop_alpha = self.shell_backdrop_alpha(now);
             let home_panel = crate::ui::home::view(
                 &self.home_state,
                 &self.session.prefs.spectrum,
                 self.home_stage.0,
                 self.home_stage.1,
-                backdrop_alpha,
+                shell.backdrop_alpha,
                 shell.panel,
                 now,
             )
@@ -2093,7 +2089,9 @@ impl App {
             // Shared shell transition: the Launcher is full-bleed. Never
             // scale or resize its view; only fade a black veil using the same
             // panel alpha Home and Browser animate.
-            let shell = self.resolved_shell_frame(self.launcher_shell_anim, Instant::now());
+            let mut shell = self.resolved_shell_frame(self.launcher_shell_anim, Instant::now());
+            // The Launcher fades its own veil, never the shared backdrop.
+            shell.backdrop_alpha = 0.0;
             self.note_shell_draw(shell);
             let veil = 1.0 - shell.panel.alpha.clamp(0.0, 1.0);
             let start: Element<'_, Message> = if veil > 0.001 {

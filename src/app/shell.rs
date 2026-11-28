@@ -109,6 +109,17 @@ impl App {
         if self.shell_window != Some(id) || self.shell_hidden || self.shell_presented {
             return Task::none();
         }
+        // The show may have been superseded by a close between the offscreen
+        // prime and this arm. Never restart an entrance for a screen that is
+        // no longer visible; the close/switch path owns the next state.
+        let mode_visible = match self.shell_mode {
+            ShellScreen::Home => self.home_visible,
+            ShellScreen::Browser => self.browser_visible,
+            ShellScreen::Launcher => self.launcher_visible,
+        };
+        if !mode_visible {
+            return Task::none();
+        }
         self.shell_reveal_armed = true;
         self.shell_reveal_started = Some(std::time::Instant::now());
         // Only a view built after this point carries the entrance pose. The
@@ -166,6 +177,7 @@ impl App {
         // by the time this message runs), never a recomputed wall-clock pose.
         let drawn = self.shell_drawn_frame.get();
         let panel = drawn.panel;
+        let backdrop = drawn.backdrop_alpha;
         let draw_epoch = self.shell_draw_epoch.get();
         let arm_draw = self.shell_reveal_arm_draw;
         let elapsed_ms = self
@@ -186,7 +198,7 @@ impl App {
             panel.offset_y
         };
         crate::controller::hid::diag::diag_info(format!(
-            "ui-diag: shell first present mode={mode:?} source={source} generation={} draw_generation={} draw_epoch={draw_epoch} arm_draw={arm_draw} elapsed_ms={elapsed_ms} scale={applied_scale:.3} offset_y={applied_y:.1} alpha={:.3} veil={:.3}",
+            "ui-diag: shell first present mode={mode:?} source={source} generation={} draw_generation={} draw_epoch={draw_epoch} arm_draw={arm_draw} elapsed_ms={elapsed_ms} scale={applied_scale:.3} offset_y={applied_y:.1} alpha={:.3} backdrop={backdrop:.3} veil={:.3}",
             self.shell_reveal_generation,
             self.shell_drawn_generation.get(),
             panel.alpha,
@@ -396,6 +408,11 @@ impl App {
     pub(crate) fn switch_shell_mode(&mut self, mode: ShellScreen) -> Task<Message> {
         self.pending_shell_mode = None;
         self.shell_opening = false;
+        // This is a new in-place entrance: a delayed arm/present from the
+        // outgoing show must not satisfy it.
+        self.shell_reveal_generation = self.shell_reveal_generation.wrapping_add(1);
+        self.shell_reveal_armed = false;
+        self.shell_reveal_started = None;
         self.set_shell_aliases(mode);
         let level = self.shell_level_task(mode);
         let enter = self.start_shell_enter(mode);
@@ -489,9 +506,19 @@ impl App {
         // state; a redraw between here and the raw hide must never fall back
         // to a settled full card.
         self.shell_render_hidden = true;
+        // A dismiss always ends the shared scrim timeline. Do this before the
+        // deferred-resume early return so a warm resume claims a fresh
+        // entrance instead of inheriting a settled/full backdrop.
+        self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
         self.home_shell_anim = None;
         self.browser_shell_anim = None;
+        self.launcher_shell_anim = None;
         self.clear_shell_aliases();
+        // Close the reveal epoch: any queued arm/present from a show that was
+        // dismissed before its gate ran must not start an entrance later.
+        self.shell_reveal_generation = self.shell_reveal_generation.wrapping_add(1);
+        self.shell_reveal_armed = false;
+        self.shell_reveal_started = None;
         // A second PS during the exit asks to resume the same screen. Cancel
         // the hide and let the normal resume path re-enter it in place.
         if self.ps_resume_pending {
@@ -501,11 +528,8 @@ impl App {
         }
         self.shell_hidden = true;
         self.shell_presented = false;
-        self.shell_reveal_armed = false;
-        self.shell_reveal_started = None;
         self.shell_pending_show = false;
         self.pending_shell_mode = None;
-        self.shell_backdrop = crate::ui::motion::ShellBackdrop::Hidden;
         self.shell_opening = false;
         self.reset_shell_cursor_clock();
         self.set_shell_cursor_hidden(false);

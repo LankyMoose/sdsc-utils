@@ -42,6 +42,16 @@ pub fn visible_screen(home: bool, browser: bool, launcher: bool) -> Option<Shell
     }
 }
 
+/// Backdrop alpha the shell view may paint. A hidden/closed shell always
+/// paints zero; the shared timeline only matters while a screen is live.
+pub(crate) fn resolve_shell_backdrop_alpha(
+    hidden: bool,
+    backdrop: crate::ui::motion::ShellBackdrop,
+    now: std::time::Instant,
+) -> f32 {
+    if hidden { 0.0 } else { backdrop.alpha(now) }
+}
+
 /// Shell work required after a Home transition. Order matters: unfocus/hide
 /// and suspend the outgoing app before showing/focusing/resuming the
 /// incoming one.
@@ -456,9 +466,11 @@ impl App {
         self.ps_resume_pending = false;
     }
 
-    /// Current shared backdrop alpha. Only the owning screen paints it.
-    pub(crate) fn shell_backdrop_alpha(&self, now: Instant) -> f32 {
-        self.shell_backdrop.alpha(now)
+    /// Backdrop alpha the shell view is allowed to paint. A hidden/closed
+    /// shell forces zero even if the shared timeline still holds a scrim: the
+    /// warm surface must never carry a settled dim into the next reveal.
+    pub(crate) fn shell_backdrop_view_alpha(&self, now: Instant) -> f32 {
+        resolve_shell_backdrop_alpha(self.shell_render_hidden, self.shell_backdrop, now)
     }
 
     /// The shared backdrop is drawn by the one shell window.
@@ -1337,6 +1349,32 @@ mod tests {
         assert_eq!(apps.active(), None);
         assert!(apps.is_installed(AppId::Browser));
         assert!(apps.close(AppId::Browser).is_empty());
+    }
+
+    #[test]
+    fn hidden_shell_forces_backdrop_zero() {
+        use crate::ui::motion::ShellBackdrop;
+        use std::time::Duration;
+
+        let now = Instant::now();
+        assert_eq!(
+            resolve_shell_backdrop_alpha(true, ShellBackdrop::Full, now),
+            0.0,
+            "a hidden shell must never paint a settled scrim"
+        );
+        assert_eq!(
+            resolve_shell_backdrop_alpha(false, ShellBackdrop::Full, now),
+            crate::ui::theme::BACKDROP_ALPHA
+        );
+        let later = now + Duration::from_millis(400);
+        assert_eq!(
+            resolve_shell_backdrop_alpha(true, ShellBackdrop::Entering { started: now }, later),
+            0.0
+        );
+        assert!(
+            resolve_shell_backdrop_alpha(false, ShellBackdrop::Entering { started: now }, later)
+                > 0.5
+        );
     }
 
     #[test]

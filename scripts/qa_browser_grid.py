@@ -506,10 +506,12 @@ def main() -> int:
             }
             source = re.search(r"\bsource=([a-z-]+)", line)
             alpha = re.search(r"\balpha=([0-9.]+)", line)
+            backdrop = re.search(r"\bbackdrop=([0-9.]+)", line)
             parsed.append(
                 {
                     "source": source.group(1) if source else "",
                     "alpha": float(alpha.group(1)) if alpha else 1.0,
+                    "backdrop": float(backdrop.group(1)) if backdrop else 1.0,
                     **{key: int(value) for key, value in fields.items()},
                 }
             )
@@ -519,6 +521,10 @@ def main() -> int:
             bool(parsed)
             and all(entry["source"] == "redraw" for entry in parsed)
             and all(entry["alpha"] < 0.9 for entry in parsed)
+            # A fresh reveal starts with no scrim; the delay is 140ms and the
+            # entrance is still under alpha 0.9 here, so a full/held backdrop
+            # means the shared timeline leaked across the dismiss.
+            and all(entry["backdrop"] < 0.05 for entry in parsed)
             and all(
                 all(isinstance(entry.get(key), int) for key in required)
                 for entry in parsed
@@ -540,7 +546,7 @@ def main() -> int:
         print(f"check first shell present is drawn after arm: {'ok' if pose_ok else 'FAIL'}")
         print(
             f"presents={len(presents)} "
-            f"details={[(e.get('source'), e.get('generation'), e.get('draw_epoch'), e.get('arm_draw'), e.get('alpha')) for e in parsed]}"
+            f"details={[(e.get('source'), e.get('generation'), e.get('draw_epoch'), e.get('arm_draw'), e.get('alpha'), e.get('backdrop')) for e in parsed]}"
         )
         if not pose_ok:
             print(
