@@ -520,6 +520,9 @@ impl App {
                     generation,
                     frame,
                 });
+                if let Some(tab) = self.browser.panel.tab_mut(id) {
+                    tab.engine_attached = true;
+                }
             }
             engine.send(EngineCommand::SetActiveTab { tab: id });
         }
@@ -536,7 +539,7 @@ impl App {
     /// Open a new foreground tab (grid plus card, popup, future bookmark
     /// action). The new page loads from birth through `OpenTab`.
     pub(crate) fn open_browser_tab(&mut self, url: Option<String>) -> Task<Message> {
-        if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
+        if self.browser.panel.tabs.len() >= crate::browser::tabs::MAX_SAVED_TABS {
             crate::controller::hid::diag::diag_info("ui-diag: browser tab cap reached");
             return Task::none();
         }
@@ -555,6 +558,9 @@ impl App {
                 generation,
                 frame,
             });
+            if let Some(tab) = self.browser.panel.tab_mut(id) {
+                tab.engine_attached = true;
+            }
             engine.send(EngineCommand::SetActiveTab { tab: id });
         } else {
             self.browser
@@ -568,7 +574,7 @@ impl App {
         self.save_page();
         crate::platform::trace::event(crate::platform::trace::Lane::Browser, "browser.tab.open")
             .field("tab", id.0)
-            .field("tabs", self.browser.panel.order.len())
+            .field("tabs", self.browser.panel.tabs.len())
             .emit();
         self.invalidate_browser_window()
     }
@@ -604,10 +610,10 @@ impl App {
                 let title = panel
                     .tab_page(next)
                     .and_then(|page| page.session.title().map(str::to_string));
-                // Swapping puts the old live page into the target's stored
-                // slot; drop that slot immediately — the closed tab is gone.
+                // Activating selects the tab record; removing then drops only
+                // the closed id (page state never swaps between tabs).
                 panel.activate_tab(next);
-                panel.remove_stored_tab(id);
+                panel.remove_tab(id);
                 let url = panel.session.url().to_string();
                 panel.session.open_surface();
                 let mut generation = None;
@@ -628,6 +634,9 @@ impl App {
                             generation,
                             frame,
                         });
+                        if let Some(tab) = panel.tab_mut(next) {
+                            tab.engine_attached = true;
+                        }
                     }
                     engine.send(EngineCommand::SetActiveTab { tab: next });
                 } else if let Some(generation) = generation {
@@ -649,7 +658,7 @@ impl App {
             }
             TabCloseOutcome::Closed { .. } => {
                 let panel = &mut self.browser.panel;
-                panel.remove_stored_tab(id);
+                panel.remove_tab(id);
                 if let Some(engine) = &self.browser.engine {
                     engine.send(EngineCommand::CloseTab { tab: id });
                 }
@@ -760,13 +769,13 @@ impl App {
             None
         };
         self.browser.panel.scroll_y = 0.0;
-        self.browser.panel.page.text_session_active = false;
+        self.browser.panel.text_session_active = false;
         // Fresh page: cursor back to center; focusables arrive with the
         // accessibility tree. Recenter the existing cursor so the live
         // viewport bounds (not the 800x600 defaults) survive navigation.
         self.browser.panel.cursor.reset_for_page();
         self.browser.panel.focusables.clear();
-        self.browser.panel.page.focusables_url = None;
+        self.browser.panel.focusables_url = None;
         let generation = self.browser.panel.session.begin_load(url.clone());
         if let Some(pending) = self.pending_browser_trace.as_mut() {
             pending.generation = Some(generation);
@@ -1159,7 +1168,7 @@ impl App {
     /// scroll, url, wells) and forces a debug shot, so the backend pull log
     /// around this timestamp tells the rest of the story.
     pub(crate) fn flag_browser_issue(&mut self, now: Instant) -> Task<Message> {
-        let targets = self.browser.panel.page.focusables.clone();
+        let targets = self.browser.panel.focusables.clone();
         let panel = &mut self.browser.panel;
         let cursor = panel.cursor.snapshot();
         let (cx, cy) = (cursor.x, cursor.y);
@@ -1335,10 +1344,8 @@ impl App {
         slot: std::sync::Arc<crate::browser::frame_slot::FrameSlot>,
     ) -> Task<Message> {
         let panel = &mut self.browser.panel;
-        if tab == panel.active_tab {
-            panel.session.set_frame_slot(slot);
-        } else if let Some(stored) = panel.stored.iter_mut().find(|t| t.id == tab) {
-            stored.page.session.set_frame_slot(slot);
+        if let Some(tab) = panel.tab_mut(tab) {
+            tab.page.session.set_frame_slot(slot);
         }
         Task::none()
     }
@@ -1366,7 +1373,7 @@ impl App {
         if !restored {
             return self.on_browser_go_default_silent();
         }
-        self.browser.panel.page.session.open_surface();
+        self.browser.panel.session.open_surface();
         self.save_page();
         self.note_launcher_activity();
         if self.browser.engine.is_some() {
@@ -1375,7 +1382,7 @@ impl App {
             self.sync_browser_theme();
             crate::controller::hid::diag::diag_info(format!(
                 "ui-diag: browser restore strip tabs={} active={}",
-                self.browser.panel.order.len(),
+                self.browser.panel.tabs.len(),
                 self.browser.panel.active_tab.0
             ));
             Task::none()
@@ -1495,8 +1502,8 @@ impl App {
                 return shot;
             }
             EngineEvent::TitleChanged { tab: _, title } => {
-                self.browser.panel.page.title_generation =
-                    self.browser.panel.page.title_generation.wrapping_add(1);
+                self.browser.panel.title_generation =
+                    self.browser.panel.title_generation.wrapping_add(1);
                 self.browser.panel.session.note_title(title);
                 // The boot tab loads before the Browser window opens; writing
                 // the strip now would replace the saved multi-tab file with
@@ -1536,16 +1543,12 @@ impl App {
                 ));
             }
             EngineEvent::A11yTree { tab: _, url, items } => {
-                self.browser.panel.page.focusables = items;
-                self.browser.panel.page.focusables_url = Some(url);
-                self.browser.panel.page.focusables_generation = self
-                    .browser
-                    .panel
-                    .page
-                    .focusables_generation
-                    .wrapping_add(1);
-                let targets = self.browser.panel.page.focusables.clone();
-                self.browser.panel.page.cursor.retarget(&targets);
+                self.browser.panel.focusables = items;
+                self.browser.panel.focusables_url = Some(url);
+                self.browser.panel.focusables_generation =
+                    self.browser.panel.focusables_generation.wrapping_add(1);
+                let targets = self.browser.panel.focusables.clone();
+                self.browser.panel.cursor.retarget(&targets);
                 // Parked page-focus target: dock when it resolves live; drop
                 // after one tree if it never does (culled targets never
                 // dock). A mid-flight jump keeps the target parked.
@@ -1579,21 +1582,21 @@ impl App {
                 self.browser.panel.page_extent = extent;
             }
             EngineEvent::ActivityChanged { phase, .. } => {
-                self.browser.panel.page.activity = phase;
+                self.browser.panel.activity = phase;
             }
             EngineEvent::HistoryCapability {
                 tab: _,
                 can_back,
                 can_forward,
             } => {
-                self.browser.panel.page.last_engine_can = Some((can_back, can_forward));
+                self.browser.panel.last_engine_can = Some((can_back, can_forward));
             }
             EngineEvent::HistoryChanged {
                 tab,
                 entries,
                 current,
             } => {
-                self.browser.panel.page.last_engine_history =
+                self.browser.panel.last_engine_history =
                     Some(crate::ui::browser::state::EngineHistorySnapshot {
                         current,
                         entries: entries.clone(),
@@ -1627,7 +1630,7 @@ impl App {
                 }
             }
             EngineEvent::EditableFocusChanged { tab: _, editable } => {
-                self.browser.panel.page.text_session_active = editable;
+                self.browser.panel.text_session_active = editable;
                 // The page text session ended: close the system keyboard. A
                 // focus/autofocus event never opens it (Cross is the only
                 // opener).
@@ -1667,7 +1670,7 @@ impl App {
         // save (which reborrows the panel).
         let mut page_changed = false;
         {
-            let Some(stored) = self.browser.panel.stored_mut(tab) else {
+            let Some(stored) = self.browser.panel.tab_mut(tab) else {
                 return;
             };
             match event {

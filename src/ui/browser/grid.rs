@@ -436,12 +436,7 @@ pub fn grid_tabs(panel: &BrowserPanel, order: &[TabId]) -> Vec<GridTab> {
     if ids.is_empty() {
         ids.push(panel.active_tab);
     }
-    for id in &panel.order {
-        if !ids.contains(id) {
-            ids.push(*id);
-        }
-    }
-    for tab in &panel.stored {
+    for tab in &panel.tabs {
         if !ids.contains(&tab.id) {
             ids.push(tab.id);
         }

@@ -594,7 +594,7 @@ impl super::App {
         }
         crate::platform::trace::replay::set_replaying(true);
         let frame_before = self.browser.panel.session.frame_slot().generation();
-        let title_before = self.browser.panel.page.title_generation;
+        let title_before = self.browser.panel.title_generation;
         let task = self.replay_dispatch(&step);
         crate::platform::trace::replay::set_replaying(false);
         match self.replay_begin_settle(&step, frame_before, title_before) {
@@ -775,7 +775,7 @@ impl super::App {
                     // reseed.
                     if self.browser.panel.cursor.snapshot().fly_to.is_some() {
                         wait.needs_focusables = true;
-                        wait.focusables_after = Some(self.browser.panel.page.focusables_generation);
+                        wait.focusables_after = Some(self.browser.panel.focusables_generation);
                     }
                 }
             }
@@ -817,17 +817,17 @@ impl super::App {
             if self.pending_browser_trace.is_some() || self.pending_history_travel.is_some() {
                 return false;
             }
-            if self.browser.panel.page.activity != crate::browser::engine::EngineActivity::Idle {
+            if self.browser.panel.activity != crate::browser::engine::EngineActivity::Idle {
                 return false;
             }
         }
         if wait.needs_focusables {
             let current_url = self.browser.panel.session.url();
-            if self.browser.panel.page.focusables.is_empty()
-                || self.browser.panel.page.focusables_url.as_deref() != Some(current_url)
+            if self.browser.panel.focusables.is_empty()
+                || self.browser.panel.focusables_url.as_deref() != Some(current_url)
                 || wait
                     .focusables_after
-                    .is_some_and(|mark| self.browser.panel.page.focusables_generation <= mark)
+                    .is_some_and(|mark| self.browser.panel.focusables_generation <= mark)
             {
                 return false;
             }
@@ -845,7 +845,7 @@ impl super::App {
                 return false;
             }
         }
-        if wait.needs_title && self.browser.panel.page.title_generation <= wait.title_mark {
+        if wait.needs_title && self.browser.panel.title_generation <= wait.title_mark {
             return false;
         }
         if wait.needs_osk_ready
@@ -930,10 +930,7 @@ impl super::App {
         .field("needs_capture", needs_capture)
         .field("pending_trace", self.pending_browser_trace.is_some())
         .field("pending_travel", self.pending_history_travel.is_some())
-        .field(
-            "activity",
-            format!("{:?}", self.browser.panel.page.activity),
-        )
+        .field("activity", format!("{:?}", self.browser.panel.activity))
         .emit();
         self.replay_wait = None;
         Task::done(Message::ReplayStep)
@@ -1539,7 +1536,6 @@ impl super::App {
         }
         self.browser
             .panel
-            .page
             .last_engine_history
             .as_ref()
             .and_then(|history| history.entries.get(current))
@@ -1610,7 +1606,6 @@ impl super::App {
             let expected = target_url.or_else(|| {
                 self.browser
                     .panel
-                    .page
                     .last_engine_history
                     .as_ref()
                     .and_then(|history| history.entries.get(target_index))
@@ -1893,7 +1888,6 @@ impl super::App {
         let engine_agree = self
             .browser
             .panel
-            .page
             .last_engine_history
             .as_ref()
             .is_some_and(|history| {
@@ -2240,7 +2234,7 @@ impl super::App {
         if self.browser.panel.grid.animating() || !self.browser.panel.grid.is_grid() {
             return Task::none();
         }
-        if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
+        if self.browser.panel.tabs.len() >= crate::browser::tabs::MAX_SAVED_TABS {
             return Task::none();
         }
         let open = self.open_browser_tab(None);
@@ -2421,7 +2415,7 @@ impl super::App {
         let Some(bookmark) = self.browser.panel.bookmarks.get(index).cloned() else {
             return Task::none();
         };
-        if self.browser.panel.order.len() >= crate::browser::tabs::MAX_SAVED_TABS {
+        if self.browser.panel.tabs.len() >= crate::browser::tabs::MAX_SAVED_TABS {
             return Task::none();
         }
         // Bookmarks open in a new tab (active); the page expands from that
@@ -4331,7 +4325,7 @@ pub(crate) fn trace_browser_state(
         })
     }
 
-    let page = &panel.page;
+    let page = panel.active_page();
     let session = &page.session;
     let engine_history = page.last_engine_history.as_ref().map(|history| {
         let center = history.current.min(history.entries.len().saturating_sub(1));
@@ -4360,7 +4354,7 @@ pub(crate) fn trace_browser_state(
     json!({
         "ui": {
             "tab": panel.active_tab.0,
-            "tabs": panel.order.len(),
+            "tabs": panel.tabs.len(),
             "url": session.url(),
             "title": session.title(),
             "loading": session.loading(),

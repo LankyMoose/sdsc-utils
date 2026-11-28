@@ -85,7 +85,7 @@ pub fn browser_spec(panel: &crate::ui::browser::BrowserPanel) -> AppSpec {
                 enabled: !panel.session.url().is_empty(),
             },
         ],
-        text_session: if panel.page.text_session_active {
+        text_session: if panel.text_session_active {
             TextSessionState::Active
         } else {
             TextSessionState::Inactive
@@ -171,8 +171,8 @@ mod tests {
         assert!(spec.action_enabled(ACTION_RELOAD));
         assert_eq!(spec.text_session, TextSessionState::Inactive);
 
-        panel.page.text_session_active = true;
-        panel.page.last_engine_can = Some((true, false));
+        panel.text_session_active = true;
+        panel.last_engine_can = Some((true, false));
         let spec = browser_spec(&panel);
         assert_eq!(spec.text_session, TextSessionState::Active);
         assert!(spec.action_enabled(ACTION_BACK));

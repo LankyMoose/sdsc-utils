@@ -814,35 +814,35 @@ mod tests {
         panel.reset_live_page();
         assert_eq!(
             {
-                let cursor = panel.page.cursor.snapshot();
+                let cursor = panel.cursor.snapshot();
                 (cursor.view_w, cursor.view_h)
             },
             (1734.0, 860.0)
         );
 
-        // A stored tab's cursor may predate the live viewport; activating it
+        // A dormant tab's cursor may predate the live viewport; activating it
         // must re-sync rather than clamp to the page's 800x600 default.
         let id = crate::browser::engine::TabId(2);
-        panel.order.push(id);
-        panel.stored.push(crate::ui::browser::StoredTab {
+        panel.tabs.push(crate::ui::browser::BrowserTab {
             id,
             page: crate::ui::browser::BrowserTabPage::default(),
-            loaded: false,
+            engine_attached: false,
         });
-        assert!(panel.activate_stored(id));
+        assert!(panel.activate_tab(id));
         assert_eq!(
             {
-                let cursor = panel.page.cursor.snapshot();
+                let cursor = panel.cursor.snapshot();
                 (cursor.view_w, cursor.view_h)
             },
             (1734.0, 860.0)
         );
 
-        // `stash_live` leaves a default placeholder page behind.
-        panel.stash_live();
+        // Replacing the active page leaves a default placeholder with synced
+        // bounds.
+        panel.reset_live_page();
         assert_eq!(
             {
-                let cursor = panel.page.cursor.snapshot();
+                let cursor = panel.cursor.snapshot();
                 (cursor.view_w, cursor.view_h)
             },
             (1734.0, 860.0)

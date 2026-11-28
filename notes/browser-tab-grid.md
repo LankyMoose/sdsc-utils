@@ -13,8 +13,9 @@ bookmark UI, or Browser screen/back behavior.
 - `src/app/browser.rs` owns the reducer: tab open/switch/close, grid focus
   movement/scroll, bookmark toggles, replay actions, and the
   transition-complete message.
-- `src/ui/browser/state.rs` owns the tab surface (`order`/`stored`/live page),
-  full-strip restore (`restore_saved_strip`), and bookmark persistence helpers.
+- `src/ui/browser/state.rs` owns the tab surface (`tabs` records with page +
+  engine attachment), full-strip restore (`restore_saved_strip`), and bookmark
+  persistence helpers.
 - `src/app/launcher.rs` owns the engine-facing tab operations
   (`open_browser_tab`, `activate_browser_tab`, `close_browser_tab`).
 
@@ -83,8 +84,9 @@ bookmark UI, or Browser screen/back behavior.
   stores one uniform block per tab id): the animating tab's grid card omits its
   shader until the transition lands.
 - Background cards show their last painted frame. Restored tabs stay dormant
-  (`StoredTab.loaded == false`) until first activation; their cards show a
-  title/URL placeholder.
+  (`BrowserTab.engine_attached == false`) until first activation; their cards
+  show a title/URL placeholder. Switching tabs changes only the active id;
+  page state and attachment stay with the tab.
 - Bookmarks are `bookmarks.json` entries matched by exact URL. The top-right
   star is filled gold (`theme::GOLD`) when the tab's current URL is
   bookmarked, outline (`theme::MUTED`) otherwise. Triangle on a focused
@@ -98,7 +100,8 @@ bookmark UI, or Browser screen/back behavior.
 `tabs.json` stores URL/title plus the active index. Up to 25 saved tabs are
 supported (`MAX_SAVED_TABS`); the row scrolls as long as needed.
 `restore_saved_strip` restores every saved tab: the active page uses
-`TabId::BOOT` (the engine preloads its URL), others become dormant stored pages.
+`TabId::BOOT` (the engine preloads its URL), others start detached and open on
+first activation.
 Tab open/close/switch rewrites the file; `tabs_restored` still gates the
 boot-time engine events that would otherwise clobber the saved strip before
 restore. Circle->Home runs `persist_grid_selection`, which activates the focused

@@ -95,14 +95,15 @@ pub struct BrowserTabPage {
     pub activity: crate::browser::engine::EngineActivity,
 }
 
-/// One background tab: stable id, page state, and whether a backend view
-/// exists for it. Restored tabs start unloaded (no view, no load) and open
-/// on first switch — the worker only ever pays for visible tabs.
+/// One tab. Page state and engine attachment travel with the tab identity;
+/// there is no separate "live" copy to swap, so idle tabs stay coherent.
 #[derive(Debug, Clone)]
-pub struct StoredTab {
+pub struct BrowserTab {
     pub id: crate::browser::engine::TabId,
     pub page: BrowserTabPage,
-    pub loaded: bool,
+    /// The engine worker has a browser view for this tab. This is about view
+    /// existence, not whether the page content has finished loading.
+    pub engine_attached: bool,
 }
 
 /// Silent result of closing one tab. The caller owns the single UI cue, so the
@@ -136,14 +137,9 @@ pub struct BlockedNavigation {
 /// pixels (see [`crate::browser::cursor`]).
 #[derive(Debug, Clone)]
 pub struct BrowserPanel {
-    /// Live page state: ALWAYS the active tab's. Swapped with `stored`
-    /// entries on switch (see `activate_stored`). The Share grid renders the
-    /// strip; background tabs stay dormant until first activation.
-    pub page: BrowserTabPage,
-    /// Background tabs (page state only; no chrome).
-    pub stored: Vec<StoredTab>,
-    /// Creation-order tab ids (active included).
-    pub order: Vec<crate::browser::engine::TabId>,
+    /// Every tab in creation order. The active one is `active_tab`; page
+    /// state is never swapped between entries.
+    pub tabs: Vec<BrowserTab>,
     /// Active tab id. Defaults to the boot webview — matches the worker's
     /// `TabId::BOOT` with no handshake.
     pub active_tab: crate::browser::engine::TabId,
@@ -206,16 +202,16 @@ pub struct BrowserPanel {
 impl std::ops::Deref for BrowserPanel {
     type Target = BrowserTabPage;
 
-    /// Live page state is always the active tab's — `panel.session`,
+    /// Page state is always the active tab's — `panel.session`,
     /// `panel.cursor` and friends address it directly.
     fn deref(&self) -> &Self::Target {
-        &self.page
+        &self.active().page
     }
 }
 
 impl std::ops::DerefMut for BrowserPanel {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.page
+        &mut self.active_mut().page
     }
 }
 
@@ -225,9 +221,11 @@ impl Default for BrowserPanel {
     fn default() -> Self {
         let page = BrowserTabPage::default();
         Self {
-            page,
-            stored: Vec::new(),
-            order: vec![crate::browser::engine::TabId::BOOT],
+            tabs: vec![BrowserTab {
+                id: crate::browser::engine::TabId::BOOT,
+                page,
+                engine_attached: true,
+            }],
             active_tab: crate::browser::engine::TabId::BOOT,
             next_tab_id: 2,
             page_mouse: (
@@ -263,6 +261,30 @@ impl Default for BrowserPanel {
 }
 
 impl BrowserPanel {
+    fn active_index(&self) -> usize {
+        self.tabs
+            .iter()
+            .position(|tab| tab.id == self.active_tab)
+            .unwrap_or(0)
+    }
+
+    /// The active tab record.
+    pub fn active(&self) -> &BrowserTab {
+        &self.tabs[self.active_index()]
+    }
+
+    /// The active tab record, mutable.
+    pub fn active_mut(&mut self) -> &mut BrowserTab {
+        let index = self.active_index();
+        &mut self.tabs[index]
+    }
+
+    /// Active page state (same as `panel` through `Deref`), for call sites
+    /// that already have a `&BrowserPanel` and cannot use field access.
+    pub fn active_page(&self) -> &BrowserTabPage {
+        &self.active().page
+    }
+
     /// Back is available when either source agrees.
     ///
     /// CEF's capability catches redirects and same-document entries that the
@@ -270,16 +292,13 @@ impl BrowserPanel {
     /// brief window after a commit where CEF still reports the pre-navigation
     /// capability (observed as a falsely disabled Back hint after a search).
     pub fn can_go_back(&self) -> bool {
-        self.page.last_engine_can.is_some_and(|(back, _)| back) || self.page.session.can_go_back()
+        self.last_engine_can.is_some_and(|(back, _)| back) || self.session.can_go_back()
     }
 
     /// Forward is available when either source agrees (same reasoning as
     /// [`Self::can_go_back`]).
     pub fn can_go_forward(&self) -> bool {
-        self.page
-            .last_engine_can
-            .is_some_and(|(_, forward)| forward)
-            || self.page.session.can_go_forward()
+        self.last_engine_can.is_some_and(|(_, forward)| forward) || self.session.can_go_forward()
     }
 
     /// Match the surface to the live card page size. Returns true when the
@@ -290,75 +309,44 @@ impl BrowserPanel {
             return false;
         }
         self.viewport = size;
-        self.page.cursor.set_viewport(size.0, size.1);
+        self.cursor.set_viewport(size.0, size.1);
         true
     }
 
-    /// Keep the live page's cursor bounds in step with the panel viewport.
-    /// Page state (including the cursor) is swapped per tab and replaced on
-    /// new/restored tabs, so a default page carries 800x600 bounds until this
-    /// runs — the recurring "cursor trapped in a quarter of the page" bug.
+    /// Keep the active page's cursor bounds in step with the panel viewport.
+    /// Page state travels with its tab, so activating a dormant or restored
+    /// tab re-syncs the cursor before it can trap input in the page default.
     pub fn sync_live_cursor(&mut self) {
-        self.page
-            .cursor
-            .set_viewport(self.viewport.0, self.viewport.1);
+        self.cursor.set_viewport(self.viewport.0, self.viewport.1);
     }
 
-    /// Replace the live page with a fresh one that already knows the live
+    /// Replace the active page with a fresh one that already knows the live
     /// viewport. Prefer this over assigning `BrowserTabPage::default()`.
     pub fn reset_live_page(&mut self) {
-        self.page = BrowserTabPage::default();
+        self.active_mut().page = BrowserTabPage::default();
         self.sync_live_cursor();
     }
 
-    /// Find a background tab's stored state.
-    pub fn stored_mut(&mut self, id: crate::browser::engine::TabId) -> Option<&mut StoredTab> {
-        self.stored.iter_mut().find(|t| t.id == id)
+    /// Find a tab by id.
+    pub fn tab_mut(&mut self, id: crate::browser::engine::TabId) -> Option<&mut BrowserTab> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
-    /// Stash the live page as a background tab under its current id. Called
-    /// before the live slot is reset for a new/adopted tab or swapped with
-    /// a stored one. The stashed page keeps its backing view, so it stays
-    /// loaded.
-    pub fn stash_live(&mut self) {
-        let page = std::mem::take(&mut self.page);
-        // `take` leaves a default page behind; give its cursor the live
-        // bounds in case the caller has not installed the replacement yet.
-        self.sync_live_cursor();
-        let id = self.active_tab;
-        if let Some(slot) = self.stored.iter_mut().find(|t| t.id == id) {
-            slot.page = page;
-            slot.loaded = true;
-        } else {
-            self.stored.push(StoredTab {
-                id,
-                page,
-                loaded: true,
-            });
-            if !self.order.contains(&id) {
-                self.order.push(id);
-            }
+    /// Foreground a tab. Page state stays in its tab record; only the active
+    /// id changes, so a tab that was already attached keeps its view.
+    pub fn activate_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
+            return false;
         }
-    }
-
-    /// Load a background tab into the live slot: the live page swaps into
-    /// the stored slot (order untouched), the stored page becomes live.
-    /// Returns false for unknown ids.
-    pub fn activate_stored(&mut self, id: crate::browser::engine::TabId) -> bool {
         if id == self.active_tab {
             return true;
         }
-        let Some(pos) = self.stored.iter().position(|t| t.id == id) else {
-            return false;
-        };
         if let Some(block) = self.nav_block.take() {
             self.nav_blocks.insert(self.active_tab, block);
         }
-        std::mem::swap(&mut self.page, &mut self.stored[pos].page);
-        self.sync_live_cursor();
-        self.stored[pos].id = self.active_tab;
         self.active_tab = id;
         self.nav_block = self.nav_blocks.remove(&id);
+        self.sync_live_cursor();
         true
     }
 
@@ -384,18 +372,24 @@ impl BrowserPanel {
         self.nav_block = None;
     }
 
-    /// Drop a background tab's stored state (the engine side closes via
-    /// `CloseTab`). Returns false when the id is live or unknown.
-    pub fn drop_stored(&mut self, id: crate::browser::engine::TabId) -> bool {
-        if id == self.active_tab {
-            return false;
-        }
-        let Some(pos) = self.stored.iter().position(|t| t.id == id) else {
+    /// Remove a tab record (the engine side closes via `CloseTab`). If the
+    /// removed tab was active, selection moves to the nearest remaining tab.
+    /// The last tab is never removed; close resets it to the default page.
+    pub fn remove_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
+        let Some(pos) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
-        self.stored.remove(pos);
-        self.order.retain(|o| *o != id);
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        self.tabs.remove(pos);
         self.nav_blocks.remove(&id);
+        if self.active_tab == id {
+            let next = pos.min(self.tabs.len() - 1);
+            self.active_tab = self.tabs[next].id;
+            self.nav_block = self.nav_blocks.remove(&self.active_tab);
+            self.sync_live_cursor();
+        }
         true
     }
 
@@ -403,27 +397,19 @@ impl BrowserPanel {
     /// position. Blank/empty URLs never persist (placeholders, not visits —
     /// same rule as the history stacks).
     pub fn snapshot_tabs(&self) -> crate::browser::tabs::SavedTabs {
-        let mut tabs = Vec::with_capacity(self.order.len());
+        let mut tabs = Vec::with_capacity(self.tabs.len());
         let mut active = 0;
-        for id in &self.order {
-            if *id == self.active_tab {
-                active = tabs.len();
-            }
-            let page = if *id == self.active_tab {
-                Some(&self.page)
-            } else {
-                self.stored.iter().find(|t| t.id == *id).map(|t| &t.page)
-            };
-            let Some(page) = page else {
-                continue;
-            };
-            let url = page.session.url();
+        for tab in &self.tabs {
+            let url = tab.page.session.url();
             if url.is_empty() || url == crate::browser::BLANK_PAGE_URL {
                 continue;
             }
+            if tab.id == self.active_tab {
+                active = tabs.len();
+            }
             tabs.push(crate::browser::tabs::SavedTab {
                 url: url.to_string(),
-                title: page.session.title().unwrap_or_default().to_string(),
+                title: tab.page.session.title().unwrap_or_default().to_string(),
             });
         }
         tabs.truncate(crate::browser::tabs::MAX_SAVED_TABS);
@@ -447,57 +433,36 @@ impl BrowserPanel {
                 next: self.active_tab,
             };
         }
-        match self.order.iter().copied().find(|tab| *tab != id) {
-            Some(next) => TabCloseOutcome::Closed { next },
-            None => TabCloseOutcome::ResetDefault,
-        }
+        self.tabs
+            .iter()
+            .map(|tab| tab.id)
+            .find(|tab| *tab != id)
+            .map_or(TabCloseOutcome::ResetDefault, |next| {
+                TabCloseOutcome::Closed { next }
+            })
     }
 
-    /// Resolve any tab id to its page state (live or stored).
+    /// Resolve any tab id to its page state.
     pub fn tab_page(&self, id: crate::browser::engine::TabId) -> Option<&BrowserTabPage> {
-        if id == self.active_tab {
-            Some(&self.page)
-        } else {
-            self.stored
-                .iter()
-                .find(|tab| tab.id == id)
-                .map(|tab| &tab.page)
-        }
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| &tab.page)
     }
 
-    /// True when the tab has a live engine view (live tab always does).
+    /// True when the engine worker has a view for this tab.
     pub fn tab_loaded(&self, id: crate::browser::engine::TabId) -> bool {
-        if id == self.active_tab {
-            true
-        } else {
-            self.stored
-                .iter()
-                .find(|tab| tab.id == id)
-                .is_some_and(|tab| tab.loaded)
-        }
-    }
-
-    /// Activate a stored tab. The old live page lands in the target's stored
-    /// slot under the old id (see [`Self::activate_stored`]).
-    pub fn activate_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
-        self.activate_stored(id)
-    }
-
-    /// Remove a non-live tab after activation swapped the old live page into
-    /// its slot. Also drops the closed id from the creation order.
-    pub fn remove_stored_tab(&mut self, id: crate::browser::engine::TabId) -> bool {
-        let before_stored = self.stored.len();
-        let before_order = self.order.len();
-        self.stored.retain(|tab| tab.id != id);
-        self.order.retain(|tab| *tab != id);
-        self.stored.len() != before_stored || self.order.len() != before_order
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .is_some_and(|tab| tab.engine_attached)
     }
 
     /// Freeze the tab-grid visual order for a new session (stable creation
     /// order; the active tab only sets focus/page).
     pub fn refresh_grid_visual(&mut self) {
-        self.grid
-            .refresh_visual(self.active_tab, &self.order.clone());
+        let order: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+        self.grid.refresh_visual(self.active_tab, &order);
     }
 
     /// Keep the frozen visual strip aligned after tab open/close.
@@ -505,12 +470,8 @@ impl BrowserPanel {
         if !self.grid.is_grid() {
             return;
         }
-        let valid: Vec<crate::browser::engine::TabId> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|id| self.tab_page(*id).is_some())
-            .collect();
+        let valid: Vec<crate::browser::engine::TabId> =
+            self.tabs.iter().map(|tab| tab.id).collect();
         self.grid.visual.retain(|id| valid.contains(id));
         // Newest first: prepend newly-created tabs. Iterating creation order
         // means the newest insert lands at index 0.
@@ -521,10 +482,9 @@ impl BrowserPanel {
         }
     }
 
-    /// Restore every persisted tab: the saved active page becomes the live
-    /// boot page (the engine preloaded its URL), the rest become dormant
-    /// stored pages that open their view on first activation. Returns false
-    /// when the saved strip has no usable tab.
+    /// Restore every persisted tab. The saved active page is the boot view
+    /// (the engine preloaded its URL); the others start detached and open on
+    /// first activation. Returns false when the saved strip has no usable tab.
     pub fn restore_saved_strip(&mut self, saved: &crate::browser::tabs::SavedTabs) -> bool {
         let tabs: Vec<&crate::browser::tabs::SavedTab> = saved
             .tabs
@@ -532,15 +492,18 @@ impl BrowserPanel {
             .filter(|tab| !tab.url.is_empty() && tab.url != crate::browser::BLANK_PAGE_URL)
             .take(crate::browser::tabs::MAX_SAVED_TABS)
             .collect();
-        self.stored.clear();
-        self.order.clear();
+        self.tabs.clear();
         self.active_tab = crate::browser::engine::TabId::BOOT;
         self.next_tab_id = 2;
         self.nav_block = None;
         self.nav_blocks.clear();
-        self.reset_live_page();
         if tabs.is_empty() {
-            self.order.push(crate::browser::engine::TabId::BOOT);
+            self.tabs.push(BrowserTab {
+                id: crate::browser::engine::TabId::BOOT,
+                page: BrowserTabPage::default(),
+                engine_attached: true,
+            });
+            self.sync_live_cursor();
             return false;
         }
         let active = saved
@@ -552,11 +515,16 @@ impl BrowserPanel {
         for (index, tab) in tabs.iter().enumerate() {
             let title = (!tab.title.is_empty()).then(|| tab.title.clone());
             if index == active {
-                self.page.session.begin_load(tab.url.clone());
+                let mut page = BrowserTabPage::default();
+                page.session.begin_load(tab.url.clone());
                 if title.is_some() {
-                    self.page.session.note_title(title);
+                    page.session.note_title(title);
                 }
-                self.order.push(crate::browser::engine::TabId::BOOT);
+                self.tabs.push(BrowserTab {
+                    id: crate::browser::engine::TabId::BOOT,
+                    page,
+                    engine_attached: true,
+                });
             } else {
                 let id = crate::browser::engine::TabId(self.next_tab_id);
                 self.next_tab_id += 1;
@@ -565,29 +533,34 @@ impl BrowserPanel {
                 if title.is_some() {
                     page.session.note_title(title);
                 }
-                self.stored.push(StoredTab {
+                self.tabs.push(BrowserTab {
                     id,
                     page,
-                    loaded: false,
+                    engine_attached: false,
                 });
-                self.order.push(id);
             }
         }
+        self.sync_live_cursor();
         true
     }
 
-    /// Create a fresh live tab after stashing the current page. Returns the
-    /// new id and the load generation the engine result must carry.
+    /// Create a fresh foreground tab. Returns the new id and the load
+    /// generation the engine result must carry. The caller opens the engine
+    /// view and marks the tab attached.
     pub fn create_tab(&mut self, url: String) -> (crate::browser::engine::TabId, u64) {
         self.nav_block = None;
-        self.stash_live();
         let id = crate::browser::engine::TabId(self.next_tab_id);
         self.next_tab_id += 1;
+        let mut page = BrowserTabPage::default();
+        page.cursor.set_viewport(self.viewport.0, self.viewport.1);
+        page.session.open_surface();
+        let generation = page.session.begin_load(url);
+        self.tabs.push(BrowserTab {
+            id,
+            page,
+            engine_attached: false,
+        });
         self.active_tab = id;
-        self.order.push(id);
-        self.reset_live_page();
-        self.page.session.open_surface();
-        let generation = self.page.session.begin_load(url);
         (id, generation)
     }
 
@@ -651,7 +624,7 @@ impl BrowserPanel {
     /// select-all.
     pub fn start_url_edit(&mut self) {
         self.url_editing = true;
-        self.url_draft = self.page.session.url().to_string();
+        self.url_draft = self.session.url().to_string();
         self.url_replace_on_type = true;
     }
 
@@ -723,8 +696,8 @@ impl BrowserPanel {
         };
         sample.stick_x = lx;
         sample.stick_y = ly;
-        let mut rt = self.page.cursor.lock();
-        rt.focusables = self.page.focusables.clone();
+        let mut rt = self.cursor.lock();
+        rt.focusables = self.focusables.clone();
         rt.advance(&sample, now)
             .scroll
             .map(|(dx, dy, _)| (dx, dy))
@@ -734,12 +707,10 @@ impl BrowserPanel {
     /// D-pad focus step: spatial cone jump over page targets. A press always
     /// asks the engine for a fresh target set around the new cursor.
     pub fn jump_cursor(&mut self, dir: crate::browser::cursor::JumpDir) {
-        let before = self.page.cursor.snapshot();
-        self.page
-            .cursor
-            .set_focusables(self.page.focusables.clone());
-        self.page.cursor.jump(dir);
-        let after = self.page.cursor.snapshot();
+        let before = self.cursor.snapshot();
+        self.cursor.set_focusables(self.focusables.clone());
+        self.cursor.jump(dir);
+        let after = self.cursor.snapshot();
         crate::platform::app_log::info(format!(
             "cursor jump {dir:?} from=({:.0},{:.0}) dock={:?} fly={:?} attached={:?} targets={}",
             before.x,
@@ -747,7 +718,7 @@ impl BrowserPanel {
             before.attached,
             after.fly_to,
             after.attached,
-            self.page.focusables.len(),
+            self.focusables.len(),
         ));
     }
 }
@@ -850,8 +821,8 @@ mod tests {
             viewport: (900.0, 700.0),
             ..BrowserPanel::default()
         };
-        panel.page.cursor.lock().cursor.x = 450.0;
-        panel.page.cursor.lock().cursor.y = 350.0;
+        panel.cursor.lock().cursor.x = 450.0;
+        panel.cursor.lock().cursor.y = 350.0;
         panel
     }
 
@@ -874,7 +845,7 @@ mod tests {
         let mut panel = panel();
         // CEF briefly reports no capability after a commit while the canonical
         // stack already has the new entry: the hint must stay enabled.
-        panel.page.last_engine_can = Some((false, false));
+        panel.last_engine_can = Some((false, false));
         panel.session.apply_engine_history(
             &[
                 engine_entry("https://a.test/"),
@@ -887,12 +858,12 @@ mod tests {
 
         // Engine capability can also lead the stack (redirects/same-document).
         panel.session = crate::browser::BrowserSession::default();
-        panel.page.last_engine_can = Some((false, true));
+        panel.last_engine_can = Some((false, true));
         assert!(!panel.can_go_back());
         assert!(panel.can_go_forward());
 
         // Both sources agree there is nowhere to go.
-        panel.page.last_engine_can = Some((false, false));
+        panel.last_engine_can = Some((false, false));
         assert!(!panel.can_go_back());
         assert!(!panel.can_go_forward());
     }
@@ -973,7 +944,7 @@ mod tests {
     fn dpad_jump_steps_through_page_targets() {
         use crate::browser::cursor::{FocusKind, Focusable};
         let mut panel = panel();
-        panel.page.focusables = vec![
+        panel.focusables = vec![
             Focusable {
                 id: 1,
                 x: 100.0,
@@ -993,9 +964,9 @@ mod tests {
                 url: None,
             },
         ];
-        panel.page.cursor.lock().cursor.x = 150.0;
-        panel.page.cursor.lock().cursor.y = 320.0;
-        panel.page.cursor.lock().cursor.attached = Some(2);
+        panel.cursor.lock().cursor.x = 150.0;
+        panel.cursor.lock().cursor.y = 320.0;
+        panel.cursor.lock().cursor.attached = Some(2);
         panel.jump_cursor(crate::browser::cursor::JumpDir::Up);
         assert!(panel.cursor.lock().dom_reseed_pending);
         assert_eq!(panel.cursor.snapshot().fly_to, Some((150.0, 120.0)));
@@ -1019,35 +990,36 @@ mod tests {
     }
 
     #[test]
-    fn store_activation_round_trips_page_state() {
+    fn tab_switch_keeps_page_state_and_engine_attachment() {
         let mut panel = BrowserPanel::default();
         assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
         panel.session.begin_load("https://a.test/".to_string());
-        panel.stash_live();
-        assert_eq!(panel.stored.len(), 1);
-        assert_eq!(panel.stored[0].id, crate::browser::engine::TabId::BOOT);
-        assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
-        assert!(panel.stored[0].loaded);
-        let second = crate::browser::engine::TabId(panel.next_tab_id);
-        panel.next_tab_id += 1;
-        panel.active_tab = second;
-        panel.order.push(second);
-        panel.session.begin_load("https://b.test/".to_string());
-        assert!(panel.activate_stored(crate::browser::engine::TabId::BOOT));
+        let (second, _) = panel.create_tab("https://b.test/".to_string());
+        assert_eq!(panel.tabs.len(), 2);
+        assert_eq!(panel.tabs[0].page.session.url(), "https://a.test/");
+        assert!(panel.tabs[0].engine_attached);
+        assert_eq!(panel.tabs[1].page.session.url(), "https://b.test/");
+        assert!(!panel.tabs[1].engine_attached);
+
+        assert!(panel.activate_tab(crate::browser::engine::TabId::BOOT));
         assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
         assert_eq!(panel.session.url(), "https://a.test/");
-        assert_eq!(panel.stored.len(), 1);
-        assert_eq!(panel.stored[0].id, second);
-        assert_eq!(panel.stored[0].page.session.url(), "https://b.test/");
-        assert!(!panel.activate_stored(crate::browser::engine::TabId(999)));
-        assert!(!panel.drop_stored(crate::browser::engine::TabId(999)));
-        assert!(panel.drop_stored(second));
-        assert!(panel.stored.is_empty());
-        assert!(!panel.drop_stored(crate::browser::engine::TabId::BOOT));
+        assert_eq!(panel.tabs[1].id, second);
+        assert_eq!(panel.tabs[1].page.session.url(), "https://b.test/");
+        assert!(!panel.activate_tab(crate::browser::engine::TabId(999)));
+        assert!(!panel.remove_tab(crate::browser::engine::TabId(999)));
+
+        // Engine attachment follows the tab identity, not the old live slot.
+        panel.tab_mut(second).unwrap().engine_attached = true;
+        assert!(panel.activate_tab(second));
+        assert!(panel.activate_tab(crate::browser::engine::TabId::BOOT));
+        assert!(panel.tab_loaded(second));
+        assert!(panel.remove_tab(second));
+        assert!(!panel.remove_tab(crate::browser::engine::TabId::BOOT));
     }
 
     #[test]
-    fn restored_strip_keeps_active_live_and_others_dormant() {
+    fn restored_strip_keeps_active_attached_and_others_detached() {
         let saved = crate::browser::tabs::SavedTabs {
             tabs: vec![
                 crate::browser::tabs::SavedTab {
@@ -1070,13 +1042,19 @@ mod tests {
         assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
         assert_eq!(panel.session.url(), "https://b.test/");
         assert_eq!(panel.session.title(), Some("B"));
-        assert_eq!(panel.order.len(), 3);
-        assert_eq!(panel.stored.len(), 2);
-        assert!(panel.stored.iter().all(|tab| !tab.loaded));
+        assert_eq!(panel.tabs.len(), 3);
+        assert!(panel.active().engine_attached);
+        assert!(
+            panel
+                .tabs
+                .iter()
+                .filter(|tab| tab.id != crate::browser::engine::TabId::BOOT)
+                .all(|tab| !tab.engine_attached)
+        );
         let urls: Vec<&str> = panel
-            .order
+            .tabs
             .iter()
-            .filter_map(|id| panel.tab_page(*id).map(|page| page.session.url()))
+            .map(|tab| tab.page.session.url())
             .collect();
         assert_eq!(
             urls,
@@ -1085,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn create_tab_stashes_live_and_foregrounds_new_page() {
+    fn create_tab_preserves_the_previous_page() {
         let mut panel = BrowserPanel::default();
         panel.session.begin_load("https://a.test/".to_string());
         let (id, generation) = panel.create_tab("https://b.test/".to_string());
@@ -1093,9 +1071,45 @@ mod tests {
         assert_eq!(panel.active_tab, id);
         assert_eq!(panel.session.url(), "https://b.test/");
         assert_eq!(panel.session.generation(), generation);
-        assert_eq!(panel.order, vec![crate::browser::engine::TabId::BOOT, id]);
-        assert_eq!(panel.stored.len(), 1);
-        assert_eq!(panel.stored[0].page.session.url(), "https://a.test/");
+        assert_eq!(
+            panel.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![crate::browser::engine::TabId::BOOT, id]
+        );
+        assert_eq!(panel.tabs[0].page.session.url(), "https://a.test/");
+        assert!(!panel.tab_loaded(id));
+        assert!(panel.tab_loaded(crate::browser::engine::TabId::BOOT));
+    }
+
+    #[test]
+    fn closing_a_dormant_tab_does_not_detach_its_neighbor() {
+        let saved = crate::browser::tabs::SavedTabs {
+            tabs: vec![
+                crate::browser::tabs::SavedTab {
+                    url: "https://a.test/".into(),
+                    title: "A".into(),
+                },
+                crate::browser::tabs::SavedTab {
+                    url: "https://b.test/".into(),
+                    title: "B".into(),
+                },
+            ],
+            active: 0,
+        };
+        let mut panel = BrowserPanel::default();
+        assert!(panel.restore_saved_strip(&saved));
+        let second = panel.tabs[1].id;
+        assert!(!panel.tab_loaded(second));
+
+        // First activation opens the engine view and marks it attached.
+        assert!(panel.activate_tab(second));
+        panel.tab_mut(second).unwrap().engine_attached = true;
+
+        // Switch back, then close the tab that was dormant. The neighbor's
+        // attachment must survive the switch; it must not be reopened.
+        assert!(panel.activate_tab(crate::browser::engine::TabId::BOOT));
+        assert!(panel.tab_loaded(crate::browser::engine::TabId::BOOT));
+        assert!(panel.remove_tab(second));
+        assert_eq!(panel.active_tab, crate::browser::engine::TabId::BOOT);
         assert!(panel.tab_loaded(crate::browser::engine::TabId::BOOT));
     }
 
